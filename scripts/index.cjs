@@ -1,0 +1,109 @@
+#!/usr/bin/env node
+
+const { spawn } = require("node:child_process");
+const path = require("node:path");
+const dotenv = require("dotenv");
+
+const repoRoot = path.resolve(__dirname, "..");
+const envPath = path.join(repoRoot, ".env");
+const tauriBin = path.join(
+  repoRoot,
+  "node_modules",
+  ".bin",
+  process.platform === "win32" ? "tauri.cmd" : "tauri"
+);
+
+dotenv.config({
+  path: envPath,
+});
+
+const commandMap = {
+  dev: "dev",
+  build: "build",
+};
+
+const hostMap = {
+  prod: process.env.SNACK_PROD_HOST || "snack.mechlabs.cn",
+  qa: process.env.SNACK_QA_HOST || "qasnack.mechlabs.cn",
+};
+
+const updaterEndpointMap = {
+  prod:
+    process.env.SNACK_PROD_UPDATER_ENDPOINT ||
+    "https://snack.mechlabs.cn/api/desktop-updates/update?currentVersion={{current_version}}&target={{target}}&arch={{arch}}",
+  qa:
+    process.env.SNACK_QA_UPDATER_ENDPOINT ||
+    "https://qasnack.mechlabs.cn/api/desktop-updates/update?currentVersion={{current_version}}&target={{target}}&arch={{arch}}",
+};
+
+const command = commandMap[process.argv[2]];
+
+if (!command) {
+  console.error("Usage: node scripts/index.cjs <dev|build> [qa|prod] [...tauriArgs]");
+  process.exit(1);
+}
+
+const args = process.argv.slice(3);
+let targetEnv = (process.env.SNACK_ENV || "prod").toLowerCase();
+
+if (args[0] && !args[0].startsWith("-")) {
+  targetEnv = args.shift().toLowerCase();
+}
+
+const host = hostMap[targetEnv];
+const updaterEndpoint = updaterEndpointMap[targetEnv];
+
+if (!host || !updaterEndpoint) {
+  console.error(`Unknown ${command} environment: ${targetEnv}`);
+  console.error(`Supported environments: ${Object.keys(hostMap).join(", ")}`);
+  process.exit(1);
+}
+
+const frontendUrl = `https://${host}`;
+const updaterPubkey = process.env.TAURI_UPDATER_PUBKEY || process.env.TAURI_PUBLIC_KEY;
+
+if (command === "build" && !updaterPubkey) {
+  console.error(
+    "Missing TAURI_UPDATER_PUBKEY. Generate an updater keypair with `tauri signer generate`, then set the public key before building."
+  );
+  process.exit(1);
+}
+
+const tauriConfig = {
+  build: {
+    devUrl: frontendUrl,
+    frontendDist: frontendUrl,
+  },
+  plugins: {
+    updater: {
+      endpoints: [updaterEndpoint],
+      ...(updaterPubkey ? { pubkey: updaterPubkey } : {}),
+    },
+  },
+};
+
+const childEnv = {
+  ...process.env,
+  TAURI_CONFIG: JSON.stringify(tauriConfig),
+  SNACK_ENV: targetEnv,
+  SNACK_FRONTEND_URL: frontendUrl,
+};
+
+if (process.env.SNACK_DESKTOP_BASE_UA) {
+  childEnv.SNACK_DESKTOP_BASE_UA = process.env.SNACK_DESKTOP_BASE_UA;
+}
+
+const child = spawn(tauriBin, [command, ...args], {
+  cwd: repoRoot,
+  stdio: "inherit",
+  env: childEnv,
+});
+
+child.on("exit", (code, signal) => {
+  if (signal) {
+    process.kill(process.pid, signal);
+    return;
+  }
+
+  process.exit(code ?? 1);
+});

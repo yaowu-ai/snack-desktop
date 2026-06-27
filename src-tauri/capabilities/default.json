@@ -1,0 +1,15 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Capabilities for the Snack desktop webview.",
+  "windows": ["main"],
+  "remote": {
+    "urls": [
+      "https://snack.mechlabs.cn/*",
+      "https://qasnack.mechlabs.cn/*",
+      "http://localhost:3000/*",
+      "http://127.0.0.1:3000/*"
+    ]
+  },
+  "permissions": ["core:default", "notification:default", "process:allow-restart", "updater:default"]
+}

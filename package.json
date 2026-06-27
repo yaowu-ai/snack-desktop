@@ -1,0 +1,13 @@
+{
+  "name": "snack",
+  "private": true,
+  "version": "0.1.0",
+  "scripts": {
+    "dev": "node scripts/index.cjs dev",
+    "build": "node scripts/index.cjs build"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.11.3",
+    "dotenv": "^16.4.5"
+  }
+}
