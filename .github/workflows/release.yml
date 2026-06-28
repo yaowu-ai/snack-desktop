@@ -357,26 +357,10 @@ jobs:
           echo "app_version=$APP_VERSION" >> "$GITHUB_OUTPUT"
           echo "artifact_version=$ARTIFACT_VERSION" >> "$GITHUB_OUTPUT"
 
-      - name: Validate required secrets
-        shell: bash
-        env:
-          TAURI_UPDATER_PUBKEY: ${{ secrets.TAURI_UPDATER_PUBKEY }}
-        run: |
-          missing=0
-          for name in TAURI_UPDATER_PUBKEY
-          do
-            if [[ -z "${!name}" ]]; then
-              echo "::error::Missing required GitHub secret: ${name}"
-              missing=1
-            fi
-          done
-          exit "$missing"
-
       - name: Build Tauri app
         run: npm run build
         env:
           CI: true
-          TAURI_UPDATER_PUBKEY: ${{ secrets.TAURI_UPDATER_PUBKEY }}
           SNACK_CREATE_UPDATER_ARTIFACTS: "false"
           SNACK_PROD_HOST: ${{ vars.SNACK_PROD_HOST }}
           SNACK_QA_HOST: ${{ vars.SNACK_QA_HOST }}
