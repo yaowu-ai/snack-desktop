@@ -1,10 +1,6 @@
-# Snack Desktop Build
+# Snack Desktop
 
-`scripts/dev.ps1`、`scripts/build.ps1`、`scripts/dev.cmd` 和 `scripts/build.cmd`
-已经废弃。不要再通过它们设置 `SNACK_DESKTOP_ENV` 或直接进入 `src-tauri`
-执行 `cargo run` / `cargo tauri build`。
-
-当前入口统一从项目根目录执行：
+如何打包：
 
 ```bash
 npm run dev -- prod
@@ -63,8 +59,6 @@ SNACK_DESKTOP_BASE_UA
 SNACK_DESKTOP_VERSION
 ```
 
-`prod` 默认地址是 `snack.mechlabs.cn`，`qa` 默认地址是
-`qasnack.mechlabs.cn`。CI 中 `SNACK_PROD_HOST` 和 `SNACK_QA_HOST` 来自
 GitHub Actions Variables；本地环境变量会覆盖默认值。
 
 macOS release CI 额外需要：

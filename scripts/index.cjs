@@ -43,8 +43,8 @@ const inferEnvFromGitRef = () => {
 };
 
 const hostMap = {
-  prod: process.env.SNACK_PROD_HOST || "snack.mechlabs.cn",
-  qa: process.env.SNACK_QA_HOST || "qasnack.mechlabs.cn",
+  prod: process.env.SNACK_PROD_HOST,
+  qa: process.env.SNACK_QA_HOST,
 };
 
 const updaterEndpointMap = {
