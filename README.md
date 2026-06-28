@@ -107,5 +107,5 @@ Windows/Linux 使用 Chrome 风格 UA。需要覆盖时设置 `SNACK_DESKTOP_BAS
 scripts/index.cjs
 src-tauri/build.rs
 src-tauri/src/lib.rs
-scripts/README.md
+README.md
 ```

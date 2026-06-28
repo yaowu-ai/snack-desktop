@@ -42,18 +42,25 @@ const inferEnvFromGitRef = () => {
   return "prod";
 };
 
+const envValue = (name, fallback) => {
+  const value = process.env[name]?.trim();
+  return value || fallback;
+};
+
 const hostMap = {
-  prod: process.env.SNACK_PROD_HOST,
-  qa: process.env.SNACK_QA_HOST,
+  prod: envValue("SNACK_PROD_HOST", "snack.mechlabs.cn"),
+  qa: envValue("SNACK_QA_HOST", "qasnack.mechlabs.cn"),
 };
 
 const updaterEndpointMap = {
-  prod:
-    process.env.SNACK_PROD_UPDATER_ENDPOINT ||
+  prod: envValue(
+    "SNACK_PROD_UPDATER_ENDPOINT",
     "https://snack.mechlabs.cn/api/desktop-updates/update?currentVersion={{current_version}}&target={{target}}&arch={{arch}}",
-  qa:
-    process.env.SNACK_QA_UPDATER_ENDPOINT ||
+  ),
+  qa: envValue(
+    "SNACK_QA_UPDATER_ENDPOINT",
     "https://qasnack.mechlabs.cn/api/desktop-updates/update?currentVersion={{current_version}}&target={{target}}&arch={{arch}}",
+  ),
 };
 
 const command = commandMap[process.argv[2]];
