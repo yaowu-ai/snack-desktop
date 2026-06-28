@@ -97,7 +97,7 @@ const normalizeUpdaterPubkey = (value) => {
     return pubkey;
   }
 
-  return `untrusted comment: tauri public key\n${pubkey}`;
+  return `untrusted comment: minisign public key ${pubkey.slice(0, 16)}\n${pubkey}`;
 };
 
 const updaterPubkey = normalizeUpdaterPubkey(
