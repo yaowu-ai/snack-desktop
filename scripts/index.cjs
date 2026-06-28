@@ -136,6 +136,7 @@ const tauriConfig = {
 const childEnv = {
   ...process.env,
   TAURI_CONFIG: JSON.stringify(tauriConfig),
+  TAURI_UPDATER_PUBKEY: updaterPubkey,
   SNACK_ENV: targetEnv,
   SNACK_FRONTEND_URL: frontendUrl,
 };
