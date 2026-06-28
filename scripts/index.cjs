@@ -81,6 +81,7 @@ if (!host || !updaterEndpoint) {
 
 const frontendUrl = `https://${host}`;
 const updaterPubkey = process.env.TAURI_UPDATER_PUBKEY || process.env.TAURI_PUBLIC_KEY;
+const createUpdaterArtifacts = process.env.SNACK_CREATE_UPDATER_ARTIFACTS !== "false";
 
 if (command === "build" && !updaterPubkey) {
   console.error(
@@ -93,6 +94,9 @@ const tauriConfig = {
   build: {
     devUrl: frontendUrl,
     frontendDist: frontendUrl,
+  },
+  bundle: {
+    createUpdaterArtifacts,
   },
   plugins: {
     updater: {

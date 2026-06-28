@@ -44,6 +44,14 @@ TAURI_SIGNING_PRIVATE_KEY
 TAURI_SIGNING_PRIVATE_KEY_PASSWORD
 ```
 
+Windows CI 暂时不生成 updater 签名产物：
+
+```text
+SNACK_CREATE_UPDATER_ARTIFACTS=false
+```
+
+这只会跳过 `.sig` / updater manifest 产物，不是 Windows 代码签名证书。
+
 可选覆盖：
 
 ```text

@@ -361,10 +361,9 @@ jobs:
         shell: bash
         env:
           TAURI_UPDATER_PUBKEY: ${{ secrets.TAURI_UPDATER_PUBKEY }}
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
         run: |
           missing=0
-          for name in TAURI_UPDATER_PUBKEY TAURI_SIGNING_PRIVATE_KEY
+          for name in TAURI_UPDATER_PUBKEY
           do
             if [[ -z "${!name}" ]]; then
               echo "::error::Missing required GitHub secret: ${name}"
@@ -378,8 +377,7 @@ jobs:
         env:
           CI: true
           TAURI_UPDATER_PUBKEY: ${{ secrets.TAURI_UPDATER_PUBKEY }}
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          SNACK_CREATE_UPDATER_ARTIFACTS: "false"
           SNACK_PROD_HOST: ${{ vars.SNACK_PROD_HOST }}
           SNACK_QA_HOST: ${{ vars.SNACK_QA_HOST }}
           SNACK_PROD_UPDATER_ENDPOINT: ${{ secrets.SNACK_PROD_UPDATER_ENDPOINT }}
