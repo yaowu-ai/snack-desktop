@@ -6,6 +6,7 @@ const dotenv = require("dotenv");
 
 const repoRoot = path.resolve(__dirname, "..");
 const envPath = path.join(repoRoot, ".env");
+const tauriConfPath = path.join(repoRoot, "src-tauri", "tauri.conf.json");
 const tauriBin = path.join(
   repoRoot,
   "node_modules",
@@ -115,7 +116,10 @@ const normalizeUpdaterPubkey = (value) => {
 const updaterPubkey = normalizeUpdaterPubkey(
   process.env.TAURI_UPDATER_PUBKEY || process.env.TAURI_PUBLIC_KEY
 );
-const createUpdaterArtifacts = process.env.SNACK_CREATE_UPDATER_ARTIFACTS === "true";
+const tauriConf = require(tauriConfPath);
+const createUpdaterArtifacts =
+  process.env.SNACK_CREATE_UPDATER_ARTIFACTS === "true" &&
+  tauriConf.bundle?.createUpdaterArtifacts !== false;
 
 if (command === "build" && createUpdaterArtifacts && !updaterPubkey) {
   console.error(
@@ -135,7 +139,7 @@ const tauriConfig = {
   plugins: {
     updater: {
       endpoints: [updaterEndpoint],
-      ...(updaterPubkey ? { pubkey: updaterPubkey } : {}),
+      ...(createUpdaterArtifacts && updaterPubkey ? { pubkey: updaterPubkey } : {}),
     },
   },
 };
