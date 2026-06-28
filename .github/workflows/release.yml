@@ -425,6 +425,7 @@ jobs:
         run: npm run build -- --bundles nsis
         env:
           CI: true
+          SNACK_CREATE_UPDATER_ARTIFACTS: false
           TAURI_UPDATER_PUBKEY: ${{ secrets.TAURI_UPDATER_PUBKEY }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
@@ -436,6 +437,9 @@ jobs:
 
       - name: Stage Windows bundle artifacts
         shell: bash
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: |
           SRC_DIR="src-tauri/target/release/bundle/nsis"
           DST_DIR="artifacts/Snack-${{ steps.version.outputs.artifact_version }}-windows-x64"
@@ -448,9 +452,26 @@ jobs:
             cp "$src" "$DST_DIR/$filename"
           done
 
-          find "$SRC_DIR" -type f -name '*.sig' -print0 | while IFS= read -r -d '' src; do
-            cp "$src" "$DST_DIR/Snack_${{ steps.version.outputs.artifact_version }}_windows_x64.exe.sig"
-          done
+          EXE_PATH="$DST_DIR/Snack_${{ steps.version.outputs.artifact_version }}_windows_x64.exe"
+          if [[ ! -s "$EXE_PATH" ]]; then
+            echo "Expected Windows installer not found: $EXE_PATH" >&2
+            exit 1
+          fi
+
+          SIGNATURE_PATH="${EXE_PATH}.sig"
+          rm -f "$SIGNATURE_PATH"
+          SIGN_OUTPUT="$(npx tauri signer sign \
+            -k "$TAURI_SIGNING_PRIVATE_KEY" \
+            ${TAURI_SIGNING_PRIVATE_KEY_PASSWORD:+-p "$TAURI_SIGNING_PRIVATE_KEY_PASSWORD"} \
+            "$EXE_PATH")"
+          if [[ ! -s "$SIGNATURE_PATH" ]]; then
+            printf '%s\n' "$SIGN_OUTPUT" | awk '/^Public signature:/{getline; print; exit}' > "$SIGNATURE_PATH"
+            if [[ ! -s "$SIGNATURE_PATH" ]]; then
+              echo "Failed to extract Windows updater signature." >&2
+              printf '%s\n' "$SIGN_OUTPUT" >&2
+              exit 1
+            fi
+          fi
 
           find "$DST_DIR" -maxdepth 1 -type f -print
 

@@ -73,6 +73,31 @@ PY
   fi
 }
 
+create_dmg() {
+  local attempt
+
+  for attempt in 1 2 3; do
+    rm -f "${DMG_PATH}"
+    if hdiutil create \
+      -volname "${APP_NAME}" \
+      -srcfolder "${STAGING_DIR}" \
+      -ov \
+      -format UDZO \
+      "${DMG_PATH}"; then
+      return 0
+    fi
+
+    echo "hdiutil create failed, retrying (${attempt}/3)." >&2
+    hdiutil info | awk '/\/Volumes\/'"${APP_NAME}"'/{print $1}' | while read -r device; do
+      hdiutil detach "${device}" -force || true
+    done
+    sleep "$((attempt * 5))"
+  done
+
+  echo "Failed to create DMG after retries: ${DMG_PATH}" >&2
+  return 1
+}
+
 rm -f "${APP_ZIP_PATH}" "${DMG_PATH}" "${UPDATER_ARCHIVE_PATH}" "${UPDATER_SIGNATURE_PATH}"
 
 echo "===== Build environment ====="
@@ -132,12 +157,7 @@ trap cleanup EXIT
 ditto "${APP_PATH}" "${STAGING_DIR}/${APP_NAME}.app"
 ln -s /Applications "${STAGING_DIR}/Applications"
 
-hdiutil create \
-  -volname "${APP_NAME}" \
-  -srcfolder "${STAGING_DIR}" \
-  -ov \
-  -format UDZO \
-  "${DMG_PATH}"
+create_dmg
 
 codesign \
   --force \

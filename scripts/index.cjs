@@ -93,14 +93,21 @@ const normalizeUpdaterPubkey = (value) => {
     return "";
   }
 
-  const minisignPubkey = pubkey.includes("\n")
-    ? pubkey
-    : `untrusted comment: minisign public key ${pubkey.slice(0, 16)}\n${pubkey}`;
-
   const decodedPubkey = Buffer.from(pubkey, "base64").toString("utf8");
   if (decodedPubkey.startsWith("untrusted comment:")) {
     return pubkey;
   }
+
+  if (pubkey.startsWith("untrusted comment:")) {
+    return Buffer.from(pubkey, "utf8").toString("base64");
+  }
+
+  const barePubkey =
+    decodedPubkey.startsWith("RW") && !decodedPubkey.includes("\n") ? decodedPubkey : pubkey;
+
+  const minisignPubkey = barePubkey.includes("\n")
+    ? barePubkey
+    : `untrusted comment: minisign public key ${barePubkey.slice(0, 16)}\n${barePubkey}`;
 
   return Buffer.from(minisignPubkey, "utf8").toString("base64");
 };
@@ -128,7 +135,7 @@ const tauriConfig = {
   plugins: {
     updater: {
       endpoints: [updaterEndpoint],
-      ...(createUpdaterArtifacts && updaterPubkey ? { pubkey: updaterPubkey } : {}),
+      ...(updaterPubkey ? { pubkey: updaterPubkey } : {}),
     },
   },
 };
