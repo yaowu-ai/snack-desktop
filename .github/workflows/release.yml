@@ -3,7 +3,7 @@ name: Release
 on:
   push:
     branches: ["test"]
-    tags: ["v*"]
+    tags: ["v*", "*.*.*"]
 
 concurrency:
   group: release-${{ github.ref }}
@@ -147,7 +147,10 @@ jobs:
         if: github.ref_type == 'tag'
         uses: softprops/action-gh-release@v1
         with:
-          files: src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/Snack_${{ steps.version.outputs.artifact_version }}_apple-silicon.dmg
+          files: |
+            src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/Snack_${{ steps.version.outputs.artifact_version }}_macos_arm64.dmg
+            src-tauri/target/aarch64-apple-darwin/release/bundle/macos/Snack_${{ steps.version.outputs.artifact_version }}_macos_arm64.app.tar.gz
+            src-tauri/target/aarch64-apple-darwin/release/bundle/macos/Snack_${{ steps.version.outputs.artifact_version }}_macos_arm64.app.tar.gz.sig
           token: ${{ secrets.GITHUB_TOKEN }}
           fail_on_unmatched_files: true
 
@@ -156,7 +159,10 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: Snack-${{ steps.version.outputs.artifact_version }}-apple-silicon
-          path: src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/Snack_${{ steps.version.outputs.artifact_version }}_apple-silicon.dmg
+          path: |
+            src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/Snack_${{ steps.version.outputs.artifact_version }}_macos_arm64.dmg
+            src-tauri/target/aarch64-apple-darwin/release/bundle/macos/Snack_${{ steps.version.outputs.artifact_version }}_macos_arm64.app.tar.gz
+            src-tauri/target/aarch64-apple-darwin/release/bundle/macos/Snack_${{ steps.version.outputs.artifact_version }}_macos_arm64.app.tar.gz.sig
           if-no-files-found: error
 
   build-macos-x64:
@@ -292,7 +298,10 @@ jobs:
         if: github.ref_type == 'tag'
         uses: softprops/action-gh-release@v1
         with:
-          files: src-tauri/target/x86_64-apple-darwin/release/bundle/dmg/Snack_${{ steps.version.outputs.artifact_version }}_intel.dmg
+          files: |
+            src-tauri/target/x86_64-apple-darwin/release/bundle/dmg/Snack_${{ steps.version.outputs.artifact_version }}_macos_x64.dmg
+            src-tauri/target/x86_64-apple-darwin/release/bundle/macos/Snack_${{ steps.version.outputs.artifact_version }}_macos_x64.app.tar.gz
+            src-tauri/target/x86_64-apple-darwin/release/bundle/macos/Snack_${{ steps.version.outputs.artifact_version }}_macos_x64.app.tar.gz.sig
           token: ${{ secrets.GITHUB_TOKEN }}
           fail_on_unmatched_files: true
 
@@ -301,7 +310,10 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: Snack-${{ steps.version.outputs.artifact_version }}-intel
-          path: src-tauri/target/x86_64-apple-darwin/release/bundle/dmg/Snack_${{ steps.version.outputs.artifact_version }}_intel.dmg
+          path: |
+            src-tauri/target/x86_64-apple-darwin/release/bundle/dmg/Snack_${{ steps.version.outputs.artifact_version }}_macos_x64.dmg
+            src-tauri/target/x86_64-apple-darwin/release/bundle/macos/Snack_${{ steps.version.outputs.artifact_version }}_macos_x64.app.tar.gz
+            src-tauri/target/x86_64-apple-darwin/release/bundle/macos/Snack_${{ steps.version.outputs.artifact_version }}_macos_x64.app.tar.gz.sig
           if-no-files-found: error
 
   build-windows-x64:
@@ -357,22 +369,29 @@ jobs:
           echo "app_version=$APP_VERSION" >> "$GITHUB_OUTPUT"
           echo "artifact_version=$ARTIFACT_VERSION" >> "$GITHUB_OUTPUT"
 
-      - name: Disable Windows updater artifacts
+      - name: Validate required secrets
         shell: bash
+        env:
+          TAURI_UPDATER_PUBKEY: ${{ secrets.TAURI_UPDATER_PUBKEY }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
         run: |
-          node -e "
-            const fs = require('fs');
-            const path = 'src-tauri/tauri.conf.json';
-            const conf = JSON.parse(fs.readFileSync(path, 'utf8'));
-            conf.bundle = conf.bundle || {};
-            conf.bundle.createUpdaterArtifacts = false;
-            fs.writeFileSync(path, JSON.stringify(conf, null, 2) + '\n');
-          "
+          missing=0
+          for name in TAURI_UPDATER_PUBKEY TAURI_SIGNING_PRIVATE_KEY
+          do
+            if [[ -z "${!name}" ]]; then
+              echo "::error::Missing required GitHub secret: ${name}"
+              missing=1
+            fi
+          done
+          exit "$missing"
 
       - name: Build Tauri app
         run: npm run build -- --bundles nsis
         env:
           CI: true
+          TAURI_UPDATER_PUBKEY: ${{ secrets.TAURI_UPDATER_PUBKEY }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
           SNACK_PROD_HOST: ${{ vars.SNACK_PROD_HOST }}
           SNACK_QA_HOST: ${{ vars.SNACK_QA_HOST }}
           SNACK_PROD_UPDATER_ENDPOINT: ${{ secrets.SNACK_PROD_UPDATER_ENDPOINT }}
@@ -389,7 +408,12 @@ jobs:
           find "$SRC_DIR" -type f -name '*.exe' -print0 | while IFS= read -r -d '' src; do
             filename="$(basename "$src")"
             filename="${filename//${{ steps.version.outputs.app_version }}/${{ steps.version.outputs.artifact_version }}}"
+            filename="Snack_${{ steps.version.outputs.artifact_version }}_windows_x64.exe"
             cp "$src" "$DST_DIR/$filename"
+          done
+
+          find "$SRC_DIR" -type f -name '*.sig' -print0 | while IFS= read -r -d '' src; do
+            cp "$src" "$DST_DIR/Snack_${{ steps.version.outputs.artifact_version }}_windows_x64.exe.sig"
           done
 
           find "$DST_DIR" -maxdepth 1 -type f -print

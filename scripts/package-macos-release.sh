@@ -15,7 +15,14 @@ BUNDLE_ROOT="src-tauri/target/${TARGET_TRIPLE}/release/bundle"
 APP_PATH="${BUNDLE_ROOT}/macos/${APP_NAME}.app"
 APP_ZIP_PATH="${BUNDLE_ROOT}/macos/${APP_NAME}.zip"
 DMG_DIR="${BUNDLE_ROOT}/dmg"
-DMG_PATH="${DMG_DIR}/${APP_NAME}_${APP_VERSION}_${DMG_ARCH_SUFFIX}.dmg"
+if [[ "${DMG_ARCH_SUFFIX}" == "apple-silicon" ]]; then
+  RELEASE_ARCH_SUFFIX="arm64"
+else
+  RELEASE_ARCH_SUFFIX="x64"
+fi
+DMG_PATH="${DMG_DIR}/${APP_NAME}_${APP_VERSION}_macos_${RELEASE_ARCH_SUFFIX}.dmg"
+UPDATER_ARCHIVE_PATH="${BUNDLE_ROOT}/macos/${APP_NAME}_${APP_VERSION}_macos_${RELEASE_ARCH_SUFFIX}.app.tar.gz"
+UPDATER_SIGNATURE_PATH="${UPDATER_ARCHIVE_PATH}.sig"
 
 submit_for_notarization() {
   local artifact_path="$1"
@@ -66,7 +73,7 @@ PY
   fi
 }
 
-rm -f "${APP_ZIP_PATH}" "${DMG_PATH}"
+rm -f "${APP_ZIP_PATH}" "${DMG_PATH}" "${UPDATER_ARCHIVE_PATH}" "${UPDATER_SIGNATURE_PATH}"
 
 echo "===== Build environment ====="
 uname -a || true
@@ -100,6 +107,18 @@ codesign --verify --deep --strict --verbose=2 "${APP_PATH}"
 ditto -c -k --keepParent --sequesterRsrc "${APP_PATH}" "${APP_ZIP_PATH}"
 submit_for_notarization "${APP_ZIP_PATH}" "${APP_NAME}.zip"
 xcrun stapler staple "${APP_PATH}"
+
+tar -czf "${UPDATER_ARCHIVE_PATH}" -C "${BUNDLE_ROOT}/macos" "${APP_NAME}.app"
+SIGN_OUTPUT="$(npx tauri signer sign \
+  -k "${TAURI_SIGNING_PRIVATE_KEY}" \
+  ${TAURI_SIGNING_PRIVATE_KEY_PASSWORD:+-p "${TAURI_SIGNING_PRIVATE_KEY_PASSWORD}"} \
+  "${UPDATER_ARCHIVE_PATH}")"
+printf '%s\n' "${SIGN_OUTPUT}" | awk '/^Signature:/{getline; print; exit}' > "${UPDATER_SIGNATURE_PATH}"
+if [[ ! -s "${UPDATER_SIGNATURE_PATH}" ]]; then
+  echo "Failed to extract updater signature." >&2
+  printf '%s\n' "${SIGN_OUTPUT}" >&2
+  exit 1
+fi
 
 mkdir -p "${DMG_DIR}"
 STAGING_DIR="$(mktemp -d)"
