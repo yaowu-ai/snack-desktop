@@ -113,11 +113,13 @@ SIGN_OUTPUT="$(npx tauri signer sign \
   -k "${TAURI_SIGNING_PRIVATE_KEY}" \
   ${TAURI_SIGNING_PRIVATE_KEY_PASSWORD:+-p "${TAURI_SIGNING_PRIVATE_KEY_PASSWORD}"} \
   "${UPDATER_ARCHIVE_PATH}")"
-printf '%s\n' "${SIGN_OUTPUT}" | awk '/^Signature:/{getline; print; exit}' > "${UPDATER_SIGNATURE_PATH}"
 if [[ ! -s "${UPDATER_SIGNATURE_PATH}" ]]; then
-  echo "Failed to extract updater signature." >&2
-  printf '%s\n' "${SIGN_OUTPUT}" >&2
-  exit 1
+  printf '%s\n' "${SIGN_OUTPUT}" | awk '/^Public signature:/{getline; print; exit}' > "${UPDATER_SIGNATURE_PATH}"
+  if [[ ! -s "${UPDATER_SIGNATURE_PATH}" ]]; then
+    echo "Failed to extract updater signature." >&2
+    printf '%s\n' "${SIGN_OUTPUT}" >&2
+    exit 1
+  fi
 fi
 
 mkdir -p "${DMG_DIR}"
