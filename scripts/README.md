@@ -1,128 +1,78 @@
-# Snack desktop scripts
+# Snack Desktop Build
 
-这些脚本分两种使用场景：本地调试和打包构建。命令都从 `snack-desktop`
-项目根目录执行。
+`scripts/dev.ps1`、`scripts/build.ps1`、`scripts/dev.cmd` 和 `scripts/build.cmd`
+已经废弃。不要再通过它们设置 `SNACK_DESKTOP_ENV` 或直接进入 `src-tauri`
+执行 `cargo run` / `cargo tauri build`。
 
-`.cmd` 是 Windows 下的便捷入口，内部会转发到对应的 `.ps1` 脚本。后续调整
-逻辑时优先改 `.ps1`。
+当前入口统一从项目根目录执行：
 
-## 本地调试
-
-默认启动 `dev` 环境：
-
-```powershell
-.\scripts\dev.ps1
+```bash
+npm run dev -- prod
+npm run dev -- qa
+npm run build -- prod
+npm run build -- qa
 ```
 
-指定环境启动：
-
-```powershell
-.\scripts\dev.ps1 dev
-.\scripts\dev.ps1 test
-.\scripts\dev.ps1 prod
-```
-
-指定环境和 UA 版本号启动：
-
-```powershell
-.\scripts\dev.ps1 dev 1.0.0
-.\scripts\dev.ps1 test 1.0.0
-```
-
-CMD 入口：
-
-```cmd
-scripts\dev.cmd
-scripts\dev.cmd test
-scripts\dev.cmd prod
-scripts\dev.cmd dev 1.0.0
-```
-
-执行规则：
+CI 打包规则：
 
 ```text
-1. 设置 SNACK_DESKTOP_ENV。
-2. 如果传入第二个参数，则设置 SNACK_DESKTOP_VERSION。
-3. 进入 src-tauri 目录执行 cargo run。
-4. build.rs 根据环境选择 Web 地址。
-5. lib.rs 创建 WebView，并设置桌面端 UA。
+push 到 test 分支 -> QA 测试包，上传 GitHub Actions artifacts
+push v* tag -> 正式包，tag 指向的 commit 必须属于 prod 分支历史，上传 GitHub Release
 ```
 
-环境地址：
+打包脚本会从 GitHub ref 推导环境：`test` 分支使用 `qa`，tag 使用 `prod`。
+本地显式传参或设置 `SNACK_ENV` 时，以本地输入为准。
+
+## 打包环境变量
+
+必需：
 
 ```text
-dev  -> http://localhost:3000
-test -> https://qasnack.mechlabs.cn
-prod -> https://snack.mechlabs.cn
+TAURI_UPDATER_PUBKEY
 ```
 
-## 打包构建
-
-默认构建 `prod` 环境：
-
-```powershell
-.\scripts\build.ps1
-```
-
-指定环境构建：
-
-```powershell
-.\scripts\build.ps1 test
-.\scripts\build.ps1 prod
-```
-
-指定环境和 UA 版本号构建：
-
-```powershell
-.\scripts\build.ps1 prod 1.0.0
-```
-
-CMD 入口：
-
-```cmd
-scripts\build.cmd
-scripts\build.cmd test
-scripts\build.cmd prod 1.0.0
-```
-
-执行规则：
+兼容旧变量名：
 
 ```text
-1. 设置 SNACK_DESKTOP_ENV。
-2. 如果传入第二个参数，则设置 SNACK_DESKTOP_VERSION。
-3. 进入 src-tauri 目录执行 cargo tauri build。
-4. build.rs 将 Web 地址、平台、架构、版本号写入编译产物。
-5. 安装后的客户端会保留打包时写入的 UA 信息。
+TAURI_PUBLIC_KEY
 ```
 
-安装包输出目录：
+生成 updater 签名包时需要：
 
 ```text
-src-tauri\target\release\bundle\
+TAURI_SIGNING_PRIVATE_KEY
+TAURI_SIGNING_PRIVATE_KEY_PASSWORD
 ```
 
-## 自动更新框架
-
-桌面端使用 Tauri v2 updater plugin。打包前需要先生成 updater keypair，并在
-构建环境设置公钥：
-
-```powershell
-npx tauri signer generate
-$env:TAURI_UPDATER_PUBKEY = "..."
-```
-
-`npm run build -- prod` / `npm run build -- qa` 会通过 `TAURI_CONFIG` 注入对应
-Web 地址和 updater endpoint。默认 endpoint 仍指向网站动态 API，后续接入
-GitHub Actions 全平台打包后，可以用环境变量切到静态 CDN manifest：
+可选覆盖：
 
 ```text
-SNACK_PROD_UPDATER_ENDPOINT=https://cdn.example.com/desktop-updates/prod/latest.json
-SNACK_QA_UPDATER_ENDPOINT=https://cdn.example.com/desktop-updates/qa/latest.json
+SNACK_ENV
+SNACK_PROD_HOST
+SNACK_QA_HOST
+SNACK_PROD_UPDATER_ENDPOINT
+SNACK_QA_UPDATER_ENDPOINT
+SNACK_DESKTOP_BASE_UA
+SNACK_DESKTOP_VERSION
 ```
 
-构建签名包时还需要按 Tauri 要求提供私钥环境变量（例如
-`TAURI_SIGNING_PRIVATE_KEY` 和对应密码）。生成的安装包签名内容回填到
-`h-snack-website` 的桌面版本管理后，网站会生成 updater manifest。
+`prod` 默认地址是 `snack.mechlabs.cn`，`qa` 默认地址是
+`qasnack.mechlabs.cn`。CI 中 `SNACK_PROD_HOST` 和 `SNACK_QA_HOST` 来自
+GitHub Actions Variables；本地环境变量会覆盖默认值。
+
+macOS release CI 额外需要：
+
+```text
+TARGET_TRIPLE
+APP_VERSION
+DMG_ARCH_SUFFIX
+APPLE_CERTIFICATE
+APPLE_CERTIFICATE_PASSWORD
+APPLE_SIGNING_IDENTITY
+APPLE_ID
+APPLE_PASSWORD
+APPLE_TEAM_ID
+```
 
 ## UA 规则
 
@@ -141,9 +91,8 @@ Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko)
 版本号来源：
 
 ```text
-1. 调试或打包命令第二个参数，例如 .\scripts\dev.ps1 dev 1.0.0。
-2. SNACK_DESKTOP_VERSION 环境变量。
-3. src-tauri/Cargo.toml 中的 Rust 包版本。
+1. SNACK_DESKTOP_VERSION 环境变量。
+2. src-tauri/Cargo.toml 中的 Rust 包版本。
 ```
 
 基础浏览器 UA 默认按平台选择，参考 Pake 的做法：macOS 使用 Safari 风格 UA，
@@ -154,10 +103,7 @@ Windows/Linux 使用 Chrome 风格 UA。需要覆盖时设置 `SNACK_DESKTOP_BAS
 调整环境、地址、版本号或 UA 时，同步检查这些文件：
 
 ```text
-scripts/dev.ps1
-scripts/build.ps1
-scripts/dev.cmd
-scripts/build.cmd
+scripts/index.cjs
 src-tauri/build.rs
 src-tauri/src/lib.rs
 scripts/README.md

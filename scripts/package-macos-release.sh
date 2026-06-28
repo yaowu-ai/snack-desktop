@@ -78,7 +78,7 @@ npm --version || true
 echo "TARGET_TRIPLE=${TARGET_TRIPLE}"
 echo
 
-CI=true npm run build -- prod --bundles app --target "${TARGET_TRIPLE}" --no-sign
+CI=true npm run build -- --bundles app --target "${TARGET_TRIPLE}" --no-sign
 
 if [[ ! -d "${APP_PATH}" ]]; then
   echo "Expected app bundle not found: ${APP_PATH}" >&2

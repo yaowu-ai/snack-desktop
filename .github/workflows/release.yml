@@ -2,9 +2,8 @@ name: Release
 
 on:
   push:
-    branches: ["develop"]
-  release:
-    types: [published]
+    branches: ["test"]
+    tags: ["v*"]
 
 concurrency:
   group: release-${{ github.ref }}
@@ -20,6 +19,19 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate release tag belongs to prod
+        if: github.ref_type == 'tag'
+        shell: bash
+        run: |
+          git fetch origin prod
+          TAG_COMMIT="$(git rev-list -n 1 "${GITHUB_REF_NAME}")"
+          if ! git merge-base --is-ancestor "${TAG_COMMIT}" origin/prod; then
+            echo "::error::Release tag ${GITHUB_REF_NAME} must point to a commit contained in origin/prod."
+            exit 1
+          fi
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -35,17 +47,14 @@ jobs:
 
       - name: Resolve app version
         id: version
-        env:
-          EVENT_NAME: ${{ github.event_name }}
-          RELEASE_TAG: ${{ github.event.release.tag_name }}
         run: |
-          if [[ "$EVENT_NAME" == "release" ]]; then
-            APP_VERSION="${RELEASE_TAG#v}"
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            APP_VERSION="${GITHUB_REF_NAME#v}"
             ARTIFACT_VERSION="$APP_VERSION"
           else
             APP_VERSION="$(node -p "require('./package.json').version")"
             SHORT_SHA="${GITHUB_SHA:0:7}"
-            ARTIFACT_VERSION="${APP_VERSION}-dev.${GITHUB_RUN_NUMBER}.${SHORT_SHA}"
+            ARTIFACT_VERSION="${APP_VERSION}-qa.${GITHUB_RUN_NUMBER}.${SHORT_SHA}"
           fi
 
           echo "Building app version: $APP_VERSION"
@@ -124,8 +133,10 @@ jobs:
           TAURI_UPDATER_PUBKEY: ${{ secrets.TAURI_UPDATER_PUBKEY }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-          SNACK_PROD_HOST: ${{ secrets.SNACK_PROD_HOST }}
+          SNACK_PROD_HOST: ${{ vars.SNACK_PROD_HOST }}
+          SNACK_QA_HOST: ${{ vars.SNACK_QA_HOST }}
           SNACK_PROD_UPDATER_ENDPOINT: ${{ secrets.SNACK_PROD_UPDATER_ENDPOINT }}
+          SNACK_QA_UPDATER_ENDPOINT: ${{ secrets.SNACK_QA_UPDATER_ENDPOINT }}
           SNACK_DESKTOP_BASE_UA: ${{ secrets.SNACK_DESKTOP_BASE_UA }}
           TARGET_TRIPLE: aarch64-apple-darwin
           APP_VERSION: ${{ steps.version.outputs.artifact_version }}
@@ -133,7 +144,7 @@ jobs:
         run: bash scripts/package-macos-release.sh
 
       - name: Upload arm64 DMG to Release
-        if: github.event_name == 'release'
+        if: github.ref_type == 'tag'
         uses: softprops/action-gh-release@v1
         with:
           files: src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/Snack_${{ steps.version.outputs.artifact_version }}_apple-silicon.dmg
@@ -141,7 +152,7 @@ jobs:
           fail_on_unmatched_files: true
 
       - name: Upload arm64 DMG artifact
-        if: github.event_name == 'push'
+        if: github.ref == 'refs/heads/test'
         uses: actions/upload-artifact@v4
         with:
           name: Snack-${{ steps.version.outputs.artifact_version }}-apple-silicon
@@ -153,6 +164,19 @@ jobs:
     runs-on: macos-26-intel
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate release tag belongs to prod
+        if: github.ref_type == 'tag'
+        shell: bash
+        run: |
+          git fetch origin prod
+          TAG_COMMIT="$(git rev-list -n 1 "${GITHUB_REF_NAME}")"
+          if ! git merge-base --is-ancestor "${TAG_COMMIT}" origin/prod; then
+            echo "::error::Release tag ${GITHUB_REF_NAME} must point to a commit contained in origin/prod."
+            exit 1
+          fi
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -168,17 +192,14 @@ jobs:
 
       - name: Resolve app version
         id: version
-        env:
-          EVENT_NAME: ${{ github.event_name }}
-          RELEASE_TAG: ${{ github.event.release.tag_name }}
         run: |
-          if [[ "$EVENT_NAME" == "release" ]]; then
-            APP_VERSION="${RELEASE_TAG#v}"
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            APP_VERSION="${GITHUB_REF_NAME#v}"
             ARTIFACT_VERSION="$APP_VERSION"
           else
             APP_VERSION="$(node -p "require('./package.json').version")"
             SHORT_SHA="${GITHUB_SHA:0:7}"
-            ARTIFACT_VERSION="${APP_VERSION}-dev.${GITHUB_RUN_NUMBER}.${SHORT_SHA}"
+            ARTIFACT_VERSION="${APP_VERSION}-qa.${GITHUB_RUN_NUMBER}.${SHORT_SHA}"
           fi
 
           echo "Building app version: $APP_VERSION"
@@ -257,8 +278,10 @@ jobs:
           TAURI_UPDATER_PUBKEY: ${{ secrets.TAURI_UPDATER_PUBKEY }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-          SNACK_PROD_HOST: ${{ secrets.SNACK_PROD_HOST }}
+          SNACK_PROD_HOST: ${{ vars.SNACK_PROD_HOST }}
+          SNACK_QA_HOST: ${{ vars.SNACK_QA_HOST }}
           SNACK_PROD_UPDATER_ENDPOINT: ${{ secrets.SNACK_PROD_UPDATER_ENDPOINT }}
+          SNACK_QA_UPDATER_ENDPOINT: ${{ secrets.SNACK_QA_UPDATER_ENDPOINT }}
           SNACK_DESKTOP_BASE_UA: ${{ secrets.SNACK_DESKTOP_BASE_UA }}
           TARGET_TRIPLE: x86_64-apple-darwin
           APP_VERSION: ${{ steps.version.outputs.artifact_version }}
@@ -266,7 +289,7 @@ jobs:
         run: bash scripts/package-macos-release.sh
 
       - name: Upload x64 DMG to Release
-        if: github.event_name == 'release'
+        if: github.ref_type == 'tag'
         uses: softprops/action-gh-release@v1
         with:
           files: src-tauri/target/x86_64-apple-darwin/release/bundle/dmg/Snack_${{ steps.version.outputs.artifact_version }}_intel.dmg
@@ -274,7 +297,7 @@ jobs:
           fail_on_unmatched_files: true
 
       - name: Upload x64 DMG artifact
-        if: github.event_name == 'push'
+        if: github.ref == 'refs/heads/test'
         uses: actions/upload-artifact@v4
         with:
           name: Snack-${{ steps.version.outputs.artifact_version }}-intel
@@ -286,6 +309,19 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate release tag belongs to prod
+        if: github.ref_type == 'tag'
+        shell: bash
+        run: |
+          git fetch origin prod
+          TAG_COMMIT="$(git rev-list -n 1 "${GITHUB_REF_NAME}")"
+          if ! git merge-base --is-ancestor "${TAG_COMMIT}" origin/prod; then
+            echo "::error::Release tag ${GITHUB_REF_NAME} must point to a commit contained in origin/prod."
+            exit 1
+          fi
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -298,18 +334,15 @@ jobs:
 
       - name: Resolve app version
         id: version
-        env:
-          EVENT_NAME: ${{ github.event_name }}
-          RELEASE_TAG: ${{ github.event.release.tag_name }}
         shell: bash
         run: |
-          if [[ "$EVENT_NAME" == "release" ]]; then
-            APP_VERSION="${RELEASE_TAG#v}"
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            APP_VERSION="${GITHUB_REF_NAME#v}"
             ARTIFACT_VERSION="$APP_VERSION"
           else
             APP_VERSION="$(node -p "require('./package.json').version")"
             SHORT_SHA="${GITHUB_SHA:0:7}"
-            ARTIFACT_VERSION="${APP_VERSION}-dev.${GITHUB_RUN_NUMBER}.${SHORT_SHA}"
+            ARTIFACT_VERSION="${APP_VERSION}-qa.${GITHUB_RUN_NUMBER}.${SHORT_SHA}"
           fi
 
           echo "Building app version: $APP_VERSION"
@@ -341,14 +374,16 @@ jobs:
           exit "$missing"
 
       - name: Build Tauri app
-        run: npm run build -- prod
+        run: npm run build
         env:
           CI: true
           TAURI_UPDATER_PUBKEY: ${{ secrets.TAURI_UPDATER_PUBKEY }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-          SNACK_PROD_HOST: ${{ secrets.SNACK_PROD_HOST }}
+          SNACK_PROD_HOST: ${{ vars.SNACK_PROD_HOST }}
+          SNACK_QA_HOST: ${{ vars.SNACK_QA_HOST }}
           SNACK_PROD_UPDATER_ENDPOINT: ${{ secrets.SNACK_PROD_UPDATER_ENDPOINT }}
+          SNACK_QA_UPDATER_ENDPOINT: ${{ secrets.SNACK_QA_UPDATER_ENDPOINT }}
           SNACK_DESKTOP_BASE_UA: ${{ secrets.SNACK_DESKTOP_BASE_UA }}
 
       - name: Stage Windows bundle artifacts
@@ -372,7 +407,7 @@ jobs:
           find "$DST_DIR" -maxdepth 1 -type f -print
 
       - name: Upload Windows bundle to Release
-        if: github.event_name == 'release'
+        if: github.ref_type == 'tag'
         uses: softprops/action-gh-release@v1
         with:
           files: artifacts/Snack-${{ steps.version.outputs.artifact_version }}-windows-x64/*
@@ -380,7 +415,7 @@ jobs:
           fail_on_unmatched_files: true
 
       - name: Upload Windows bundle artifact
-        if: github.event_name == 'push'
+        if: github.ref == 'refs/heads/test'
         uses: actions/upload-artifact@v4
         with:
           name: Snack-${{ steps.version.outputs.artifact_version }}-windows-x64

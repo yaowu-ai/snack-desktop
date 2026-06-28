@@ -22,6 +22,26 @@ const commandMap = {
   build: "build",
 };
 
+const inferEnvFromGitRef = () => {
+  const ref = process.env.GITHUB_REF || "";
+  const refName = process.env.GITHUB_REF_NAME || "";
+  const refType = process.env.GITHUB_REF_TYPE || "";
+
+  if (refType === "tag" || ref.startsWith("refs/tags/")) {
+    return "prod";
+  }
+
+  if (refName === "test" || ref === "refs/heads/test") {
+    return "qa";
+  }
+
+  if (refName === "prod" || ref === "refs/heads/prod") {
+    return "prod";
+  }
+
+  return "prod";
+};
+
 const hostMap = {
   prod: process.env.SNACK_PROD_HOST || "snack.mechlabs.cn",
   qa: process.env.SNACK_QA_HOST || "qasnack.mechlabs.cn",
@@ -44,7 +64,7 @@ if (!command) {
 }
 
 const args = process.argv.slice(3);
-let targetEnv = (process.env.SNACK_ENV || "prod").toLowerCase();
+let targetEnv = (process.env.SNACK_ENV || inferEnvFromGitRef()).toLowerCase();
 
 if (args[0] && !args[0].startsWith("-")) {
   targetEnv = args.shift().toLowerCase();
@@ -97,6 +117,7 @@ const child = spawn(tauriBin, [command, ...args], {
   cwd: repoRoot,
   stdio: "inherit",
   env: childEnv,
+  shell: process.platform === "win32",
 });
 
 child.on("exit", (code, signal) => {
