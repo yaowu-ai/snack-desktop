@@ -87,7 +87,22 @@ if (!host || !updaterEndpoint) {
 }
 
 const frontendUrl = `https://${host}`;
-const updaterPubkey = process.env.TAURI_UPDATER_PUBKEY || process.env.TAURI_PUBLIC_KEY;
+const normalizeUpdaterPubkey = (value) => {
+  const pubkey = value?.trim();
+  if (!pubkey) {
+    return "";
+  }
+
+  if (pubkey.includes("\n")) {
+    return pubkey;
+  }
+
+  return `untrusted comment: tauri public key\n${pubkey}`;
+};
+
+const updaterPubkey = normalizeUpdaterPubkey(
+  process.env.TAURI_UPDATER_PUBKEY || process.env.TAURI_PUBLIC_KEY
+);
 const createUpdaterArtifacts = process.env.SNACK_CREATE_UPDATER_ARTIFACTS !== "false";
 
 if (command === "build" && createUpdaterArtifacts && !updaterPubkey) {
