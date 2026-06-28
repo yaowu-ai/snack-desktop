@@ -115,7 +115,7 @@ const normalizeUpdaterPubkey = (value) => {
 const updaterPubkey = normalizeUpdaterPubkey(
   process.env.TAURI_UPDATER_PUBKEY || process.env.TAURI_PUBLIC_KEY
 );
-const createUpdaterArtifacts = process.env.SNACK_CREATE_UPDATER_ARTIFACTS !== "false";
+const createUpdaterArtifacts = process.env.SNACK_CREATE_UPDATER_ARTIFACTS === "true";
 
 if (command === "build" && createUpdaterArtifacts && !updaterPubkey) {
   console.error(

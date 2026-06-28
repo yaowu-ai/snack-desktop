@@ -71,11 +71,12 @@ TAURI_SIGNING_PRIVATE_KEY
 TAURI_SIGNING_PRIVATE_KEY_PASSWORD
 ```
 
-Windows CI 也会生成 updater 签名产物，并随 GitHub Release 上传 `.exe`
-和 `.exe.sig`。如果本地临时跳过 updater 产物，可设置：
+CI 会手动为 updater release 产物生成签名，并随 GitHub Release 上传 `.sig`。
+默认关闭 Tauri CLI 自带的 updater artifact 生成，避免打包阶段重复处理签名。
+如果需要本地显式启用 Tauri CLI 自带 updater artifact 生成，可设置：
 
 ```text
-SNACK_CREATE_UPDATER_ARTIFACTS=false
+SNACK_CREATE_UPDATER_ARTIFACTS=true
 ```
 
 可选覆盖：
