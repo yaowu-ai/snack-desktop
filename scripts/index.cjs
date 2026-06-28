@@ -93,11 +93,16 @@ const normalizeUpdaterPubkey = (value) => {
     return "";
   }
 
-  if (pubkey.includes("\n")) {
+  const minisignPubkey = pubkey.includes("\n")
+    ? pubkey
+    : `untrusted comment: minisign public key ${pubkey.slice(0, 16)}\n${pubkey}`;
+
+  const decodedPubkey = Buffer.from(pubkey, "base64").toString("utf8");
+  if (decodedPubkey.startsWith("untrusted comment:")) {
     return pubkey;
   }
 
-  return `untrusted comment: minisign public key ${pubkey.slice(0, 16)}\n${pubkey}`;
+  return Buffer.from(minisignPubkey, "utf8").toString("base64");
 };
 
 const updaterPubkey = normalizeUpdaterPubkey(
