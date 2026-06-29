@@ -4,12 +4,16 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 #[cfg(windows)]
 use std::time::Duration;
-use tauri::{AppHandle, Manager, Url, UserAttentionType, WebviewWindow, WebviewWindowBuilder};
 #[cfg(any(target_os = "macos", windows))]
 use tauri::include_image;
+use tauri::{AppHandle, Manager, Url, UserAttentionType, WebviewWindow, WebviewWindowBuilder};
 
 #[cfg(any(target_os = "macos", windows))]
 const TRAY_ID: &str = "main-tray";
+#[cfg(any(target_os = "macos", windows))]
+const TRAY_MENU_SHOW_ID: &str = "show";
+#[cfg(any(target_os = "macos", windows))]
+const TRAY_MENU_QUIT_ID: &str = "quit";
 #[cfg(any(target_os = "macos", windows))]
 const TRAY_DEFAULT_ICON: tauri::image::Image<'_> = include_image!("./icons/32x32.png");
 #[cfg(any(target_os = "macos", windows))]
@@ -165,6 +169,7 @@ fn desktop_user_agent() -> String {
 
 #[cfg(windows)]
 fn setup_windows_tray(app: &mut tauri::App) -> tauri::Result<()> {
+    use tauri::menu::{Menu, MenuItem};
     use tauri::tray::TrayIconBuilder;
 
     let attention_state = Arc::new(DesktopAttentionState {
@@ -172,10 +177,38 @@ fn setup_windows_tray(app: &mut tauri::App) -> tauri::Result<()> {
     });
     app.manage(attention_state.clone());
 
+    let show = MenuItem::with_id(app, TRAY_MENU_SHOW_ID, "显示 Snack", true, None::<&str>)?;
+    let quit = MenuItem::with_id(app, TRAY_MENU_QUIT_ID, "退出", true, None::<&str>)?;
+    let menu = Menu::with_items(app, &[&show, &quit])?;
+
     TrayIconBuilder::with_id(TRAY_ID)
         .icon(TRAY_DEFAULT_ICON)
         .tooltip("Snack")
+        .menu(&menu)
+        .show_menu_on_left_click(false)
+        .on_tray_icon_event(|tray, event| {
+            use tauri::tray::{MouseButton, MouseButtonState, TrayIconEvent};
+
+            let should_show = match event {
+                TrayIconEvent::Click {
+                    button: MouseButton::Left,
+                    button_state: MouseButtonState::Up,
+                    ..
+                }
+                | TrayIconEvent::DoubleClick {
+                    button: MouseButton::Left,
+                    ..
+                } => true,
+                _ => false,
+            };
+
+            if should_show {
+                show_main_window(tray.app_handle());
+            }
+        })
         .build(app)?;
+
+    register_status_menu_events(app);
 
     let handle = app.handle().clone();
     std::thread::spawn(move || {
@@ -204,14 +237,55 @@ fn setup_windows_tray(app: &mut tauri::App) -> tauri::Result<()> {
     Ok(())
 }
 
+#[cfg(any(target_os = "macos", windows))]
+fn show_main_window(app: &AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+    }
+}
+
+#[cfg(any(target_os = "macos", windows))]
+fn register_status_menu_events(app: &mut tauri::App) {
+    app.on_menu_event(|app, event| match event.id().as_ref() {
+        TRAY_MENU_SHOW_ID => show_main_window(app),
+        TRAY_MENU_QUIT_ID => app.exit(0),
+        _ => {}
+    });
+}
+
+#[cfg(any(target_os = "macos", windows))]
+fn install_close_to_status_menu(window: &WebviewWindow) {
+    let close_window = window.clone();
+    window.on_window_event(move |event| {
+        if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+            api.prevent_close();
+            let _ = close_window.hide();
+        }
+    });
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
+fn install_close_to_status_menu(_window: &WebviewWindow) {}
+
 #[cfg(target_os = "macos")]
 fn setup_macos_status_menu(app: &mut tauri::App) -> tauri::Result<()> {
+    use tauri::menu::{Menu, MenuItem};
     use tauri::tray::TrayIconBuilder;
+
+    let show = MenuItem::with_id(app, TRAY_MENU_SHOW_ID, "显示 Snack", true, None::<&str>)?;
+    let quit = MenuItem::with_id(app, TRAY_MENU_QUIT_ID, "退出", true, None::<&str>)?;
+    let menu = Menu::with_items(app, &[&show, &quit])?;
 
     TrayIconBuilder::with_id(TRAY_ID)
         .icon(TRAY_DEFAULT_ICON)
         .tooltip("Snack")
+        .menu(&menu)
+        .show_menu_on_left_click(true)
         .build(app)?;
+
+    register_status_menu_events(app);
 
     Ok(())
 }
@@ -241,9 +315,11 @@ pub fn run() {
 
             let user_agent = desktop_user_agent();
 
-            WebviewWindowBuilder::from_config(app, window_config)?
+            let window = WebviewWindowBuilder::from_config(app, window_config)?
                 .user_agent(&user_agent)
                 .build()?;
+
+            install_close_to_status_menu(&window);
 
             Ok(())
         })
