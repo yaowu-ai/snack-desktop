@@ -1,0 +1,15 @@
+{
+  "default": null,
+  "permission": [
+    {
+      "identifier": "allow-set-desktop-attention",
+      "description": "Allow the remote Snack web app to update desktop unread attention state.",
+      "commands": {
+        "allow": [
+          "set_desktop_attention"
+        ],
+        "deny": []
+      }
+    }
+  ]
+}

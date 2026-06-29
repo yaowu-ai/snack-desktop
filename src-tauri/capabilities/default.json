@@ -11,5 +11,11 @@
       "http://127.0.0.1:3000/*"
     ]
   },
-  "permissions": ["core:default", "notification:default", "process:allow-restart", "updater:default"]
+  "permissions": [
+    "core:default",
+    "notification:default",
+    "process:allow-restart",
+    "updater:default",
+    "allow-set-desktop-attention"
+  ]
 }
