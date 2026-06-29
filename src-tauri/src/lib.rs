@@ -5,14 +5,14 @@ use std::sync::Arc;
 #[cfg(windows)]
 use std::time::Duration;
 use tauri::{AppHandle, Manager, Url, UserAttentionType, WebviewWindow, WebviewWindowBuilder};
-#[cfg(windows)]
+#[cfg(any(target_os = "macos", windows))]
 use tauri::include_image;
 
-#[cfg(windows)]
+#[cfg(any(target_os = "macos", windows))]
 const TRAY_ID: &str = "main-tray";
-#[cfg(windows)]
+#[cfg(any(target_os = "macos", windows))]
 const TRAY_DEFAULT_ICON: tauri::image::Image<'_> = include_image!("./icons/32x32.png");
-#[cfg(windows)]
+#[cfg(any(target_os = "macos", windows))]
 const TRAY_ATTENTION_ICON: tauri::image::Image<'_> = include_image!("./icons/tray-attention.png");
 
 const ALLOWED_WEB_ORIGINS: &[&str] = &[
@@ -60,7 +60,7 @@ fn set_desktop_attention(
     set_badge_label(&window, unread_count);
     update_tray_attention(&window.app_handle(), unread_count);
 
-    if unread_count > 0 {
+    if unread_count > 0 && should_request_window_attention() {
         let request_type = if level == "critical" || level == "mention" {
             UserAttentionType::Critical
         } else {
@@ -72,6 +72,16 @@ fn set_desktop_attention(
     }
 
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn should_request_window_attention() -> bool {
+    false
+}
+
+#[cfg(not(target_os = "macos"))]
+fn should_request_window_attention() -> bool {
+    true
 }
 
 #[cfg(target_os = "macos")]
@@ -88,6 +98,19 @@ fn set_badge_label(window: &WebviewWindow, unread_count: u32) {
 
 #[cfg(not(target_os = "macos"))]
 fn set_badge_label(_window: &WebviewWindow, _unread_count: u32) {}
+
+#[cfg(target_os = "macos")]
+fn update_tray_attention(app: &AppHandle, unread_count: u32) {
+    if let Some(tray) = app.tray_by_id(TRAY_ID) {
+        if unread_count > 0 {
+            let _ = tray.set_icon(Some(TRAY_ATTENTION_ICON));
+            let _ = tray.set_tooltip(Some("Snack - 有未读消息"));
+        } else {
+            let _ = tray.set_icon(Some(TRAY_DEFAULT_ICON));
+            let _ = tray.set_tooltip(Some("Snack"));
+        }
+    }
+}
 
 #[cfg(windows)]
 fn update_tray_attention(app: &AppHandle, unread_count: u32) {
@@ -106,7 +129,7 @@ fn update_tray_attention(app: &AppHandle, unread_count: u32) {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(target_os = "macos", windows)))]
 fn update_tray_attention(_app: &AppHandle, _unread_count: u32) {}
 
 #[cfg(windows)]
@@ -181,6 +204,18 @@ fn setup_windows_tray(app: &mut tauri::App) -> tauri::Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
+fn setup_macos_status_menu(app: &mut tauri::App) -> tauri::Result<()> {
+    use tauri::tray::TrayIconBuilder;
+
+    TrayIconBuilder::with_id(TRAY_ID)
+        .icon(TRAY_DEFAULT_ICON)
+        .tooltip("Snack")
+        .build(app)?;
+
+    Ok(())
+}
+
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_notification::init())
@@ -191,6 +226,9 @@ pub fn run() {
             set_desktop_attention
         ])
         .setup(|app| {
+            #[cfg(target_os = "macos")]
+            setup_macos_status_menu(app)?;
+
             #[cfg(windows)]
             setup_windows_tray(app)?;
 
