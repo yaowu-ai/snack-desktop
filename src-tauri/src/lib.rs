@@ -56,16 +56,8 @@ fn set_desktop_attention(
         1..=99 => Some(i64::from(unread_count)),
         _ => Some(99),
     };
-    let badge_label = if unread_count == 0 {
-        None
-    } else if unread_count > 99 {
-        Some("99+".to_string())
-    } else {
-        Some(unread_count.to_string())
-    };
-
     let _ = window.set_badge_count(badge_count);
-    let _ = window.set_badge_label(badge_label);
+    set_badge_label(&window, unread_count);
     update_tray_attention(&window.app_handle(), unread_count);
 
     if unread_count > 0 {
@@ -81,6 +73,21 @@ fn set_desktop_attention(
 
     Ok(())
 }
+
+#[cfg(target_os = "macos")]
+fn set_badge_label(window: &WebviewWindow, unread_count: u32) {
+    let badge_label = if unread_count == 0 {
+        None
+    } else if unread_count > 99 {
+        Some("99+".to_string())
+    } else {
+        Some(unread_count.to_string())
+    };
+    let _ = window.set_badge_label(badge_label);
+}
+
+#[cfg(not(target_os = "macos"))]
+fn set_badge_label(_window: &WebviewWindow, _unread_count: u32) {}
 
 #[cfg(windows)]
 fn update_tray_attention(app: &AppHandle, unread_count: u32) {
