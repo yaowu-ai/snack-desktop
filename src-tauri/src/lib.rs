@@ -214,7 +214,7 @@ fn setup_windows_tray(app: &mut tauri::App) -> tauri::Result<()> {
     std::thread::spawn(move || {
         let mut attention_frame = false;
         loop {
-            std::thread::sleep(Duration::from_millis(800));
+            std::thread::sleep(Duration::from_millis(400));
             let active = attention_state.active.load(Ordering::Relaxed);
             let Some(tray) = handle.tray_by_id(TRAY_ID) else {
                 continue;
