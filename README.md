@@ -19,6 +19,11 @@ push v* 或 *.*.* tag -> 正式包，tag 指向的 commit 必须属于 GitHub pr
 打包脚本会从 GitHub ref 推导环境：`test` 分支使用 `qa`，tag 使用 `prod`。
 本地显式传参或设置 `SNACK_ENV` 时，以本地输入为准。
 
+
+## 开发 gitflow
+有新需求，先从prod分支拉feature/xxx，改完后合并到test打包, 远端会打debug包
+验证通过后，feature/xxx 合并到prod，再打tag，远端会打 release 包
+
 ## 正式发版
 
 正式包通过 GitHub tag 触发，不需要在本地上传安装包。tag 必须指向 GitHub
