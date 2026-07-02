@@ -14,7 +14,9 @@ const TRAY_ID: &str = "main-tray";
 const TRAY_MENU_SHOW_ID: &str = "show";
 #[cfg(any(target_os = "macos", windows))]
 const TRAY_MENU_QUIT_ID: &str = "quit";
-#[cfg(any(target_os = "macos", windows))]
+#[cfg(target_os = "macos")]
+const TRAY_DEFAULT_ICON: tauri::image::Image<'_> = include_image!("./icons/white.png");
+#[cfg(windows)]
 const TRAY_DEFAULT_ICON: tauri::image::Image<'_> = include_image!("./icons/32x32.png");
 #[cfg(any(target_os = "macos", windows))]
 const TRAY_ATTENTION_ICON: tauri::image::Image<'_> = include_image!("./icons/tray-attention.png");
@@ -110,7 +112,7 @@ fn update_tray_attention(app: &AppHandle, unread_count: u32) {
             let _ = tray.set_icon(Some(TRAY_ATTENTION_ICON));
             let _ = tray.set_tooltip(Some("Snack - 有未读消息"));
         } else {
-            let _ = tray.set_icon(Some(TRAY_DEFAULT_ICON));
+            let _ = tray.set_icon_with_as_template(Some(TRAY_DEFAULT_ICON), true);
             let _ = tray.set_tooltip(Some("Snack"));
         }
     }
@@ -246,6 +248,11 @@ fn show_main_window(app: &AppHandle) {
     }
 }
 
+#[cfg(target_os = "macos")]
+fn should_show_window_on_reopen(has_visible_windows: bool) -> bool {
+    !has_visible_windows
+}
+
 #[cfg(any(target_os = "macos", windows))]
 fn register_status_menu_events(app: &mut tauri::App) {
     app.on_menu_event(|app, event| match event.id().as_ref() {
@@ -280,6 +287,7 @@ fn setup_macos_status_menu(app: &mut tauri::App) -> tauri::Result<()> {
 
     TrayIconBuilder::with_id(TRAY_ID)
         .icon(TRAY_DEFAULT_ICON)
+        .icon_as_template(true)
         .tooltip("Snack")
         .menu(&menu)
         .show_menu_on_left_click(true)
@@ -323,6 +331,34 @@ pub fn run() {
 
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("error while running Snack desktop client");
+        .build(tauri::generate_context!())
+        .expect("error while building Snack desktop client")
+        .run(|app, event| {
+            #[cfg(target_os = "macos")]
+            if let tauri::RunEvent::Reopen {
+                has_visible_windows,
+                ..
+            } = event
+            {
+                if should_show_window_on_reopen(has_visible_windows) {
+                    show_main_window(app);
+                }
+            }
+        });
+}
+
+#[cfg(test)]
+#[cfg(target_os = "macos")]
+mod tests {
+    use super::should_show_window_on_reopen;
+
+    #[test]
+    fn reopens_hidden_main_window_from_dock() {
+        assert!(should_show_window_on_reopen(false));
+    }
+
+    #[test]
+    fn does_not_steal_focus_when_reopen_finds_visible_windows() {
+        assert!(!should_show_window_on_reopen(true));
+    }
 }
