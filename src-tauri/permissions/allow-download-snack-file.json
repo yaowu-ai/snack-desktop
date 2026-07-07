@@ -1,0 +1,15 @@
+{
+  "default": null,
+  "permission": [
+    {
+      "identifier": "allow-download-snack-file",
+      "description": "Allow the remote Snack web app to download authenticated Snack files through the desktop shell.",
+      "commands": {
+        "allow": [
+          "download_snack_file"
+        ],
+        "deny": []
+      }
+    }
+  ]
+}

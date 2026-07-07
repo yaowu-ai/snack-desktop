@@ -177,6 +177,12 @@
       "description": "Permission identifier",
       "oneOf": [
         {
+          "description": "Allow the remote Snack web app to download authenticated Snack files through the desktop shell.",
+          "type": "string",
+          "const": "allow-download-snack-file",
+          "markdownDescription": "Allow the remote Snack web app to download authenticated Snack files through the desktop shell."
+        },
+        {
           "description": "Allow the remote Snack web app to close the desktop shell after a forced update is cancelled.",
           "type": "string",
           "const": "allow-exit-after-force-update-cancel",
