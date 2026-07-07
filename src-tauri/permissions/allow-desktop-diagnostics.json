@@ -1,0 +1,16 @@
+{
+  "default": null,
+  "permission": [
+    {
+      "identifier": "allow-desktop-diagnostics",
+      "description": "Allow the remote Snack web app to write and reveal Snack desktop diagnostic logs.",
+      "commands": {
+        "allow": [
+          "write_desktop_log",
+          "reveal_desktop_log_dir"
+        ],
+        "deny": []
+      }
+    }
+  ]
+}

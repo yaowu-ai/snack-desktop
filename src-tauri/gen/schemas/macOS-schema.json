@@ -177,6 +177,12 @@
       "description": "Permission identifier",
       "oneOf": [
         {
+          "description": "Allow the remote Snack web app to write and reveal Snack desktop diagnostic logs.",
+          "type": "string",
+          "const": "allow-desktop-diagnostics",
+          "markdownDescription": "Allow the remote Snack web app to write and reveal Snack desktop diagnostic logs."
+        },
+        {
           "description": "Allow the remote Snack web app to download authenticated Snack files through the desktop shell.",
           "type": "string",
           "const": "allow-download-snack-file",

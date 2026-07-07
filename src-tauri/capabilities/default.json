@@ -16,6 +16,7 @@
     "notification:default",
     "process:allow-restart",
     "updater:default",
+    "allow-desktop-diagnostics",
     "allow-download-snack-file",
     "allow-set-desktop-attention"
   ]

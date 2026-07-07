@@ -121,7 +121,7 @@ const createUpdaterArtifacts =
   process.env.SNACK_CREATE_UPDATER_ARTIFACTS === "true" &&
   tauriConf.bundle?.createUpdaterArtifacts !== false;
 
-if (command === "build" && createUpdaterArtifacts && !updaterPubkey) {
+if (command === "build" && !updaterPubkey) {
   console.error(
     "Missing TAURI_UPDATER_PUBKEY. Generate an updater keypair with `tauri signer generate`, then set the public key before building."
   );
@@ -139,7 +139,7 @@ const tauriConfig = {
   plugins: {
     updater: {
       endpoints: [updaterEndpoint],
-      ...(createUpdaterArtifacts && updaterPubkey ? { pubkey: updaterPubkey } : {}),
+      ...(updaterPubkey ? { pubkey: updaterPubkey } : {}),
     },
   },
 };
