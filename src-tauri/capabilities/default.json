@@ -14,6 +14,13 @@
   "permissions": [
     "core:default",
     "notification:default",
+    {
+      "identifier": "opener:allow-open-url",
+      "allow": [
+        { "url": "http://*" },
+        { "url": "https://*" }
+      ]
+    },
     "process:allow-restart",
     "updater:default",
     "allow-desktop-diagnostics",
