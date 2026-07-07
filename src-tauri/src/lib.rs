@@ -33,6 +33,8 @@ const TRAY_DEFAULT_ICON: tauri::image::Image<'_> = include_image!("./icons/white
 const TRAY_DEFAULT_ICON: tauri::image::Image<'_> = include_image!("./icons/32x32.png");
 #[cfg(any(target_os = "macos", windows))]
 const TRAY_ATTENTION_ICON: tauri::image::Image<'_> = include_image!("./icons/tray-attention.png");
+#[cfg(any(target_os = "macos", windows))]
+const ABOUT_ICON: tauri::image::Image<'_> = include_image!("./icons/icon.png");
 
 const ALLOWED_WEB_ORIGINS: &[&str] = &[
     "https://snack.mechlabs.cn",
@@ -730,7 +732,7 @@ fn navigation_back_accelerator() -> &'static str {
 
 #[cfg(any(target_os = "macos", windows))]
 fn setup_navigation_menu(app: &mut tauri::App) -> tauri::Result<()> {
-    use tauri::menu::{Menu, MenuItem, Submenu};
+    use tauri::menu::{MenuItem, Submenu};
 
     let back = MenuItem::with_id(
         app,
@@ -740,15 +742,125 @@ fn setup_navigation_menu(app: &mut tauri::App) -> tauri::Result<()> {
         Some(navigation_back_accelerator()),
     )?;
     let navigation = Submenu::with_id_and_items(app, NAVIGATION_MENU_ID, "导航", true, &[&back])?;
-    let menu = Menu::with_items(app, &[&navigation])?;
+    let menu = match app.menu() {
+        Some(menu) => menu,
+        None => default_app_menu(app)?,
+    };
+    menu.append(&navigation)?;
     app.set_menu(menu)?;
 
     Ok(())
 }
 
+#[cfg(any(target_os = "macos", windows))]
+fn about_metadata(app: &tauri::App) -> tauri::menu::AboutMetadata<'static> {
+    let package_info = app.package_info();
+    let config = app.config();
+
+    tauri::menu::AboutMetadata {
+        name: Some(package_info.name.clone()),
+        version: Some(package_info.version.to_string()),
+        copyright: config.bundle.copyright.clone(),
+        authors: config
+            .bundle
+            .publisher
+            .clone()
+            .map(|publisher| vec![publisher]),
+        icon: Some(ABOUT_ICON),
+        ..Default::default()
+    }
+}
+
+#[cfg(any(target_os = "macos", windows))]
+fn default_app_menu(app: &tauri::App) -> tauri::Result<tauri::menu::Menu<tauri::Wry>> {
+    use tauri::menu::{Menu, PredefinedMenuItem, Submenu};
+
+    let package_name = app.package_info().name.clone();
+
+    let window_menu = Submenu::with_id_and_items(
+        app,
+        "Window",
+        "Window",
+        true,
+        &[
+            &PredefinedMenuItem::minimize(app, None)?,
+            &PredefinedMenuItem::maximize(app, None)?,
+            #[cfg(target_os = "macos")]
+            &PredefinedMenuItem::separator(app)?,
+            &PredefinedMenuItem::close_window(app, None)?,
+        ],
+    )?;
+
+    let help_menu = Submenu::with_id_and_items(
+        app,
+        "Help",
+        "Help",
+        true,
+        &[
+            #[cfg(not(target_os = "macos"))]
+            &PredefinedMenuItem::about(app, None, Some(about_metadata(app)))?,
+        ],
+    )?;
+
+    Menu::with_items(
+        app,
+        &[
+            #[cfg(target_os = "macos")]
+            &Submenu::with_items(
+                app,
+                package_name,
+                true,
+                &[
+                    &PredefinedMenuItem::about(app, None, Some(about_metadata(app)))?,
+                    &PredefinedMenuItem::separator(app)?,
+                    &PredefinedMenuItem::services(app, None)?,
+                    &PredefinedMenuItem::separator(app)?,
+                    &PredefinedMenuItem::hide(app, None)?,
+                    &PredefinedMenuItem::hide_others(app, None)?,
+                    &PredefinedMenuItem::separator(app)?,
+                    &PredefinedMenuItem::quit(app, None)?,
+                ],
+            )?,
+            #[cfg(windows)]
+            &Submenu::with_items(
+                app,
+                "File",
+                true,
+                &[
+                    &PredefinedMenuItem::close_window(app, None)?,
+                    &PredefinedMenuItem::quit(app, None)?,
+                ],
+            )?,
+            &Submenu::with_items(
+                app,
+                "Edit",
+                true,
+                &[
+                    &PredefinedMenuItem::undo(app, None)?,
+                    &PredefinedMenuItem::redo(app, None)?,
+                    &PredefinedMenuItem::separator(app)?,
+                    &PredefinedMenuItem::cut(app, None)?,
+                    &PredefinedMenuItem::copy(app, None)?,
+                    &PredefinedMenuItem::paste(app, None)?,
+                    &PredefinedMenuItem::select_all(app, None)?,
+                ],
+            )?,
+            #[cfg(target_os = "macos")]
+            &Submenu::with_items(
+                app,
+                "View",
+                true,
+                &[&PredefinedMenuItem::fullscreen(app, None)?],
+            )?,
+            &window_menu,
+            &help_menu,
+        ],
+    )
+}
+
 #[cfg(windows)]
 fn setup_windows_tray(app: &mut tauri::App) -> tauri::Result<()> {
-    use tauri::menu::{Menu, MenuItem};
+    use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
     use tauri::tray::TrayIconBuilder;
 
     let attention_state = Arc::new(DesktopAttentionState {
@@ -757,8 +869,18 @@ fn setup_windows_tray(app: &mut tauri::App) -> tauri::Result<()> {
     app.manage(attention_state.clone());
 
     let show = MenuItem::with_id(app, TRAY_MENU_SHOW_ID, "显示 Snack", true, None::<&str>)?;
+    let about = PredefinedMenuItem::about(app, Some("关于 Snack"), Some(about_metadata(app)))?;
     let quit = MenuItem::with_id(app, TRAY_MENU_QUIT_ID, "退出", true, None::<&str>)?;
-    let menu = Menu::with_items(app, &[&show, &quit])?;
+    let menu = Menu::with_items(
+        app,
+        &[
+            &show,
+            &PredefinedMenuItem::separator(app)?,
+            &about,
+            &PredefinedMenuItem::separator(app)?,
+            &quit,
+        ],
+    )?;
 
     TrayIconBuilder::with_id(TRAY_ID)
         .icon(TRAY_DEFAULT_ICON)
@@ -860,12 +982,22 @@ fn install_close_to_status_menu(_window: &WebviewWindow) {}
 
 #[cfg(target_os = "macos")]
 fn setup_macos_status_menu(app: &mut tauri::App) -> tauri::Result<()> {
-    use tauri::menu::{Menu, MenuItem};
+    use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
     use tauri::tray::TrayIconBuilder;
 
     let show = MenuItem::with_id(app, TRAY_MENU_SHOW_ID, "显示 Snack", true, None::<&str>)?;
+    let about = PredefinedMenuItem::about(app, Some("关于 Snack"), Some(about_metadata(app)))?;
     let quit = MenuItem::with_id(app, TRAY_MENU_QUIT_ID, "退出", true, None::<&str>)?;
-    let menu = Menu::with_items(app, &[&show, &quit])?;
+    let menu = Menu::with_items(
+        app,
+        &[
+            &show,
+            &PredefinedMenuItem::separator(app)?,
+            &about,
+            &PredefinedMenuItem::separator(app)?,
+            &quit,
+        ],
+    )?;
 
     TrayIconBuilder::with_id(TRAY_ID)
         .icon(TRAY_DEFAULT_ICON)
