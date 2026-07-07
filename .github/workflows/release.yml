@@ -2,7 +2,6 @@ name: Release
 
 on:
   push:
-    branches: ["test"]
     tags: ["v*", "*.*.*"]
 
 concurrency:
@@ -143,7 +142,6 @@ jobs:
         run: bash scripts/package-macos-release.sh
 
       - name: Upload macOS bundle to Release
-        if: github.ref_type == 'tag'
         uses: softprops/action-gh-release@v1
         with:
           files: |
@@ -154,17 +152,6 @@ jobs:
           prerelease: ${{ steps.version.outputs.release_prerelease }}
           make_latest: ${{ steps.version.outputs.release_make_latest }}
           fail_on_unmatched_files: true
-
-      - name: Upload macOS bundle artifact
-        if: github.ref == 'refs/heads/test'
-        uses: actions/upload-artifact@v4
-        with:
-          name: Snack-${{ steps.version.outputs.artifact_version }}-${{ matrix.artifact_label }}
-          path: |
-            src-tauri/target/${{ matrix.target }}/release/bundle/dmg/Snack_${{ steps.version.outputs.artifact_version }}_macos_${{ matrix.release_arch_suffix }}.dmg
-            src-tauri/target/${{ matrix.target }}/release/bundle/macos/Snack_${{ steps.version.outputs.artifact_version }}_macos_${{ matrix.release_arch_suffix }}.app.tar.gz
-            src-tauri/target/${{ matrix.target }}/release/bundle/macos/Snack_${{ steps.version.outputs.artifact_version }}_macos_${{ matrix.release_arch_suffix }}.app.tar.gz.sig
-          if-no-files-found: error
 
   build-windows-x64:
     name: Windows (x64)
@@ -268,7 +255,6 @@ jobs:
           find "$DST_DIR" -maxdepth 1 -type f -print
 
       - name: Upload Windows bundle to Release
-        if: github.ref_type == 'tag'
         uses: softprops/action-gh-release@v1
         with:
           files: artifacts/Snack-${{ steps.version.outputs.artifact_version }}-windows-x64/*
@@ -276,11 +262,3 @@ jobs:
           prerelease: ${{ steps.version.outputs.release_prerelease }}
           make_latest: ${{ steps.version.outputs.release_make_latest }}
           fail_on_unmatched_files: true
-
-      - name: Upload Windows bundle artifact
-        if: github.ref == 'refs/heads/test'
-        uses: actions/upload-artifact@v4
-        with:
-          name: Snack-${{ steps.version.outputs.artifact_version }}-windows-x64
-          path: artifacts/Snack-${{ steps.version.outputs.artifact_version }}-windows-x64/*
-          if-no-files-found: error

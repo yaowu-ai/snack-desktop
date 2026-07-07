@@ -30,36 +30,29 @@ runs:
         RELEASE_PRERELEASE="false"
         RELEASE_MAKE_LATEST="false"
 
-        if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
-          git fetch origin prod test
-          TAG_COMMIT="$(git rev-list -n 1 "${GITHUB_REF_NAME}")"
+        if [[ "${GITHUB_REF_TYPE}" != "tag" ]]; then
+          echo "::error::Unsupported release ref ${GITHUB_REF}. Release builds must be triggered by a tag."
+          exit 1
+        fi
 
-          if git merge-base --is-ancestor "${TAG_COMMIT}" origin/prod; then
-            RELEASE_CHANNEL="prod"
-            RELEASE_PRERELEASE="false"
-            RELEASE_MAKE_LATEST="true"
-          elif git merge-base --is-ancestor "${TAG_COMMIT}" origin/test; then
-            RELEASE_CHANNEL="qa"
-            RELEASE_PRERELEASE="true"
-            RELEASE_MAKE_LATEST="false"
-          else
-            echo "::error::Release tag ${GITHUB_REF_NAME} must point to a commit contained in origin/prod or origin/test."
-            exit 1
-          fi
+        git fetch origin prod test
+        TAG_COMMIT="$(git rev-list -n 1 "${GITHUB_REF_NAME}")"
 
-          APP_VERSION="${GITHUB_REF_NAME#v}"
-          ARTIFACT_VERSION="$APP_VERSION"
-        elif [[ "${GITHUB_REF}" == "refs/heads/test" ]]; then
+        if git merge-base --is-ancestor "${TAG_COMMIT}" origin/prod; then
+          RELEASE_CHANNEL="prod"
+          RELEASE_PRERELEASE="false"
+          RELEASE_MAKE_LATEST="true"
+        elif git merge-base --is-ancestor "${TAG_COMMIT}" origin/test; then
           RELEASE_CHANNEL="qa"
           RELEASE_PRERELEASE="true"
           RELEASE_MAKE_LATEST="false"
-          APP_VERSION="$(node -p "require('./package.json').version")"
-          SHORT_SHA="${GITHUB_SHA:0:7}"
-          ARTIFACT_VERSION="${APP_VERSION}-qa.${GITHUB_RUN_NUMBER}.${SHORT_SHA}"
         else
-          echo "::error::Unsupported release ref ${GITHUB_REF}. Only prod/test tags and the test branch are supported."
+          echo "::error::Release tag ${GITHUB_REF_NAME} must point to a commit contained in origin/prod or origin/test."
           exit 1
         fi
+
+        APP_VERSION="${GITHUB_REF_NAME#v}"
+        ARTIFACT_VERSION="$APP_VERSION"
 
         if [[ ! "$APP_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
           echo "::error::App version must use x.y.z format: ${APP_VERSION}"
