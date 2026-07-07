@@ -1,14 +1,16 @@
+use futures_util::StreamExt;
+use reqwest::header::{COOKIE, LOCATION, USER_AGENT};
+use std::path::{Path, PathBuf};
+use std::process::Command;
 #[cfg(windows)]
 use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(windows)]
 use std::sync::Arc;
-use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 #[cfg(any(target_os = "macos", windows))]
 use tauri::include_image;
-use futures_util::StreamExt;
-use reqwest::header::{COOKIE, LOCATION, USER_AGENT};
 use tauri::path::BaseDirectory;
+use tauri::webview::NewWindowResponse;
 use tauri::window::{ProgressBarState, ProgressBarStatus};
 use tauri::{
     AppHandle, Emitter, Manager, Url, UserAttentionType, WebviewWindow, WebviewWindowBuilder,
@@ -21,6 +23,10 @@ const TRAY_ID: &str = "main-tray";
 const TRAY_MENU_SHOW_ID: &str = "show";
 #[cfg(any(target_os = "macos", windows))]
 const TRAY_MENU_QUIT_ID: &str = "quit";
+#[cfg(any(target_os = "macos", windows))]
+const NAVIGATION_MENU_BACK_ID: &str = "navigation-back";
+#[cfg(any(target_os = "macos", windows))]
+const NAVIGATION_MENU_ID: &str = "navigation";
 #[cfg(target_os = "macos")]
 const TRAY_DEFAULT_ICON: tauri::image::Image<'_> = include_image!("./icons/white.png");
 #[cfg(windows)]
@@ -65,6 +71,12 @@ struct DownloadProgressPayload {
     percent: Option<u8>,
     path: Option<String>,
     message: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DownloadedPathRequest {
+    path: String,
 }
 
 #[cfg(windows)]
@@ -150,6 +162,26 @@ async fn download_snack_file(
     result
 }
 
+#[tauri::command]
+fn open_downloaded_file(
+    app: AppHandle,
+    window: WebviewWindow,
+    request: DownloadedPathRequest,
+) -> Result<(), String> {
+    let path = validate_downloaded_path(&app, &window, &request.path)?;
+    open_path(&path)
+}
+
+#[tauri::command]
+fn reveal_downloaded_file(
+    app: AppHandle,
+    window: WebviewWindow,
+    request: DownloadedPathRequest,
+) -> Result<(), String> {
+    let path = validate_downloaded_path(&app, &window, &request.path)?;
+    reveal_path(&path)
+}
+
 async fn download_snack_file_inner(
     app: AppHandle,
     window: WebviewWindow,
@@ -157,7 +189,9 @@ async fn download_snack_file_inner(
 ) -> Result<DownloadSnackFileResult, String> {
     validate_download_id(&request.download_id)?;
 
-    let current_url = window.url().map_err(|_| "failed to read current window URL".to_string())?;
+    let current_url = window
+        .url()
+        .map_err(|_| "failed to read current window URL".to_string())?;
     if !is_allowed_web_origin(&current_url) {
         return Err("origin is not allowed to start native downloads".to_string());
     }
@@ -409,6 +443,98 @@ fn resolve_destination_dir(app: &AppHandle) -> Result<PathBuf, String> {
         .map_err(|_| "failed to resolve downloads directory".to_string())
 }
 
+fn validate_downloaded_path(
+    app: &AppHandle,
+    window: &WebviewWindow,
+    raw_path: &str,
+) -> Result<PathBuf, String> {
+    let current_url = window
+        .url()
+        .map_err(|_| "failed to read current window URL".to_string())?;
+    if !is_allowed_web_origin(&current_url) {
+        return Err("origin is not allowed to open downloaded files".to_string());
+    }
+
+    let path = PathBuf::from(raw_path);
+    if !path.is_absolute() {
+        return Err("downloaded file path is invalid".to_string());
+    }
+
+    let canonical_path = path
+        .canonicalize()
+        .map_err(|_| "downloaded file does not exist".to_string())?;
+    if !canonical_path.is_file() {
+        return Err("downloaded path is not a file".to_string());
+    }
+
+    let downloads_dir = resolve_destination_dir(app)?;
+    let canonical_downloads_dir = downloads_dir
+        .canonicalize()
+        .map_err(|_| "failed to resolve downloads directory".to_string())?;
+    if !canonical_path.starts_with(canonical_downloads_dir) {
+        return Err("downloaded file path is not allowed".to_string());
+    }
+
+    Ok(canonical_path)
+}
+
+fn open_path(path: &Path) -> Result<(), String> {
+    run_open_command(build_open_command(path))
+}
+
+fn reveal_path(path: &Path) -> Result<(), String> {
+    run_open_command(build_reveal_command(path))
+}
+
+fn run_open_command(mut command: Command) -> Result<(), String> {
+    command
+        .spawn()
+        .map_err(|_| "failed to open downloaded file".to_string())?;
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn build_open_command(path: &Path) -> Command {
+    let mut command = Command::new("open");
+    command.arg(path);
+    command
+}
+
+#[cfg(target_os = "macos")]
+fn build_reveal_command(path: &Path) -> Command {
+    let mut command = Command::new("open");
+    command.arg("-R").arg(path);
+    command
+}
+
+#[cfg(windows)]
+fn build_open_command(path: &Path) -> Command {
+    let mut command = Command::new("cmd");
+    command.arg("/C").arg("start").arg("").arg(path);
+    command
+}
+
+#[cfg(windows)]
+fn build_reveal_command(path: &Path) -> Command {
+    let mut command = Command::new("explorer.exe");
+    command.arg(format!("/select,{}", path.to_string_lossy()));
+    command
+}
+
+#[cfg(all(not(target_os = "macos"), not(windows)))]
+fn build_open_command(path: &Path) -> Command {
+    let mut command = Command::new("xdg-open");
+    command.arg(path);
+    command
+}
+
+#[cfg(all(not(target_os = "macos"), not(windows)))]
+fn build_reveal_command(path: &Path) -> Command {
+    let mut command = Command::new("xdg-open");
+    command.arg(path.parent().unwrap_or_else(|| Path::new("/")));
+    command
+}
+
 fn resolve_available_path(destination_dir: &Path, filename: &str) -> PathBuf {
     let candidate = destination_dir.join(filename);
     if !candidate.exists() {
@@ -548,6 +674,78 @@ fn desktop_user_agent() -> String {
     )
 }
 
+fn handle_new_window_request(app: &AppHandle, url: Url) -> NewWindowResponse<tauri::Wry> {
+    if is_allowed_web_origin(&url) {
+        if let Some(window) = app.get_webview_window("main") {
+            let _ = window.navigate(url);
+        }
+    } else if is_supported_external_web_url(&url) {
+        let _ = open_external_url(&url);
+    }
+
+    NewWindowResponse::Deny
+}
+
+fn is_supported_external_web_url(url: &Url) -> bool {
+    matches!(url.scheme(), "http" | "https")
+}
+
+fn open_external_url(url: &Url) -> Result<(), String> {
+    run_open_command(build_open_url_command(url.as_str()))
+}
+
+#[cfg(target_os = "macos")]
+fn build_open_url_command(url: &str) -> Command {
+    let mut command = Command::new("open");
+    command.arg(url);
+    command
+}
+
+#[cfg(windows)]
+fn build_open_url_command(url: &str) -> Command {
+    let mut command = Command::new("explorer.exe");
+    command.arg(url);
+    command
+}
+
+#[cfg(all(not(target_os = "macos"), not(windows)))]
+fn build_open_url_command(url: &str) -> Command {
+    let mut command = Command::new("xdg-open");
+    command.arg(url);
+    command
+}
+
+fn navigate_back(window: &WebviewWindow) {
+    let _ = window.eval("window.history.back();");
+}
+
+#[cfg(any(target_os = "macos", windows))]
+fn navigation_back_accelerator() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "Cmd+["
+    } else {
+        "Alt+Left"
+    }
+}
+
+#[cfg(any(target_os = "macos", windows))]
+fn setup_navigation_menu(app: &mut tauri::App) -> tauri::Result<()> {
+    use tauri::menu::{Menu, MenuItem, Submenu};
+
+    let back = MenuItem::with_id(
+        app,
+        NAVIGATION_MENU_BACK_ID,
+        "后退",
+        true,
+        Some(navigation_back_accelerator()),
+    )?;
+    let navigation = Submenu::with_id_and_items(app, NAVIGATION_MENU_ID, "导航", true, &[&back])?;
+    let menu = Menu::with_items(app, &[&navigation])?;
+    app.set_menu(menu)?;
+
+    Ok(())
+}
+
 #[cfg(windows)]
 fn setup_windows_tray(app: &mut tauri::App) -> tauri::Result<()> {
     use tauri::menu::{Menu, MenuItem};
@@ -635,6 +833,11 @@ fn should_show_window_on_reopen(has_visible_windows: bool) -> bool {
 #[cfg(any(target_os = "macos", windows))]
 fn register_status_menu_events(app: &mut tauri::App) {
     app.on_menu_event(|app, event| match event.id().as_ref() {
+        NAVIGATION_MENU_BACK_ID => {
+            if let Some(window) = app.get_webview_window("main") {
+                navigate_back(&window);
+            }
+        }
         TRAY_MENU_SHOW_ID => show_main_window(app),
         TRAY_MENU_QUIT_ID => app.exit(0),
         _ => {}
@@ -685,6 +888,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             download_snack_file,
             exit_after_force_update_cancel,
+            open_downloaded_file,
+            reveal_downloaded_file,
             set_desktop_attention
         ])
         .setup(|app| {
@@ -694,6 +899,9 @@ pub fn run() {
             #[cfg(windows)]
             setup_windows_tray(app)?;
 
+            #[cfg(any(target_os = "macos", windows))]
+            setup_navigation_menu(app)?;
+
             let window_config = app
                 .config()
                 .app
@@ -702,9 +910,11 @@ pub fn run() {
                 .expect("missing main window config");
 
             let user_agent = desktop_user_agent();
+            let app_handle = app.handle().clone();
 
             let window = WebviewWindowBuilder::from_config(app, window_config)?
                 .user_agent(&user_agent)
+                .on_new_window(move |url, _features| handle_new_window_request(&app_handle, url))
                 .build()?;
 
             install_close_to_status_menu(&window);

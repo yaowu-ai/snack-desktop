@@ -6,7 +6,9 @@
       "description": "Allow the remote Snack web app to download authenticated Snack files through the desktop shell.",
       "commands": {
         "allow": [
-          "download_snack_file"
+          "download_snack_file",
+          "open_downloaded_file",
+          "reveal_downloaded_file"
         ],
         "deny": []
       }
