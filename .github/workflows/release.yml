@@ -14,24 +14,31 @@ permissions:
   packages: write
 
 jobs:
-  build-macos-arm64:
-    name: macOS (Apple Silicon)
-    runs-on: macos-latest
+  build-macos:
+    name: macOS (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Apple Silicon
+            runner: macos-latest
+            target: aarch64-apple-darwin
+            rust_target: aarch64-apple-darwin
+            dmg_arch_suffix: apple-silicon
+            release_arch_suffix: arm64
+            artifact_label: apple-silicon
+          - name: Intel
+            runner: macos-26-intel
+            target: x86_64-apple-darwin
+            rust_target: x86_64-apple-darwin
+            dmg_arch_suffix: intel
+            release_arch_suffix: x64
+            artifact_label: intel
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-
-      - name: Validate release tag belongs to prod
-        if: github.ref_type == 'tag'
-        shell: bash
-        run: |
-          git fetch origin prod
-          TAG_COMMIT="$(git rev-list -n 1 "${GITHUB_REF_NAME}")"
-          if ! git merge-base --is-ancestor "${TAG_COMMIT}" origin/prod; then
-            echo "::error::Release tag ${GITHUB_REF_NAME} must point to a commit contained in origin/prod."
-            exit 1
-          fi
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -39,35 +46,15 @@ jobs:
           node-version: 22
           cache: npm
 
-      - name: Install Rust target (aarch64)
-        run: rustup target add aarch64-apple-darwin
+      - name: Install Rust target
+        run: rustup target add ${{ matrix.rust_target }}
 
       - name: Install frontend dependencies
         run: npm ci
 
-      - name: Resolve app version
+      - name: Prepare release context
         id: version
-        run: |
-          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
-            APP_VERSION="${GITHUB_REF_NAME#v}"
-            ARTIFACT_VERSION="$APP_VERSION"
-          else
-            APP_VERSION="$(node -p "require('./package.json').version")"
-            SHORT_SHA="${GITHUB_SHA:0:7}"
-            ARTIFACT_VERSION="${APP_VERSION}-qa.${GITHUB_RUN_NUMBER}.${SHORT_SHA}"
-          fi
-
-          echo "Building app version: $APP_VERSION"
-          echo "Artifact version: $ARTIFACT_VERSION"
-          node -e "
-            const fs = require('fs');
-            const conf = JSON.parse(fs.readFileSync('src-tauri/tauri.conf.json', 'utf8'));
-            conf.version = '$APP_VERSION';
-            fs.writeFileSync('src-tauri/tauri.conf.json', JSON.stringify(conf, null, 2) + '\n');
-          "
-          echo "SNACK_DESKTOP_VERSION=$ARTIFACT_VERSION" >> "$GITHUB_ENV"
-          echo "app_version=$APP_VERSION" >> "$GITHUB_OUTPUT"
-          echo "artifact_version=$ARTIFACT_VERSION" >> "$GITHUB_OUTPUT"
+        uses: ./.github/actions/prepare-release-context
 
       - name: Validate required secrets
         shell: bash
@@ -136,7 +123,7 @@ jobs:
             -S apple-tool:,apple:,codesign: \
             -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
 
-      - name: Package signed macOS app (arm64)
+      - name: Package signed macOS app
         env:
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
           APPLE_ID: ${{ secrets.APPLE_ID }}
@@ -150,194 +137,33 @@ jobs:
           SNACK_PROD_UPDATER_ENDPOINT: ${{ secrets.SNACK_PROD_UPDATER_ENDPOINT }}
           SNACK_QA_UPDATER_ENDPOINT: ${{ secrets.SNACK_QA_UPDATER_ENDPOINT }}
           SNACK_DESKTOP_BASE_UA: ${{ secrets.SNACK_DESKTOP_BASE_UA }}
-          TARGET_TRIPLE: aarch64-apple-darwin
+          TARGET_TRIPLE: ${{ matrix.target }}
           APP_VERSION: ${{ steps.version.outputs.artifact_version }}
-          DMG_ARCH_SUFFIX: apple-silicon
+          DMG_ARCH_SUFFIX: ${{ matrix.dmg_arch_suffix }}
         run: bash scripts/package-macos-release.sh
 
-      - name: Upload arm64 DMG to Release
+      - name: Upload macOS bundle to Release
         if: github.ref_type == 'tag'
         uses: softprops/action-gh-release@v1
         with:
           files: |
-            src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/Snack_${{ steps.version.outputs.artifact_version }}_macos_arm64.dmg
-            src-tauri/target/aarch64-apple-darwin/release/bundle/macos/Snack_${{ steps.version.outputs.artifact_version }}_macos_arm64.app.tar.gz
-            src-tauri/target/aarch64-apple-darwin/release/bundle/macos/Snack_${{ steps.version.outputs.artifact_version }}_macos_arm64.app.tar.gz.sig
+            src-tauri/target/${{ matrix.target }}/release/bundle/dmg/Snack_${{ steps.version.outputs.artifact_version }}_macos_${{ matrix.release_arch_suffix }}.dmg
+            src-tauri/target/${{ matrix.target }}/release/bundle/macos/Snack_${{ steps.version.outputs.artifact_version }}_macos_${{ matrix.release_arch_suffix }}.app.tar.gz
+            src-tauri/target/${{ matrix.target }}/release/bundle/macos/Snack_${{ steps.version.outputs.artifact_version }}_macos_${{ matrix.release_arch_suffix }}.app.tar.gz.sig
           token: ${{ secrets.GITHUB_TOKEN }}
+          prerelease: ${{ steps.version.outputs.release_prerelease }}
+          make_latest: ${{ steps.version.outputs.release_make_latest }}
           fail_on_unmatched_files: true
 
-      - name: Upload arm64 DMG artifact
+      - name: Upload macOS bundle artifact
         if: github.ref == 'refs/heads/test'
         uses: actions/upload-artifact@v4
         with:
-          name: Snack-${{ steps.version.outputs.artifact_version }}-apple-silicon
+          name: Snack-${{ steps.version.outputs.artifact_version }}-${{ matrix.artifact_label }}
           path: |
-            src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/Snack_${{ steps.version.outputs.artifact_version }}_macos_arm64.dmg
-            src-tauri/target/aarch64-apple-darwin/release/bundle/macos/Snack_${{ steps.version.outputs.artifact_version }}_macos_arm64.app.tar.gz
-            src-tauri/target/aarch64-apple-darwin/release/bundle/macos/Snack_${{ steps.version.outputs.artifact_version }}_macos_arm64.app.tar.gz.sig
-          if-no-files-found: error
-
-  build-macos-x64:
-    name: macOS (Intel)
-    runs-on: macos-26-intel
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Validate release tag belongs to prod
-        if: github.ref_type == 'tag'
-        shell: bash
-        run: |
-          git fetch origin prod
-          TAG_COMMIT="$(git rev-list -n 1 "${GITHUB_REF_NAME}")"
-          if ! git merge-base --is-ancestor "${TAG_COMMIT}" origin/prod; then
-            echo "::error::Release tag ${GITHUB_REF_NAME} must point to a commit contained in origin/prod."
-            exit 1
-          fi
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: npm
-
-      - name: Install Rust target (x86_64)
-        run: rustup target add x86_64-apple-darwin
-
-      - name: Install frontend dependencies
-        run: npm ci
-
-      - name: Resolve app version
-        id: version
-        run: |
-          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
-            APP_VERSION="${GITHUB_REF_NAME#v}"
-            ARTIFACT_VERSION="$APP_VERSION"
-          else
-            APP_VERSION="$(node -p "require('./package.json').version")"
-            SHORT_SHA="${GITHUB_SHA:0:7}"
-            ARTIFACT_VERSION="${APP_VERSION}-qa.${GITHUB_RUN_NUMBER}.${SHORT_SHA}"
-          fi
-
-          echo "Building app version: $APP_VERSION"
-          echo "Artifact version: $ARTIFACT_VERSION"
-          node -e "
-            const fs = require('fs');
-            const conf = JSON.parse(fs.readFileSync('src-tauri/tauri.conf.json', 'utf8'));
-            conf.version = '$APP_VERSION';
-            fs.writeFileSync('src-tauri/tauri.conf.json', JSON.stringify(conf, null, 2) + '\n');
-          "
-          echo "SNACK_DESKTOP_VERSION=$ARTIFACT_VERSION" >> "$GITHUB_ENV"
-          echo "app_version=$APP_VERSION" >> "$GITHUB_OUTPUT"
-          echo "artifact_version=$ARTIFACT_VERSION" >> "$GITHUB_OUTPUT"
-
-      - name: Validate required secrets
-        shell: bash
-        env:
-          TAURI_UPDATER_PUBKEY: ${{ secrets.TAURI_UPDATER_PUBKEY }}
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-        run: |
-          missing=0
-          for name in \
-            TAURI_UPDATER_PUBKEY \
-            TAURI_SIGNING_PRIVATE_KEY \
-            APPLE_CERTIFICATE \
-            APPLE_CERTIFICATE_PASSWORD \
-            APPLE_SIGNING_IDENTITY \
-            APPLE_ID \
-            APPLE_PASSWORD \
-            APPLE_TEAM_ID
-          do
-            if [[ -z "${!name}" ]]; then
-              echo "::error::Missing required GitHub secret: ${name}"
-              missing=1
-            fi
-          done
-          exit "$missing"
-
-      - name: Validate updater signing key
-        shell: bash
-        env:
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-        run: |
-          printf 'snack updater signing check' > "$RUNNER_TEMP/updater-signing-check.txt"
-          npx tauri signer sign \
-            -k "$TAURI_SIGNING_PRIVATE_KEY" \
-            ${TAURI_SIGNING_PRIVATE_KEY_PASSWORD:+-p "$TAURI_SIGNING_PRIVATE_KEY_PASSWORD"} \
-            "$RUNNER_TEMP/updater-signing-check.txt" >/dev/null
-
-      - name: Import Apple certificate
-        env:
-          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-        run: |
-          KEYCHAIN_PATH=$RUNNER_TEMP/build.keychain
-          KEYCHAIN_PASSWORD=$(openssl rand -base64 32)
-
-          echo "$APPLE_CERTIFICATE" | base64 --decode > $RUNNER_TEMP/certificate.p12
-
-          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
-          security default-keychain -s "$KEYCHAIN_PATH"
-          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
-          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
-
-          security import "$RUNNER_TEMP/certificate.p12" \
-            -k "$KEYCHAIN_PATH" \
-            -P "$APPLE_CERTIFICATE_PASSWORD" \
-            -T /usr/bin/codesign
-
-          security list-keychain -d user -s "$KEYCHAIN_PATH"
-          security set-key-partition-list \
-            -S apple-tool:,apple:,codesign: \
-            -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
-
-      - name: Package signed macOS app (x64)
-        env:
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-          TAURI_UPDATER_PUBKEY: ${{ secrets.TAURI_UPDATER_PUBKEY }}
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-          SNACK_PROD_HOST: ${{ vars.SNACK_PROD_HOST }}
-          SNACK_QA_HOST: ${{ vars.SNACK_QA_HOST }}
-          SNACK_PROD_UPDATER_ENDPOINT: ${{ secrets.SNACK_PROD_UPDATER_ENDPOINT }}
-          SNACK_QA_UPDATER_ENDPOINT: ${{ secrets.SNACK_QA_UPDATER_ENDPOINT }}
-          SNACK_DESKTOP_BASE_UA: ${{ secrets.SNACK_DESKTOP_BASE_UA }}
-          TARGET_TRIPLE: x86_64-apple-darwin
-          APP_VERSION: ${{ steps.version.outputs.artifact_version }}
-          DMG_ARCH_SUFFIX: intel
-        run: bash scripts/package-macos-release.sh
-
-      - name: Upload x64 DMG to Release
-        if: github.ref_type == 'tag'
-        uses: softprops/action-gh-release@v1
-        with:
-          files: |
-            src-tauri/target/x86_64-apple-darwin/release/bundle/dmg/Snack_${{ steps.version.outputs.artifact_version }}_macos_x64.dmg
-            src-tauri/target/x86_64-apple-darwin/release/bundle/macos/Snack_${{ steps.version.outputs.artifact_version }}_macos_x64.app.tar.gz
-            src-tauri/target/x86_64-apple-darwin/release/bundle/macos/Snack_${{ steps.version.outputs.artifact_version }}_macos_x64.app.tar.gz.sig
-          token: ${{ secrets.GITHUB_TOKEN }}
-          fail_on_unmatched_files: true
-
-      - name: Upload x64 DMG artifact
-        if: github.ref == 'refs/heads/test'
-        uses: actions/upload-artifact@v4
-        with:
-          name: Snack-${{ steps.version.outputs.artifact_version }}-intel
-          path: |
-            src-tauri/target/x86_64-apple-darwin/release/bundle/dmg/Snack_${{ steps.version.outputs.artifact_version }}_macos_x64.dmg
-            src-tauri/target/x86_64-apple-darwin/release/bundle/macos/Snack_${{ steps.version.outputs.artifact_version }}_macos_x64.app.tar.gz
-            src-tauri/target/x86_64-apple-darwin/release/bundle/macos/Snack_${{ steps.version.outputs.artifact_version }}_macos_x64.app.tar.gz.sig
+            src-tauri/target/${{ matrix.target }}/release/bundle/dmg/Snack_${{ steps.version.outputs.artifact_version }}_macos_${{ matrix.release_arch_suffix }}.dmg
+            src-tauri/target/${{ matrix.target }}/release/bundle/macos/Snack_${{ steps.version.outputs.artifact_version }}_macos_${{ matrix.release_arch_suffix }}.app.tar.gz
+            src-tauri/target/${{ matrix.target }}/release/bundle/macos/Snack_${{ steps.version.outputs.artifact_version }}_macos_${{ matrix.release_arch_suffix }}.app.tar.gz.sig
           if-no-files-found: error
 
   build-windows-x64:
@@ -348,17 +174,6 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Validate release tag belongs to prod
-        if: github.ref_type == 'tag'
-        shell: bash
-        run: |
-          git fetch origin prod
-          TAG_COMMIT="$(git rev-list -n 1 "${GITHUB_REF_NAME}")"
-          if ! git merge-base --is-ancestor "${TAG_COMMIT}" origin/prod; then
-            echo "::error::Release tag ${GITHUB_REF_NAME} must point to a commit contained in origin/prod."
-            exit 1
-          fi
-
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
@@ -368,30 +183,9 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
-      - name: Resolve app version
+      - name: Prepare release context
         id: version
-        shell: bash
-        run: |
-          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
-            APP_VERSION="${GITHUB_REF_NAME#v}"
-            ARTIFACT_VERSION="$APP_VERSION"
-          else
-            APP_VERSION="$(node -p "require('./package.json').version")"
-            SHORT_SHA="${GITHUB_SHA:0:7}"
-            ARTIFACT_VERSION="${APP_VERSION}-qa.${GITHUB_RUN_NUMBER}.${SHORT_SHA}"
-          fi
-
-          echo "Building app version: $APP_VERSION"
-          echo "Artifact version: $ARTIFACT_VERSION"
-          node -e "
-            const fs = require('fs');
-            const conf = JSON.parse(fs.readFileSync('src-tauri/tauri.conf.json', 'utf8'));
-            conf.version = '$APP_VERSION';
-            fs.writeFileSync('src-tauri/tauri.conf.json', JSON.stringify(conf, null, 2) + '\n');
-          "
-          echo "SNACK_DESKTOP_VERSION=$ARTIFACT_VERSION" >> "$GITHUB_ENV"
-          echo "app_version=$APP_VERSION" >> "$GITHUB_OUTPUT"
-          echo "artifact_version=$ARTIFACT_VERSION" >> "$GITHUB_OUTPUT"
+        uses: ./.github/actions/prepare-release-context
 
       - name: Validate required secrets
         shell: bash
@@ -446,8 +240,6 @@ jobs:
           mkdir -p "$DST_DIR"
 
           find "$SRC_DIR" -type f -name '*.exe' -print0 | while IFS= read -r -d '' src; do
-            filename="$(basename "$src")"
-            filename="${filename//${{ steps.version.outputs.app_version }}/${{ steps.version.outputs.artifact_version }}}"
             filename="Snack_${{ steps.version.outputs.artifact_version }}_windows_x64.exe"
             cp "$src" "$DST_DIR/$filename"
           done
@@ -481,6 +273,8 @@ jobs:
         with:
           files: artifacts/Snack-${{ steps.version.outputs.artifact_version }}-windows-x64/*
           token: ${{ secrets.GITHUB_TOKEN }}
+          prerelease: ${{ steps.version.outputs.release_prerelease }}
+          make_latest: ${{ steps.version.outputs.release_make_latest }}
           fail_on_unmatched_files: true
 
       - name: Upload Windows bundle artifact
