@@ -8,6 +8,7 @@ mod navigation;
 mod platform;
 mod record_import;
 mod web;
+mod window_state;
 
 use app_menu::install_close_to_status_menu;
 #[cfg(target_os = "macos")]
@@ -77,6 +78,7 @@ pub fn run() {
             let page_load_app_handle = app.handle().clone();
 
             let window = WebviewWindowBuilder::from_config(app, window_config)?
+                .visible(false)
                 .user_agent(&user_agent)
                 .on_new_window(move |url, _features| handle_new_window_request(&app_handle, url))
                 .on_page_load(move |window, payload| {
@@ -111,6 +113,9 @@ pub fn run() {
                     record_import::handle_open_url(app.handle(), &url);
                 }
             }
+
+            // The hidden webview loads while display detection runs, then becomes visible once.
+            window_state::restore_track_and_show(app.handle(), &window);
 
             Ok(())
         })

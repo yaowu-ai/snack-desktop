@@ -243,6 +243,7 @@ pub(crate) fn show_main_window(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.show();
         let _ = window.unminimize();
+        crate::window_state::recover_if_unreachable(&window);
         let _ = window.set_focus();
     }
 }
