@@ -17,7 +17,7 @@ use app_menu::setup_navigation_menu;
 #[cfg(windows)]
 use app_menu::setup_windows_tray;
 use navigation::handle_new_window_request;
-use tauri::WebviewWindowBuilder;
+use tauri::{webview::PageLoadEvent, WebviewWindowBuilder};
 use tauri_plugin_deep_link::DeepLinkExt;
 use web::desktop_user_agent;
 
@@ -74,10 +74,16 @@ pub fn run() {
 
             let user_agent = desktop_user_agent();
             let app_handle = app.handle().clone();
+            let page_load_app_handle = app.handle().clone();
 
             let window = WebviewWindowBuilder::from_config(app, window_config)?
                 .user_agent(&user_agent)
                 .on_new_window(move |url, _features| handle_new_window_request(&app_handle, url))
+                .on_page_load(move |window, payload| {
+                    if payload.event() == PageLoadEvent::Finished {
+                        record_import::handle_page_load(&page_load_app_handle, &window);
+                    }
+                })
                 .build()?;
 
             logging::write_app_log(

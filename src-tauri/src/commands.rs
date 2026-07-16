@@ -97,7 +97,8 @@ pub(crate) fn reveal_desktop_log_dir(
     }
 
     let dir = log_dir(&app);
-    std::fs::create_dir_all(&dir).map_err(|_| "failed to create desktop log directory".to_string())?;
+    std::fs::create_dir_all(&dir)
+        .map_err(|_| "failed to create desktop log directory".to_string())?;
     open_path(&dir)?;
 
     Ok(resolve_desktop_log_info(&app))

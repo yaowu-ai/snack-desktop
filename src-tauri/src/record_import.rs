@@ -26,6 +26,16 @@ pub(crate) struct PendingRecordImport {
     pub id: String,
     pub text: String,
     pub created_at: String,
+    #[serde(default)]
+    delivery_state: RecordImportDeliveryState,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum RecordImportDeliveryState {
+    #[default]
+    Pending,
+    Delivered,
 }
 
 pub(crate) struct RecordImportStore {
@@ -64,6 +74,25 @@ impl RecordImportStore {
             .lock()
             .expect("record import store poisoned")
             .clone()
+    }
+
+    fn claim_for_webview(&self) -> Option<PendingRecordImport> {
+        self.pending
+            .lock()
+            .expect("record import store poisoned")
+            .as_ref()
+            .filter(|item| item.delivery_state == RecordImportDeliveryState::Pending)
+            .cloned()
+    }
+
+    fn mark_delivered(&self, id: &str) -> Result<bool, String> {
+        let mut pending = self.pending.lock().expect("record import store poisoned");
+        let Some(item) = pending.as_mut().filter(|item| item.id == id) else {
+            return Ok(false);
+        };
+        item.delivery_state = RecordImportDeliveryState::Delivered;
+        self.persist(pending.as_ref())?;
+        Ok(true)
     }
 
     fn acknowledge(&self, id: &str) -> Result<bool, String> {
@@ -115,13 +144,22 @@ pub(crate) fn handle_open_url(app: &AppHandle, url: &tauri::Url) {
                 );
             } else {
                 show_main_window(app);
-                crate::logging::write_app_log(
-                    app,
-                    "info",
-                    "record-import",
-                    "Clipboard import is ready",
-                    None,
-                );
+                match navigate_to_root(app) {
+                    Ok(()) => crate::logging::write_app_log(
+                        app,
+                        "info",
+                        "record-import",
+                        "Clipboard import is ready and the webview is navigating to the root page",
+                        None,
+                    ),
+                    Err(error) => crate::logging::write_app_log(
+                        app,
+                        "warn",
+                        "record-import",
+                        "Clipboard import is ready but the webview could not navigate to the root page",
+                        Some(&serde_json::json!({ "reason": error })),
+                    ),
+                }
             }
         }
         Err(error) => crate::logging::write_app_log(
@@ -131,6 +169,38 @@ pub(crate) fn handle_open_url(app: &AppHandle, url: &tauri::Url) {
             "Clipboard import was rejected",
             Some(&serde_json::json!({ "reason": error })),
         ),
+    }
+}
+
+pub(crate) fn handle_page_load(app: &AppHandle, window: &WebviewWindow) {
+    let Ok(url) = window.url() else {
+        return;
+    };
+    if !is_allowed_web_origin(&url) || url.path() != "/" {
+        return;
+    }
+    let store = app.state::<RecordImportStore>();
+    let Some(import) = store.claim_for_webview() else {
+        return;
+    };
+    if let Err(error) = prefill_root_input(window, &import)
+        .and_then(|_| store.mark_delivered(&import.id).map(|_| ()))
+    {
+        crate::logging::write_app_log(
+            app,
+            "warn",
+            "record-import",
+            "Clipboard import could not be written after root page loaded",
+            Some(&serde_json::json!({ "reason": error })),
+        );
+    } else {
+        crate::logging::write_app_log(
+            app,
+            "info",
+            "record-import",
+            "Clipboard import was written after root page loaded",
+            None,
+        );
     }
 }
 
@@ -177,6 +247,25 @@ fn show_main_window(app: &AppHandle) {
     }
 }
 
+fn navigate_to_root(app: &AppHandle) -> Result<(), String> {
+    let window = app
+        .get_webview_window("main")
+        .ok_or_else(|| "main webview is unavailable".to_string())?;
+    require_allowed_origin(&window)?;
+    let mut root_url = window.url().map_err(|error| error.to_string())?;
+    root_url.set_path("/");
+    root_url.set_query(None);
+    root_url.set_fragment(None);
+    window.navigate(root_url).map_err(|error| error.to_string())
+}
+
+fn prefill_root_input(window: &WebviewWindow, import: &PendingRecordImport) -> Result<(), String> {
+    require_allowed_origin(window)?;
+    let text = serde_json::to_string(&import.text).map_err(|error| error.to_string())?;
+    let script = format!("window.sessionStorage.setItem('prefill_message', {text});");
+    window.eval(&script).map_err(|error| error.to_string())
+}
+
 #[cfg(target_os = "macos")]
 fn read_clipboard_import() -> Result<PendingRecordImport, String> {
     use objc2_app_kit::{NSPasteboard, NSPasteboardTypeString};
@@ -216,6 +305,7 @@ fn read_clipboard_import() -> Result<PendingRecordImport, String> {
         id: format!("clipboard-v1-{checksum}"),
         text,
         created_at: metadata.created_at,
+        delivery_state: RecordImportDeliveryState::Pending,
     })
 }
 
@@ -253,6 +343,7 @@ fn read_clipboard_import() -> Result<PendingRecordImport, String> {
                 id: format!("clipboard-v1-{checksum}"),
                 text,
                 created_at: metadata.created_at,
+                delivery_state: RecordImportDeliveryState::Pending,
             })
         })();
         DataExchange::CloseClipboard();
@@ -294,7 +385,7 @@ fn read_clipboard_import() -> Result<PendingRecordImport, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::is_clipboard_import_url;
+    use super::{is_clipboard_import_url, PendingRecordImport, RecordImportDeliveryState};
 
     #[test]
     fn accepts_only_the_v1_clipboard_link() {
@@ -307,5 +398,15 @@ mod tests {
         assert!(!is_clipboard_import_url(
             &"snack://other?source=clipboard".parse().unwrap()
         ));
+    }
+
+    #[test]
+    fn legacy_pending_import_defaults_to_pending_delivery() {
+        let import: PendingRecordImport = serde_json::from_str(
+            r#"{"id":"legacy","text":"transcript","createdAt":"2026-07-16T00:00:00Z"}"#,
+        )
+        .unwrap();
+
+        assert_eq!(import.delivery_state, RecordImportDeliveryState::Pending);
     }
 }
