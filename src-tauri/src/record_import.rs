@@ -312,7 +312,7 @@ fn read_clipboard_import() -> Result<PendingRecordImport, String> {
 #[cfg(not(target_os = "macos"))]
 #[cfg(target_os = "windows")]
 fn read_clipboard_import() -> Result<PendingRecordImport, String> {
-    use windows_sys::Win32::System::{DataExchange, Memory};
+    use windows_sys::Win32::System::{DataExchange, Ole};
 
     unsafe {
         if DataExchange::OpenClipboard(std::ptr::null_mut()) == 0 {
@@ -327,7 +327,7 @@ fn read_clipboard_import() -> Result<PendingRecordImport, String> {
             if metadata.version != 1 || metadata.source != "snack-record" {
                 return Err("unsupported Snack Record clipboard metadata".to_string());
             }
-            let text = read_windows_clipboard_string(DataExchange::CF_UNICODETEXT)?;
+            let text = read_windows_clipboard_string(u32::from(Ole::CF_UNICODETEXT))?;
             let bytes = text.as_bytes();
             if bytes.is_empty()
                 || bytes.len() > MAX_TRANSCRIPT_BYTES
