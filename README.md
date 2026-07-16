@@ -1,6 +1,37 @@
 # Snack Desktop
 
-如何打包：
+Snack Desktop 是 [Snack](https://snack.mechlabs.cn/) 的桌面客户端。Snack 是面向企业增长团队的 AI 工作台，连接业务数据、团队协作和待办任务，让信息整理、分析、执行与复盘形成持续运转的闭环。
+
+**[访问 Snack 官网并开始使用](https://snack.mechlabs.cn/)**
+
+## Snack 能做什么
+
+Snack 将企业知识、会议文档、IM 沟通、业务数据、流程权限和既有工具系统连接到同一工作流中。它不仅回答问题，也能结合上下文识别风险、生成建议、推进任务，并将过程经验沉淀为团队可复用的资产。
+
+- **统一经营视角**：汇总客户、项目、渠道和反馈等过程数据，帮助团队发现机会与风险，并围绕同一份事实协同决策。
+- **团队记忆系统**：将资料、会议、聊天与业务过程沉淀为可检索、可复用的上下文，减少重复梳理与信息断层。
+- **长任务执行**：通过 Agent、Skill 和任务记忆拆解复杂工作，持续跟进执行进度，并沉淀下一次交付可用的经验。
+- **安全可控的 AI 底座**：结合本地数据安全、本地算力与多级模型路由，在安全要求和成本之间选择合适的模型能力。
+
+适用于出海增长、经营管理、伙伴运营等需要跨数据源、跨角色协作的真实业务场景。无论是投放复盘与线索承接，还是服务反馈归类和行动跟进，Snack 都帮助团队把零散动作组织成可持续优化的增长节奏。
+
+## 界面预览
+
+Snack 将企业增长工作流呈现在同一界面中：
+
+![Snack 企业增长工作流](https://snack.mechlabs.cn/home/growth-flow.png)
+
+从多市场、多语种、多品类的增长运营，到提醒、任务与复盘，Snack 帮助小团队连接过程信息并持续推进关键动作：
+
+![Snack 增长运营场景](https://snack.mechlabs.cn/home/case-growth-hd.png)
+
+在经营管理中，Snack 汇集客户、项目、反馈与过程数据，为团队建立统一的经营认知：
+
+![Snack 经营管理场景](https://snack.mechlabs.cn/home/case-command-hd.png)
+
+更多产品能力、应用场景与使用方式，请访问 **[snack.mechlabs.cn](https://snack.mechlabs.cn/)**。
+
+## 本地打包
 
 ```bash
 npm run dev -- prod
@@ -9,40 +40,19 @@ npm run build -- prod
 npm run build -- qa
 ```
 
-CI 打包规则：
+## 远端打包与发布
 
-```text
-push 到 test 分支 -> QA 测试包，上传 GitHub Actions artifacts
-push v* 或 *.*.* tag -> 正式包，tag 指向的 commit 必须属于 GitHub prod 分支历史，上传 GitHub Release
-```
+GitHub Actions 在推送符合条件的 tag 时触发构建。tag 支持 `v*` 或 `*.*.*` 形式，但版本最终必须是 `x.y.z` 或 `vX.Y.Z`，例如 `1.2.3`、`v1.2.3`。
 
-打包脚本会从 GitHub ref 推导环境：`test` 分支使用 `qa`，tag 使用 `prod`。
-本地显式传参或设置 `SNACK_ENV` 时，以本地输入为准。
+工作流会检查 tag 指向的提交属于哪个远端分支历史：
 
+| Tag 所在提交 | 构建环境 | GitHub Release |
+| --- | --- | --- |
+| `prod` 分支历史 | `prod` | 正式发布并标记为 latest |
+| `test` 分支历史 | `qa` | 预发布（prerelease） |
+| 不属于两者 | 不构建 | 工作流失败 |
 
-## 开发 gitflow
-有新需求，先从prod分支拉feature/xxx，改完后合并到test打包, 远端会打debug包
-验证通过后，feature/xxx 合并到prod，再打tag，远端会打 release 包
-
-## 正式发版
-
-正式包通过 GitHub tag 触发，不需要在本地上传安装包。tag 必须指向 GitHub
-`prod` 分支历史中的 commit，否则 CI 会直接失败。
-
-推荐流程：
-
-```bash
-git fetch origin-github prod --tags
-git checkout main
-git merge --ff-only origin-github/prod
-git tag 0.1.3 origin-github/prod
-git push origin-github 0.1.3
-```
-
-如果上一次 tag 指向了旧 commit，重跑 GitHub Actions 不会使用新代码。需要重新打一个新版本
-tag，例如从 `0.1.2` 改为 `0.1.3`，并确保新 tag 指向当前 GitHub `prod`。
-
-CI 上传到 GitHub Release 的产物命名规则：
+每次发布会在 GitHub Release 上传以下签名产物：
 
 ```text
 Snack_{version}_windows_x64.exe
@@ -55,105 +65,8 @@ Snack_{version}_macos_x64.app.tar.gz
 Snack_{version}_macos_x64.app.tar.gz.sig
 ```
 
-## 打包环境变量
+远端构建使用 Node.js 22。Windows 构建需要 `TAURI_UPDATER_PUBKEY` 和 `TAURI_SIGNING_PRIVATE_KEY`；macOS 构建还需要 Apple 签名与公证相关的 GitHub Secrets。工作流会为 updater 安装包生成并上传 `.sig` 签名文件。
 
-必需：
+## 许可证
 
-```text
-TAURI_UPDATER_PUBKEY
-```
-
-兼容旧变量名：
-
-```text
-TAURI_PUBLIC_KEY
-```
-
-生成 updater 签名包时需要：
-
-```text
-TAURI_SIGNING_PRIVATE_KEY
-TAURI_SIGNING_PRIVATE_KEY_PASSWORD
-```
-
-CI 会手动为 updater release 产物生成签名，并随 GitHub Release 上传 `.sig`。
-默认关闭 Tauri CLI 自带的 updater artifact 生成，避免打包阶段重复处理签名。
-如果需要本地显式启用 Tauri CLI 自带 updater artifact 生成，可设置：
-
-```text
-SNACK_CREATE_UPDATER_ARTIFACTS=true
-```
-
-可选覆盖：
-
-```text
-SNACK_ENV
-SNACK_PROD_HOST
-SNACK_QA_HOST
-SNACK_PROD_UPDATER_ENDPOINT
-SNACK_QA_UPDATER_ENDPOINT
-SNACK_DESKTOP_BASE_UA
-SNACK_DESKTOP_VERSION
-```
-
-`SNACK_PROD_HOST`、`SNACK_QA_HOST`、`SNACK_PROD_UPDATER_ENDPOINT`、
-`SNACK_QA_UPDATER_ENDPOINT` 为空时会使用默认值：
-
-```text
-prod host: snack.mechlabs.cn
-qa host: qasnack.mechlabs.cn
-prod updater: https://snack.mechlabs.cn/api/desktop-updates/update?currentVersion={{current_version}}&target={{target}}&arch={{arch}}
-qa updater: https://qasnack.mechlabs.cn/api/desktop-updates/update?currentVersion={{current_version}}&target={{target}}&arch={{arch}}
-```
-
-updater endpoint 中的 `{{current_version}}`、`{{target}}`、`{{arch}}` 是 Tauri
-运行时占位符，放进 GitHub secret 或本地环境变量时也保持这种写法。
-
-macOS release CI 额外需要：
-
-```text
-TARGET_TRIPLE
-APP_VERSION
-DMG_ARCH_SUFFIX
-APPLE_CERTIFICATE
-APPLE_CERTIFICATE_PASSWORD
-APPLE_SIGNING_IDENTITY
-APPLE_ID
-APPLE_PASSWORD
-APPLE_TEAM_ID
-```
-
-## UA 规则
-
-当前 WebView UA 格式：
-
-```text
-{base_browser_ua} SnackDesktop/{arch}/{version}
-```
-
-示例：
-
-```text
-Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36 SnackDesktop/x64/1.0.0
-```
-
-版本号来源：
-
-```text
-1. SNACK_DESKTOP_VERSION 环境变量。
-2. src-tauri/Cargo.toml 中的 Rust 包版本。
-```
-
-基础浏览器 UA 默认按平台选择，参考 Pake 的做法：macOS 使用 Safari 风格 UA，
-Windows/Linux 使用 Chrome 风格 UA。需要覆盖时设置 `SNACK_DESKTOP_BASE_UA`。
-
-## 维护位置
-
-调整环境、地址、版本号或 UA 时，同步检查这些文件：
-
-```text
-scripts/index.cjs
-src-tauri/build.rs
-src-tauri/src/lib.rs
-README.md
-```
+本项目采用 [MIT License](LICENSE)。
