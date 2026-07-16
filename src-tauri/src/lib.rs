@@ -6,6 +6,7 @@ mod download;
 mod logging;
 mod navigation;
 mod platform;
+mod record_import;
 mod web;
 
 use app_menu::install_close_to_status_menu;
@@ -17,11 +18,15 @@ use app_menu::setup_navigation_menu;
 use app_menu::setup_windows_tray;
 use navigation::handle_new_window_request;
 use tauri::WebviewWindowBuilder;
+use tauri_plugin_deep_link::DeepLinkExt;
 use web::desktop_user_agent;
 
 pub fn run() {
     tauri::Builder::default()
+        // Must be registered first so Windows forwards a deep-link CLI launch to the active app.
+        .plugin(tauri_plugin_single_instance::init(|_, _, _| {}))
         .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
@@ -32,9 +37,12 @@ pub fn run() {
             commands::reveal_desktop_log_dir,
             commands::reveal_downloaded_file,
             commands::set_desktop_attention,
-            commands::write_desktop_log
+            commands::write_desktop_log,
+            record_import::claim_pending_record_import,
+            record_import::acknowledge_record_import_prefilled
         ])
         .setup(|app| {
+            record_import::initialize(app.handle()).map_err(std::io::Error::other)?;
             logging::write_app_log(
                 app.handle(),
                 "info",
@@ -84,6 +92,19 @@ pub fn run() {
             );
 
             install_close_to_status_menu(&window);
+
+            let app_handle = app.handle().clone();
+            app.deep_link().on_open_url(move |event| {
+                for url in event.urls() {
+                    record_import::handle_open_url(&app_handle, &url);
+                }
+            });
+
+            if let Ok(Some(urls)) = app.deep_link().get_current() {
+                for url in urls {
+                    record_import::handle_open_url(app.handle(), &url);
+                }
+            }
 
             Ok(())
         })
