@@ -7,6 +7,7 @@ mod logging;
 mod navigation;
 mod platform;
 mod record_import;
+mod record_resources;
 mod recording;
 mod web;
 mod window_state;
@@ -29,16 +30,6 @@ pub fn run() {
         .plugin(tauri_plugin_single_instance::init(|_, _, _| {}))
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_deep_link::init())
-        .plugin(tauri_plugin_dialog::init())
-        .plugin(
-            tauri_plugin_global_shortcut::Builder::new()
-                .with_handler(|app, _, event| {
-                    if event.state == tauri_plugin_global_shortcut::ShortcutState::Pressed {
-                        recording::toggle_recording_from_shortcut(app.clone());
-                    }
-                })
-                .build(),
-        )
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
@@ -52,6 +43,8 @@ pub fn run() {
             commands::write_desktop_log,
             record_import::claim_pending_record_import,
             record_import::acknowledge_record_import_prefilled,
+            record_resources::get_recording_resource_status,
+            record_resources::install_recording_resources,
             recording::choose_and_import_recording,
             recording::choose_recording_output_directory,
             recording::configure_recording_preferences,
@@ -59,19 +52,17 @@ pub fn run() {
             recording::delete_system_audio_recording,
             recording::delete_system_audio_recordings,
             recording::detect_active_meeting_app,
-            recording::get_recording_resource_status,
+            recording::get_recording_preferences,
             recording::get_system_audio_recording_status,
-            recording::install_recording_resources,
             recording::list_system_audio_recordings,
             recording::open_local_recording_file,
+            recording::open_recording_window,
             recording::start_system_audio_recording,
             recording::stop_system_audio_recording,
             recording::transcribe_local_audio
         ])
         .setup(|app| {
             record_import::initialize(app.handle()).map_err(std::io::Error::other)?;
-            recording::initialize(app.handle()).map_err(std::io::Error::other)?;
-            recording::setup_default_shortcut(app.handle());
             logging::write_app_log(
                 app.handle(),
                 "info",

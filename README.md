@@ -34,7 +34,6 @@ Snack 将企业增长工作流呈现在同一界面中：
 ## 本地打包
 
 ```bash
-npm run dev -- local
 npm run dev -- prod
 npm run dev -- qa
 npm run build -- prod

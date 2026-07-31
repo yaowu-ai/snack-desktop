@@ -128,6 +128,11 @@ pub(crate) fn initialize(app: &AppHandle) -> Result<(), String> {
 }
 
 pub(crate) fn handle_open_url(app: &AppHandle, url: &tauri::Url) {
+    if let Some(entry) = snack_record_entry(url) {
+        handle_snack_record_entry(app, entry);
+        return;
+    }
+
     if !is_clipboard_import_url(url) {
         return;
     }
@@ -240,11 +245,84 @@ fn is_clipboard_import_url(url: &tauri::Url) -> bool {
             .any(|(key, value)| key == "source" && value == "clipboard")
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum SnackRecordEntry {
+    Library,
+    Recording,
+    Settings,
+}
+
+impl SnackRecordEntry {
+    fn view(self) -> &'static str {
+        match self {
+            Self::Library | Self::Recording => "library",
+            Self::Settings => "settings",
+        }
+    }
+}
+
+fn snack_record_entry(url: &tauri::Url) -> Option<SnackRecordEntry> {
+    if url.scheme() != "snack" || url.host_str() != Some("apps") || url.path() != "/snack-record" {
+        return None;
+    }
+
+    let mut entry = SnackRecordEntry::Library;
+    for (key, value) in url.query_pairs() {
+        if key == "action" && value == "recording" {
+            return Some(SnackRecordEntry::Recording);
+        }
+        if key == "view" && value == "settings" {
+            entry = SnackRecordEntry::Settings;
+        }
+    }
+    Some(entry)
+}
+
+fn handle_snack_record_entry(app: &AppHandle, entry: SnackRecordEntry) {
+    show_main_window(app);
+    if let Err(error) = navigate_to_snack_record(app, entry.view()) {
+        crate::logging::write_app_log(
+            app,
+            "warn",
+            "snack-record-entry",
+            "Snack Record entry could not navigate the main webview",
+            Some(&serde_json::json!({ "reason": error })),
+        );
+    }
+    if entry == SnackRecordEntry::Recording {
+        if let Err(error) = crate::recording::show_recording_window(app) {
+            crate::logging::write_app_log(
+                app,
+                "warn",
+                "snack-record-entry",
+                "Snack Record recording window could not be opened",
+                Some(&serde_json::json!({ "reason": error })),
+            );
+        }
+    }
+}
+
 fn show_main_window(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.show();
+        let _ = window.unminimize();
+        crate::window_state::recover_if_unreachable(&window);
         let _ = window.set_focus();
     }
+}
+
+fn navigate_to_snack_record(app: &AppHandle, view: &str) -> Result<(), String> {
+    let window = app
+        .get_webview_window("main")
+        .ok_or_else(|| "main webview is unavailable".to_string())?;
+    require_allowed_origin(&window)?;
+    let mut target_url = window.url().map_err(|error| error.to_string())?;
+    target_url.set_path("/apps/snack-record");
+    target_url.set_query(Some(&format!("view={view}")));
+    target_url.set_fragment(None);
+    window
+        .navigate(target_url)
+        .map_err(|error| error.to_string())
 }
 
 fn navigate_to_root(app: &AppHandle) -> Result<(), String> {
@@ -385,7 +463,10 @@ fn read_clipboard_import() -> Result<PendingRecordImport, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_clipboard_import_url, PendingRecordImport, RecordImportDeliveryState};
+    use super::{
+        is_clipboard_import_url, snack_record_entry, PendingRecordImport,
+        RecordImportDeliveryState, SnackRecordEntry,
+    };
 
     #[test]
     fn accepts_only_the_v1_clipboard_link() {
@@ -398,6 +479,30 @@ mod tests {
         assert!(!is_clipboard_import_url(
             &"snack://other?source=clipboard".parse().unwrap()
         ));
+    }
+
+    #[test]
+    fn maps_snack_record_links_to_desktop_entries() {
+        assert_eq!(
+            snack_record_entry(
+                &"snack://apps/snack-record?action=recording"
+                    .parse()
+                    .unwrap()
+            ),
+            Some(SnackRecordEntry::Recording)
+        );
+        assert_eq!(
+            snack_record_entry(&"snack://apps/snack-record?view=library".parse().unwrap()),
+            Some(SnackRecordEntry::Library)
+        );
+        assert_eq!(
+            snack_record_entry(&"snack://apps/snack-record?view=settings".parse().unwrap()),
+            Some(SnackRecordEntry::Settings)
+        );
+        assert_eq!(
+            snack_record_entry(&"snack://chat?source=clipboard".parse().unwrap()),
+            None
+        );
     }
 
     #[test]
