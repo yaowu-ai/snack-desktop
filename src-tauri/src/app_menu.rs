@@ -13,8 +13,8 @@ use crate::attention::DesktopAttentionState;
 use crate::constants::TRAY_ATTENTION_ICON;
 #[cfg(any(target_os = "macos", windows))]
 use crate::constants::{
-    ABOUT_ICON, NAVIGATION_MENU_BACK_ID, NAVIGATION_MENU_ID, TRAY_DEFAULT_ICON, TRAY_ID,
-    TRAY_MENU_QUIT_ID, TRAY_MENU_SHOW_ID,
+    ABOUT_ICON, APP_MENU_RECORD_ID, NAVIGATION_MENU_BACK_ID, NAVIGATION_MENU_ID, TRAY_DEFAULT_ICON,
+    TRAY_ID, TRAY_MENU_QUIT_ID, TRAY_MENU_RECORD_ID, TRAY_MENU_SHOW_ID,
 };
 #[cfg(any(target_os = "macos", windows))]
 use crate::navigation::navigate_back;
@@ -44,6 +44,17 @@ pub(crate) fn setup_navigation_menu(app: &mut tauri::App) -> tauri::Result<()> {
         Some(menu) => menu,
         None => default_app_menu(app)?,
     };
+    #[cfg(target_os = "macos")]
+    {
+        let ready = install_macos_application_recording_entry(app, &menu)?;
+        crate::logging::write_app_log(
+            app.handle(),
+            if ready { "info" } else { "error" },
+            "menu",
+            "Application recording menu configured",
+            Some(&serde_json::json!({ "ready": ready })),
+        );
+    }
     menu.append(&navigation)?;
     app.set_menu(menu)?;
 
@@ -69,9 +80,54 @@ fn about_metadata(app: &tauri::App) -> tauri::menu::AboutMetadata<'static> {
     }
 }
 
+#[cfg(target_os = "macos")]
+fn macos_application_recording_menu_spec() -> (&'static str, &'static str) {
+    (APP_MENU_RECORD_ID, "开启本地录音纪要")
+}
+
+#[cfg(target_os = "macos")]
+fn macos_application_recording_insert_position() -> usize {
+    2
+}
+
+#[cfg(target_os = "macos")]
+fn install_macos_application_recording_entry(
+    app: &tauri::App,
+    menu: &tauri::menu::Menu<tauri::Wry>,
+) -> tauri::Result<bool> {
+    use tauri::menu::{MenuItem, MenuItemKind, PredefinedMenuItem};
+
+    let application_menu = menu
+        .items()?
+        .into_iter()
+        .next()
+        .and_then(|item| match item {
+            MenuItemKind::Submenu(submenu) => Some(submenu),
+            _ => None,
+        });
+    let Some(application_menu) = application_menu else {
+        return Ok(false);
+    };
+    if application_menu.get(APP_MENU_RECORD_ID).is_none() {
+        let (id, label) = macos_application_recording_menu_spec();
+        let record = MenuItem::with_id(app, id, label, true, None::<&str>)?;
+        let separator = PredefinedMenuItem::separator(app)?;
+        application_menu.insert_items(
+            &[&record, &separator],
+            macos_application_recording_insert_position(),
+        )?;
+    }
+    Ok(application_menu.get(APP_MENU_RECORD_ID).is_some())
+}
+
+#[cfg(any(target_os = "macos", windows))]
+fn is_recording_menu_event(id: &str) -> bool {
+    matches!(id, APP_MENU_RECORD_ID | TRAY_MENU_RECORD_ID)
+}
+
 #[cfg(any(target_os = "macos", windows))]
 fn default_app_menu(app: &tauri::App) -> tauri::Result<tauri::menu::Menu<tauri::Wry>> {
-    use tauri::menu::{Menu, PredefinedMenuItem, Submenu};
+    use tauri::menu::{Menu, MenuItem, PredefinedMenuItem, Submenu};
 
     let package_name = app.package_info().name.clone();
 
@@ -110,6 +166,14 @@ fn default_app_menu(app: &tauri::App) -> tauri::Result<tauri::menu::Menu<tauri::
                 true,
                 &[
                     &PredefinedMenuItem::about(app, None, Some(about_metadata(app)))?,
+                    &PredefinedMenuItem::separator(app)?,
+                    &MenuItem::with_id(
+                        app,
+                        macos_application_recording_menu_spec().0,
+                        macos_application_recording_menu_spec().1,
+                        true,
+                        None::<&str>,
+                    )?,
                     &PredefinedMenuItem::separator(app)?,
                     &PredefinedMenuItem::services(app, None)?,
                     &PredefinedMenuItem::separator(app)?,
@@ -167,12 +231,20 @@ pub(crate) fn setup_windows_tray(app: &mut tauri::App) -> tauri::Result<()> {
     app.manage(attention_state.clone());
 
     let show = MenuItem::with_id(app, TRAY_MENU_SHOW_ID, "显示 Snack", true, None::<&str>)?;
+    let record = MenuItem::with_id(
+        app,
+        TRAY_MENU_RECORD_ID,
+        "开启本地录音纪要",
+        true,
+        None::<&str>,
+    )?;
     let about = PredefinedMenuItem::about(app, Some("关于 Snack"), Some(about_metadata(app)))?;
     let quit = MenuItem::with_id(app, TRAY_MENU_QUIT_ID, "退出", true, None::<&str>)?;
     let menu = Menu::with_items(
         app,
         &[
             &show,
+            &record,
             &PredefinedMenuItem::separator(app)?,
             &about,
             &PredefinedMenuItem::separator(app)?,
@@ -256,6 +328,9 @@ pub(crate) fn should_show_window_on_reopen(has_visible_windows: bool) -> bool {
 #[cfg(any(target_os = "macos", windows))]
 fn register_status_menu_events(app: &mut tauri::App) {
     app.on_menu_event(|app, event| match event.id().as_ref() {
+        id if is_recording_menu_event(id) => {
+            crate::recording::start_recording_from_status_menu(app.clone())
+        }
         NAVIGATION_MENU_BACK_ID => {
             if let Some(window) = app.get_webview_window("main") {
                 navigate_back(&window);
@@ -287,12 +362,20 @@ pub(crate) fn setup_macos_status_menu(app: &mut tauri::App) -> tauri::Result<()>
     use tauri::tray::TrayIconBuilder;
 
     let show = MenuItem::with_id(app, TRAY_MENU_SHOW_ID, "显示 Snack", true, None::<&str>)?;
+    let record = MenuItem::with_id(
+        app,
+        TRAY_MENU_RECORD_ID,
+        "开启本地录音纪要",
+        true,
+        None::<&str>,
+    )?;
     let about = PredefinedMenuItem::about(app, Some("关于 Snack"), Some(about_metadata(app)))?;
     let quit = MenuItem::with_id(app, TRAY_MENU_QUIT_ID, "退出", true, None::<&str>)?;
     let menu = Menu::with_items(
         app,
         &[
             &show,
+            &record,
             &PredefinedMenuItem::separator(app)?,
             &about,
             &PredefinedMenuItem::separator(app)?,
@@ -316,7 +399,21 @@ pub(crate) fn setup_macos_status_menu(app: &mut tauri::App) -> tauri::Result<()>
 #[cfg(test)]
 #[cfg(target_os = "macos")]
 mod tests {
-    use super::should_show_window_on_reopen;
+    use super::{
+        is_recording_menu_event, macos_application_recording_insert_position,
+        macos_application_recording_menu_spec, should_show_window_on_reopen,
+    };
+    use crate::constants::APP_MENU_RECORD_ID;
+
+    #[test]
+    fn exposes_local_recording_in_the_macos_application_menu() {
+        let (id, label) = macos_application_recording_menu_spec();
+
+        assert_eq!(id, APP_MENU_RECORD_ID);
+        assert_eq!(label, "开启本地录音纪要");
+        assert_eq!(macos_application_recording_insert_position(), 2);
+        assert!(is_recording_menu_event(id));
+    }
 
     #[test]
     fn reopens_hidden_main_window_from_dock() {

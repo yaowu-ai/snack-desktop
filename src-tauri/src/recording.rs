@@ -19,6 +19,8 @@ use uuid::Uuid;
 
 use crate::web::is_allowed_web_origin;
 
+const DEFAULT_RECORDING_SHORTCUT: &str = "CommandOrControl+R";
+
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct TranscriptionRequest {
@@ -311,6 +313,12 @@ pub(crate) fn open_local_recording_file(
         .find(|recording| recording.id == id)
         .ok_or("未找到录音")?;
     let path = recording_file_path(recording, &kind)?;
+    if kind == "audio" {
+        app.asset_protocol_scope()
+            .allow_file(&path)
+            .map_err(|error| format!("无法读取本地录音：{error}"))?;
+        return show_audio_player_window(&app, &window, recording);
+    }
     app.opener()
         .open_path(path.to_string_lossy(), None::<&str>)
         .map_err(|error| error.to_string())
@@ -371,7 +379,34 @@ pub(crate) fn configure_recording_shortcut(
 }
 
 pub(crate) fn setup_default_shortcut(app: &AppHandle) {
-    let _ = app.global_shortcut().register("Control+R");
+    if let Err(error) = app.global_shortcut().register(DEFAULT_RECORDING_SHORTCUT) {
+        crate::logging::write_app_log(
+            app,
+            "error",
+            "recording",
+            "Failed to register the default recording shortcut",
+            Some(&serde_json::json!({
+                "error": error.to_string(),
+                "shortcut": DEFAULT_RECORDING_SHORTCUT,
+            })),
+        );
+    }
+}
+
+pub(crate) fn start_recording_from_status_menu(app: AppHandle) {
+    let Some(window) = app.get_webview_window("main") else {
+        return;
+    };
+    tauri::async_runtime::spawn(async move {
+        let status = get_system_audio_recording_status(window.clone(), app.clone());
+        if status.is_ok_and(|status| status.active) {
+            show_recording_window(&app, &window);
+            return;
+        }
+        if let Err(error) = start_system_audio_recording(window, app.clone()).await {
+            crate::logging::write_app_log(&app, "error", "recording", &error, None);
+        }
+    });
 }
 
 pub(crate) fn toggle_recording_from_shortcut(app: AppHandle) {
@@ -730,6 +765,40 @@ fn show_recording_window(app: &AppHandle, source: &WebviewWindow) {
         .build();
 }
 
+fn show_audio_player_window(
+    app: &AppHandle,
+    source: &WebviewWindow,
+    recording: &DesktopRecording,
+) -> Result<(), String> {
+    let mut url = source.url().map_err(|error| error.to_string())?;
+    url.set_path("/apps/snack-record");
+    url.set_query(None);
+    url.query_pairs_mut().append_pair("player", &recording.id);
+    let title = format!("{} - 本地录音", recording.file_name);
+
+    if let Some(window) = app.get_webview_window("snack-recording-player") {
+        window.navigate(url).map_err(|error| error.to_string())?;
+        window
+            .set_title(&title)
+            .map_err(|error| error.to_string())?;
+        window.show().map_err(|error| error.to_string())?;
+        window.set_focus().map_err(|error| error.to_string())?;
+        return Ok(());
+    }
+
+    let window =
+        WebviewWindowBuilder::new(app, "snack-recording-player", WebviewUrl::External(url))
+            .title(&title)
+            .inner_size(760.0, 400.0)
+            .min_inner_size(640.0, 360.0)
+            .resizable(true)
+            .decorations(false)
+            .build()
+            .map_err(|error| error.to_string())?;
+    let _ = window.center();
+    Ok(())
+}
+
 fn hide_recording_window(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("snack-recording") {
         let _ = window.hide();
@@ -881,6 +950,11 @@ extern "C" {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn uses_platform_command_or_control_as_the_default_shortcut() {
+        assert_eq!(DEFAULT_RECORDING_SHORTCUT, "CommandOrControl+R");
+    }
 
     #[test]
     fn persists_recording_metadata_atomically() {

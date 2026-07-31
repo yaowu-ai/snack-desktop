@@ -1,0 +1,22 @@
+{
+  "identifier": "snack-recording-window-drag",
+  "description": "Allow Snack Record utility windows to use their custom title bars and window controls.",
+  "local": true,
+  "remote": {
+    "urls": [
+      "https://snack.mechlabs.cn/*",
+      "https://qasnack.mechlabs.cn/*",
+      "http://localhost:3000/*",
+      "http://127.0.0.1:3000/*"
+    ]
+  },
+  "windows": [
+    "snack-recording",
+    "snack-recording-player"
+  ],
+  "permissions": [
+    "core:window:allow-start-dragging",
+    "core:window:allow-close",
+    "core:window:allow-hide"
+  ]
+}

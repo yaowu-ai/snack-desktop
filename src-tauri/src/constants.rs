@@ -4,7 +4,11 @@ use tauri::include_image;
 #[cfg(any(target_os = "macos", windows))]
 pub(crate) const TRAY_ID: &str = "main-tray";
 #[cfg(any(target_os = "macos", windows))]
+pub(crate) const APP_MENU_RECORD_ID: &str = "app-start-local-recording";
+#[cfg(any(target_os = "macos", windows))]
 pub(crate) const TRAY_MENU_SHOW_ID: &str = "show";
+#[cfg(any(target_os = "macos", windows))]
+pub(crate) const TRAY_MENU_RECORD_ID: &str = "start-local-recording";
 #[cfg(any(target_os = "macos", windows))]
 pub(crate) const TRAY_MENU_QUIT_ID: &str = "quit";
 #[cfg(any(target_os = "macos", windows))]
