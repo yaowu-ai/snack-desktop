@@ -48,12 +48,17 @@ const envValue = (name, fallback) => {
   return value || fallback;
 };
 
-const hostMap = {
-  prod: envValue("SNACK_PROD_HOST", "snack.mechlabs.cn"),
-  qa: envValue("SNACK_QA_HOST", "qasnack.mechlabs.cn"),
+const frontendUrlMap = {
+  local: envValue("SNACK_LOCAL_FRONTEND_URL", "http://localhost:3000"),
+  prod: `https://${envValue("SNACK_PROD_HOST", "snack.mechlabs.cn")}`,
+  qa: `https://${envValue("SNACK_QA_HOST", "qasnack.mechlabs.cn")}`,
 };
 
 const updaterEndpointMap = {
+  local: envValue(
+    "SNACK_LOCAL_UPDATER_ENDPOINT",
+    "http://localhost:3000/api/desktop-updates/update?currentVersion={{current_version}}&target={{target}}&arch={{arch}}",
+  ),
   prod: envValue(
     "SNACK_PROD_UPDATER_ENDPOINT",
     "https://snack.mechlabs.cn/api/desktop-updates/update?currentVersion={{current_version}}&target={{target}}&arch={{arch}}",
@@ -67,7 +72,7 @@ const updaterEndpointMap = {
 const command = commandMap[process.argv[2]];
 
 if (!command) {
-  console.error("Usage: node scripts/index.cjs <dev|build> [qa|prod] [...tauriArgs]");
+  console.error("Usage: node scripts/index.cjs <dev|build> [local|qa|prod] [...tauriArgs]");
   process.exit(1);
 }
 
@@ -78,16 +83,14 @@ if (args[0] && !args[0].startsWith("-")) {
   targetEnv = args.shift().toLowerCase();
 }
 
-const host = hostMap[targetEnv];
+const frontendUrl = frontendUrlMap[targetEnv];
 const updaterEndpoint = updaterEndpointMap[targetEnv];
 
-if (!host || !updaterEndpoint) {
+if (!frontendUrl || !updaterEndpoint) {
   console.error(`Unknown ${command} environment: ${targetEnv}`);
-  console.error(`Supported environments: ${Object.keys(hostMap).join(", ")}`);
+  console.error(`Supported environments: ${Object.keys(frontendUrlMap).join(", ")}`);
   process.exit(1);
 }
-
-const frontendUrl = `https://${host}`;
 const normalizeUpdaterPubkey = (value) => {
   const pubkey = value?.trim();
   if (!pubkey) {

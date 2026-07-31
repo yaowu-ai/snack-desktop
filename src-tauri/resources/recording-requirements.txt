@@ -1,0 +1,12 @@
+funasr==1.3.14
+modelscope==1.38.1
+numpy<2; platform_machine == "x86_64"
+torch==2.2.2; platform_machine == "x86_64"
+torchaudio==2.2.2; platform_machine == "x86_64"
+numba==0.62.1; platform_machine == "x86_64"
+llvmlite==0.45.1; platform_machine == "x86_64"
+transformers<5; platform_machine == "x86_64"
+torch>=2.2; platform_machine == "arm64"
+torchaudio>=2.2; platform_machine == "arm64"
+librosa>=0.10
+soundfile>=0.12

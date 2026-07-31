@@ -1,0 +1,29 @@
+{
+  "default": null,
+  "permission": [
+    {
+      "identifier": "allow-local-recording",
+      "description": "Allow the Snack web app to record, import, transcribe, list, and delete local meeting audio.",
+      "commands": {
+        "allow": [
+          "choose_and_import_recording",
+          "choose_recording_output_directory",
+          "configure_recording_preferences",
+          "configure_recording_shortcut",
+          "delete_system_audio_recording",
+          "delete_system_audio_recordings",
+          "detect_active_meeting_app",
+          "get_recording_resource_status",
+          "get_system_audio_recording_status",
+          "install_recording_resources",
+          "list_system_audio_recordings",
+          "open_local_recording_file",
+          "start_system_audio_recording",
+          "stop_system_audio_recording",
+          "transcribe_local_audio"
+        ],
+        "deny": []
+      }
+    }
+  ]
+}

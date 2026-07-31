@@ -3,6 +3,8 @@ fn main() {
     println!("cargo:rerun-if-env-changed=SNACK_DESKTOP_BASE_UA");
     println!("cargo:rerun-if-env-changed=SNACK_DESKTOP_VERSION");
 
+    build_macos_recording_bridge();
+
     let version = std::env::var("SNACK_DESKTOP_VERSION")
         .or_else(|_| std::env::var("CARGO_PKG_VERSION"))
         .unwrap_or_else(|_| "0.1.0".to_string());
@@ -48,4 +50,24 @@ fn main() {
     println!("cargo:rustc-env=SNACK_DESKTOP_ARCH={arch}");
 
     tauri_build::build()
+}
+
+fn build_macos_recording_bridge() {
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("macos") {
+        return;
+    }
+    cc::Build::new()
+        .file("src/recording_native.m")
+        .flag("-fobjc-arc")
+        .compile("snack_recording_native");
+    for framework in [
+        "AVFoundation",
+        "CoreMedia",
+        "CoreGraphics",
+        "Foundation",
+        "ScreenCaptureKit",
+    ] {
+        println!("cargo:rustc-link-lib=framework={framework}");
+    }
+    println!("cargo:rerun-if-changed=src/recording_native.m");
 }

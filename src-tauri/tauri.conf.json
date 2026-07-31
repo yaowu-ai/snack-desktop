@@ -27,11 +27,21 @@
       }
     ],
     "security": {
-      "csp": null
+      "csp": null,
+      "assetProtocol": {
+        "enable": true,
+        "scope": ["$APPDATA/recordings/**"]
+      }
     }
   },
   "bundle": {
     "active": true,
+    "resources": [
+      "resources/download_models.py",
+      "resources/funasr_transcribe.py",
+      "resources/install_recording_resources.sh",
+      "resources/recording-requirements.txt"
+    ],
     "createUpdaterArtifacts": false,
     "targets": ["nsis", "msi", "app"],
     "icon": [

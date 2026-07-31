@@ -2,7 +2,7 @@
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
   "description": "Capabilities for the Snack desktop webview.",
-  "windows": ["main"],
+  "windows": ["main", "snack-recording"],
   "remote": {
     "urls": [
       "https://snack.mechlabs.cn/*",
@@ -25,6 +25,7 @@
     "updater:default",
     "allow-desktop-diagnostics",
     "allow-download-snack-file",
+    "allow-local-recording",
     "allow-set-desktop-attention"
   ]
 }
