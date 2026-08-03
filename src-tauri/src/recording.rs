@@ -15,6 +15,16 @@ use crate::web::is_allowed_web_origin;
 
 const MAX_OFFICIAL_JOBS: usize = 7;
 const SNACK_RECORD_BUNDLE_ID: &str = "app.snackrecord.local";
+const EMBEDDED_RECORDING_BUNDLE_ID: &str = "cn.yaowutech.snack.recording-service";
+const EMBEDDED_RECORDING_APP_NAME: &str = "Snack Recording Service.app";
+const EMBEDDED_RECORDING_SCHEME: &str = "snack-record-runtime";
+const LEGACY_RECORDING_SCHEME: &str = "snack-record";
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct SnackRecordRuntime {
+    pub(crate) path: PathBuf,
+    pub(crate) scheme: &'static str,
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -340,18 +350,18 @@ pub(crate) fn detect_active_meeting_app(window: WebviewWindow) -> Result<Option<
 fn send_action(app: &AppHandle, action: &str, params: &[(&str, &str)]) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
-        let mut url =
-            Url::parse(&format!("snack-record://control/{action}")).map_err(|e| e.to_string())?;
+        let runtime = snack_record_runtime(app)?;
+        let mut url = Url::parse(&format!("{}://control/{action}", runtime.scheme))
+            .map_err(|e| e.to_string())?;
         {
             let mut query = url.query_pairs_mut();
             for (key, value) in params {
                 query.append_pair(key, value);
             }
         }
-        let app_path = snack_record_app_path(app)?;
         let status = Command::new("/usr/bin/open")
             .arg("-a")
-            .arg(app_path)
+            .arg(runtime.path)
             .arg(url.as_str())
             .status()
             .map_err(|error| format!("无法打开 Snack Record：{error}"))?;
@@ -369,15 +379,34 @@ fn send_action(app: &AppHandle, action: &str, params: &[(&str, &str)]) -> Result
 }
 
 #[cfg(target_os = "macos")]
-fn snack_record_app_path(app: &AppHandle) -> Result<PathBuf, String> {
+pub(crate) fn snack_record_runtime(app: &AppHandle) -> Result<SnackRecordRuntime, String> {
     let home = app.path().home_dir().map_err(|error| error.to_string())?;
+    let resources = app
+        .path()
+        .resource_dir()
+        .map_err(|error| error.to_string())?;
+    snack_record_runtime_candidates(&resources, &home)
+        .into_iter()
+        .find(|candidate| candidate.path.is_dir())
+        .ok_or_else(|| "Snack 内置录音组件缺失，请重新安装或升级 Snack".to_string())
+}
+
+#[cfg(target_os = "macos")]
+fn snack_record_runtime_candidates(resources: &Path, home: &Path) -> [SnackRecordRuntime; 3] {
     [
-        home.join("Applications/Snack Record.app"),
-        PathBuf::from("/Applications/Snack Record.app"),
+        SnackRecordRuntime {
+            path: resources.join(EMBEDDED_RECORDING_APP_NAME),
+            scheme: EMBEDDED_RECORDING_SCHEME,
+        },
+        SnackRecordRuntime {
+            path: home.join("Applications/Snack Record.app"),
+            scheme: LEGACY_RECORDING_SCHEME,
+        },
+        SnackRecordRuntime {
+            path: PathBuf::from("/Applications/Snack Record.app"),
+            scheme: LEGACY_RECORDING_SCHEME,
+        },
     ]
-    .into_iter()
-    .find(|candidate| candidate.is_dir())
-    .ok_or_else(|| "未找到已安装的 Snack Record，请先安装后重试".to_string())
 }
 
 fn snack_record_root(app: &AppHandle) -> Result<PathBuf, String> {
@@ -448,14 +477,18 @@ fn read_preferences(_app: &AppHandle) -> RecordingPreferences {
 }
 
 fn read_default(key: &str) -> Option<String> {
-    let output = Command::new("/usr/bin/defaults")
-        .args(["read", SNACK_RECORD_BUNDLE_ID, key])
-        .output()
-        .ok()?;
-    output
-        .status
-        .success()
-        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+    [EMBEDDED_RECORDING_BUNDLE_ID, SNACK_RECORD_BUNDLE_ID]
+        .into_iter()
+        .find_map(|bundle_id| {
+            let output = Command::new("/usr/bin/defaults")
+                .args(["read", bundle_id, key])
+                .output()
+                .ok()?;
+            output
+                .status
+                .success()
+                .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        })
 }
 
 fn load_official_jobs(root: &Path) -> Vec<DesktopRecording> {
@@ -611,5 +644,26 @@ mod tests {
         assert!(!status.active);
         assert_eq!(status.elapsed_ms, 0);
         assert!(status.started_at.is_none());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn embedded_recording_runtime_is_preferred_over_legacy_installations() {
+        let resources = Path::new("/Applications/Snack.app/Contents/Resources");
+        let home = Path::new("/Users/tester");
+        let candidates = snack_record_runtime_candidates(resources, home);
+
+        assert_eq!(
+            candidates[0],
+            SnackRecordRuntime {
+                path: resources.join("Snack Recording Service.app"),
+                scheme: "snack-record-runtime",
+            }
+        );
+        assert_eq!(
+            candidates[1].path,
+            home.join("Applications/Snack Record.app")
+        );
+        assert_eq!(candidates[1].scheme, "snack-record");
     }
 }

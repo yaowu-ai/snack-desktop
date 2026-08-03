@@ -39,6 +39,14 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Checkout Snack Record runtime
+        uses: actions/checkout@v4
+        with:
+          repository: yaowu-ai/snack-record
+          ref: ${{ vars.SNACK_RECORD_RUNTIME_REF || 'main' }}
+          token: ${{ secrets.SNACK_RECORD_REPOSITORY_TOKEN }}
+          path: .build/snack-record
+
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
@@ -66,6 +74,7 @@ jobs:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          SNACK_RECORD_REPOSITORY_TOKEN: ${{ secrets.SNACK_RECORD_REPOSITORY_TOKEN }}
         run: |
           missing=0
           for name in \
@@ -76,7 +85,8 @@ jobs:
             APPLE_SIGNING_IDENTITY \
             APPLE_ID \
             APPLE_PASSWORD \
-            APPLE_TEAM_ID
+            APPLE_TEAM_ID \
+            SNACK_RECORD_REPOSITORY_TOKEN
           do
             if [[ -z "${!name}" ]]; then
               echo "::error::Missing required GitHub secret: ${name}"
@@ -136,6 +146,7 @@ jobs:
           SNACK_PROD_UPDATER_ENDPOINT: ${{ secrets.SNACK_PROD_UPDATER_ENDPOINT }}
           SNACK_QA_UPDATER_ENDPOINT: ${{ secrets.SNACK_QA_UPDATER_ENDPOINT }}
           SNACK_DESKTOP_BASE_UA: ${{ secrets.SNACK_DESKTOP_BASE_UA }}
+          SNACK_RECORD_SOURCE_DIR: ${{ github.workspace }}/.build/snack-record
           TARGET_TRIPLE: ${{ matrix.target }}
           APP_VERSION: ${{ steps.version.outputs.artifact_version }}
           DMG_ARCH_SUFFIX: ${{ matrix.dmg_arch_suffix }}

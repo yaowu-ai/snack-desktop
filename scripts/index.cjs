@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-const { spawn } = require("node:child_process");
+const { spawn, spawnSync } = require("node:child_process");
 const path = require("node:path");
 const dotenv = require("dotenv");
 
@@ -128,6 +128,36 @@ const createUpdaterArtifacts =
   process.env.SNACK_CREATE_UPDATER_ARTIFACTS === "true" &&
   tauriConf.bundle?.createUpdaterArtifacts !== false;
 
+const prepareEmbeddedRecordingRuntime = () => {
+  if (
+    command !== "build" ||
+    process.platform !== "darwin" ||
+    process.env.SNACK_EMBED_RECORDING_RUNTIME === "false"
+  ) {
+    return undefined;
+  }
+
+  const script = path.join(repoRoot, "scripts", "prepare-snack-record-runtime.sh");
+  const result = spawnSync("bash", [script], {
+    cwd: repoRoot,
+    env: process.env,
+    encoding: "utf8",
+  });
+  if (result.status !== 0) {
+    process.stderr.write(result.stdout || "");
+    process.stderr.write(result.stderr || "");
+    process.exit(result.status || 1);
+  }
+  const runtimePath = result.stdout.trim().split("\n").filter(Boolean).at(-1);
+  if (!runtimePath) {
+    console.error("Snack Record runtime build did not return an app path.");
+    process.exit(1);
+  }
+  return runtimePath;
+};
+
+const embeddedRecordingRuntimePath = prepareEmbeddedRecordingRuntime();
+
 if (command === "build" && targetEnv !== "local" && !updaterPubkey) {
   console.error(
     "Missing TAURI_UPDATER_PUBKEY. Generate an updater keypair with `tauri signer generate`, then set the public key before building."
@@ -148,6 +178,13 @@ const tauriConfig = {
   },
   bundle: {
     createUpdaterArtifacts,
+    ...(embeddedRecordingRuntimePath
+      ? {
+          resources: {
+            [embeddedRecordingRuntimePath]: "Snack Recording Service.app",
+          },
+        }
+      : {}),
   },
   plugins: {
     ...(targetEnv === "local"
@@ -189,11 +226,62 @@ const child = spawn(tauriBin, tauriArgs, {
   shell: process.platform === "win32",
 });
 
+const finalizeMacOSBundle = () => {
+  if (
+    command !== "build" ||
+    process.platform !== "darwin" ||
+    !embeddedRecordingRuntimePath ||
+    args.includes("--no-sign")
+  ) {
+    return true;
+  }
+  const targetIndex = args.indexOf("--target");
+  const target = targetIndex >= 0 ? args[targetIndex + 1] : undefined;
+  const bundleRoot = target
+    ? path.join(repoRoot, "src-tauri", "target", target, "release", "bundle", "macos")
+    : path.join(repoRoot, "src-tauri", "target", "release", "bundle", "macos");
+  const productName = targetEnv === "local" ? "Snack Record Local" : tauriConf.productName;
+  const appPath = path.join(bundleRoot, `${productName}.app`);
+  const signingIdentity = process.env.APPLE_SIGNING_IDENTITY || process.env.SIGN_IDENTITY || "-";
+  const sign = spawnSync(
+    "codesign",
+    [
+      "--force",
+      "--options",
+      "runtime",
+      "--sign",
+      signingIdentity,
+      "--entitlements",
+      path.join(repoRoot, "src-tauri", "Entitlements.plist"),
+      appPath,
+    ],
+    { cwd: repoRoot, encoding: "utf8" },
+  );
+  if (sign.status !== 0) {
+    process.stderr.write(sign.stdout || "");
+    process.stderr.write(sign.stderr || "");
+    return false;
+  }
+  const verify = spawnSync("codesign", ["--verify", "--deep", "--strict", "--verbose=2", appPath], {
+    cwd: repoRoot,
+    encoding: "utf8",
+  });
+  if (verify.status !== 0) {
+    process.stderr.write(verify.stdout || "");
+    process.stderr.write(verify.stderr || "");
+    return false;
+  }
+  return true;
+};
+
 child.on("exit", (code, signal) => {
   if (signal) {
     process.kill(process.pid, signal);
     return;
   }
 
+  if (code === 0 && !finalizeMacOSBundle()) {
+    process.exit(1);
+  }
   process.exit(code ?? 1);
 });

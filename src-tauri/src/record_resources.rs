@@ -1,4 +1,7 @@
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    process::Command,
+};
 
 use tauri::{AppHandle, Manager, WebviewWindow};
 
@@ -35,7 +38,7 @@ pub(crate) fn get_recording_resource_status(
 }
 
 #[tauri::command]
-pub(crate) fn install_recording_resources(
+pub(crate) async fn install_recording_resources(
     app: AppHandle,
     window: WebviewWindow,
 ) -> Result<RecordingResourceStatus, String> {
@@ -45,11 +48,51 @@ pub(crate) fn install_recording_resources(
         log_resource_status(&app, "resource install reused Snack Record files", &status);
         return Ok(status);
     }
-    log_resource_status(&app, "resource repair delegated to Snack Record", &status);
+    #[cfg(target_os = "macos")]
+    {
+        let runtime = crate::recording::snack_record_runtime(&app)?;
+        let installer = runtime.path.join("Contents/Resources/install-runtime.sh");
+        let root = snack_record_resource_root(&app)?;
+        logging::write_app_log(
+            &app,
+            "info",
+            "snack-record-resources",
+            "installing embedded recording resources",
+            Some(&serde_json::json!({ "installer": installer.to_string_lossy() })),
+        );
+        let installed = tauri::async_runtime::spawn_blocking(move || {
+            run_resource_installer(&installer)?;
+            Ok::<RecordingResourceStatus, String>(inspect_resource_root(&root, has_ffmpeg()))
+        })
+        .await
+        .map_err(|error| error.to_string())??;
+        log_resource_status(&app, "embedded recording resources installed", &installed);
+        if installed.available {
+            return Ok(installed);
+        }
+        return Err(format!("录音资源准备未完成：{}", installed.detail));
+    }
+
+    #[cfg(not(target_os = "macos"))]
     Err(format!(
-        "{}。请通过 Snack Record 安装或修复本地资源，Snack 不会重复下载资源包",
+        "{}。当前桌面系统暂不支持自动准备录音资源",
         status.detail
     ))
+}
+
+#[cfg(target_os = "macos")]
+fn run_resource_installer(installer: &Path) -> Result<(), String> {
+    if !installer.is_file() {
+        return Err("Snack 内置录音资源安装器缺失，请重新安装或升级 Snack".to_string());
+    }
+    let status = Command::new("/bin/zsh")
+        .arg(installer)
+        .status()
+        .map_err(|error| format!("无法启动录音资源安装器：{error}"))?;
+    status
+        .success()
+        .then_some(())
+        .ok_or_else(|| "录音资源安装失败，请检查网络、Python 和 Homebrew 后重试".to_string())
 }
 
 fn ensure_allowed_origin(window: &WebviewWindow) -> Result<(), String> {

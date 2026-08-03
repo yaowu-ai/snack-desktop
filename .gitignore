@@ -1,4 +1,6 @@
 /src-tauri/target/
+/src-tauri/embedded-runtime/
+/.build/
 /.idea/
 .env
 node_modules/
