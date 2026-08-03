@@ -252,11 +252,18 @@ enum SnackRecordEntry {
     Settings,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum SnackRecordEntryAction {
+    Navigate(&'static str),
+    StartRecording,
+}
+
 impl SnackRecordEntry {
-    fn view(self) -> &'static str {
+    fn action(self) -> SnackRecordEntryAction {
         match self {
-            Self::Library | Self::Recording => "library",
-            Self::Settings => "settings",
+            Self::Library => SnackRecordEntryAction::Navigate("library"),
+            Self::Recording => SnackRecordEntryAction::StartRecording,
+            Self::Settings => SnackRecordEntryAction::Navigate("settings"),
         }
     }
 }
@@ -283,25 +290,18 @@ fn snack_record_entry(url: &tauri::Url) -> Option<SnackRecordEntry> {
 
 fn handle_snack_record_entry(app: &AppHandle, entry: SnackRecordEntry) {
     show_main_window(app);
-    if let Err(error) = navigate_to_snack_record(app, entry.view()) {
+    let result = match entry.action() {
+        SnackRecordEntryAction::Navigate(view) => navigate_to_snack_record(app, view),
+        SnackRecordEntryAction::StartRecording => crate::recording::start_recording(app),
+    };
+    if let Err(error) = result {
         crate::logging::write_app_log(
             app,
             "warn",
             "snack-record-entry",
-            "Snack Record entry could not navigate the main webview",
-            Some(&serde_json::json!({ "reason": error })),
+            "Snack Record entry action failed",
+            Some(&serde_json::json!({ "entry": format!("{entry:?}"), "reason": error })),
         );
-    }
-    if entry == SnackRecordEntry::Recording {
-        if let Err(error) = crate::recording::show_recording_window(app) {
-            crate::logging::write_app_log(
-                app,
-                "warn",
-                "snack-record-entry",
-                "Snack Record recording window could not be opened",
-                Some(&serde_json::json!({ "reason": error })),
-            );
-        }
     }
 }
 
@@ -468,7 +468,7 @@ fn read_clipboard_import() -> Result<PendingRecordImport, String> {
 mod tests {
     use super::{
         is_clipboard_import_url, snack_record_entry, PendingRecordImport,
-        RecordImportDeliveryState, SnackRecordEntry,
+        RecordImportDeliveryState, SnackRecordEntry, SnackRecordEntryAction,
     };
 
     #[test]
@@ -513,6 +513,18 @@ mod tests {
         assert_eq!(
             snack_record_entry(&"snack://chat?source=clipboard".parse().unwrap()),
             None
+        );
+    }
+
+    #[test]
+    fn recording_entry_starts_directly_without_opening_the_record_panel() {
+        assert_eq!(
+            SnackRecordEntry::Recording.action(),
+            SnackRecordEntryAction::StartRecording
+        );
+        assert_eq!(
+            SnackRecordEntry::Library.action(),
+            SnackRecordEntryAction::Navigate("library")
         );
     }
 

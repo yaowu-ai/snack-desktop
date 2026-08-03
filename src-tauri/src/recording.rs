@@ -83,7 +83,7 @@ pub(crate) async fn start_system_audio_recording(
     window: WebviewWindow,
 ) -> Result<DesktopRecordingStatus, String> {
     ensure_allowed_origin(&window)?;
-    send_action(&app, "start", &[])?;
+    start_recording(&app)?;
     let root = snack_record_root(&app)?;
     tauri::async_runtime::spawn_blocking(move || {
         for _ in 0..50 {
@@ -97,6 +97,10 @@ pub(crate) async fn start_system_audio_recording(
     })
     .await
     .map_err(|error| error.to_string())?
+}
+
+pub(crate) fn start_recording(app: &AppHandle) -> Result<(), String> {
+    send_action(app, "start", &[])
 }
 
 #[tauri::command]
