@@ -4,7 +4,9 @@ const ALLOWED_WEB_ORIGINS: &[&str] = &[
     "https://snack.mechlabs.cn",
     "https://qasnack.mechlabs.cn",
     "http://localhost:3000",
+    "http://localhost:3002",
     "http://127.0.0.1:3000",
+    "http://127.0.0.1:3002",
 ];
 
 pub(crate) fn is_allowed_web_origin(url: &Url) -> bool {
@@ -27,4 +29,22 @@ pub(crate) fn desktop_user_agent() -> String {
         env!("SNACK_DESKTOP_ARCH"),
         env!("SNACK_DESKTOP_VERSION")
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_allowed_web_origin;
+
+    #[test]
+    fn allows_supported_loopback_ports_only() {
+        assert!(is_allowed_web_origin(
+            &"http://127.0.0.1:3002/apps".parse().unwrap()
+        ));
+        assert!(is_allowed_web_origin(
+            &"http://localhost:3000/apps".parse().unwrap()
+        ));
+        assert!(!is_allowed_web_origin(
+            &"http://127.0.0.1:4000/apps".parse().unwrap()
+        ));
+    }
 }

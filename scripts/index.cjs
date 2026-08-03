@@ -128,7 +128,7 @@ const createUpdaterArtifacts =
   process.env.SNACK_CREATE_UPDATER_ARTIFACTS === "true" &&
   tauriConf.bundle?.createUpdaterArtifacts !== false;
 
-if (command === "build" && !updaterPubkey) {
+if (command === "build" && targetEnv !== "local" && !updaterPubkey) {
   console.error(
     "Missing TAURI_UPDATER_PUBKEY. Generate an updater keypair with `tauri signer generate`, then set the public key before building."
   );
@@ -138,8 +138,8 @@ if (command === "build" && !updaterPubkey) {
 const tauriConfig = {
   ...(targetEnv === "local"
     ? {
-        identifier: "cn.yaowutech.snack.local",
-        productName: "Snack Local",
+        identifier: "cn.yaowutech.snack.record.local",
+        productName: "Snack Record Local",
       }
     : {}),
   build: {
@@ -150,6 +150,13 @@ const tauriConfig = {
     createUpdaterArtifacts,
   },
   plugins: {
+    ...(targetEnv === "local"
+      ? {
+          "deep-link": {
+            desktop: { schemes: ["snack-record-local"] },
+          },
+        }
+      : {}),
     updater: {
       endpoints: [updaterEndpoint],
       ...(updaterPubkey ? { pubkey: updaterPubkey } : {}),
@@ -165,11 +172,17 @@ const childEnv = {
   SNACK_FRONTEND_URL: frontendUrl,
 };
 
+const tauriArgs = [
+  command,
+  ...(targetEnv === "local" ? ["--config", JSON.stringify(tauriConfig)] : []),
+  ...args,
+];
+
 if (process.env.SNACK_DESKTOP_BASE_UA) {
   childEnv.SNACK_DESKTOP_BASE_UA = process.env.SNACK_DESKTOP_BASE_UA;
 }
 
-const child = spawn(tauriBin, [command, ...args], {
+const child = spawn(tauriBin, tauriArgs, {
   cwd: repoRoot,
   stdio: "inherit",
   env: childEnv,

@@ -262,7 +262,10 @@ impl SnackRecordEntry {
 }
 
 fn snack_record_entry(url: &tauri::Url) -> Option<SnackRecordEntry> {
-    if url.scheme() != "snack" || url.host_str() != Some("apps") || url.path() != "/snack-record" {
+    if !matches!(url.scheme(), "snack" | "snack-record-local")
+        || url.host_str() != Some("apps")
+        || url.path() != "/snack-record"
+    {
         return None;
     }
 
@@ -498,6 +501,14 @@ mod tests {
         assert_eq!(
             snack_record_entry(&"snack://apps/snack-record?view=settings".parse().unwrap()),
             Some(SnackRecordEntry::Settings)
+        );
+        assert_eq!(
+            snack_record_entry(
+                &"snack-record-local://apps/snack-record?action=recording"
+                    .parse()
+                    .unwrap()
+            ),
+            Some(SnackRecordEntry::Recording)
         );
         assert_eq!(
             snack_record_entry(&"snack://chat?source=clipboard".parse().unwrap()),
