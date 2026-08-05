@@ -210,6 +210,9 @@ jobs:
         run: npm run build -- --bundles nsis
         env:
           CI: true
+          # sherpa-onnx's Windows static archive uses the /MT runtime.
+          CMAKE_POLICY_DEFAULT_CMP0091: NEW
+          CMAKE_MSVC_RUNTIME_LIBRARY: MultiThreaded
           SNACK_CREATE_UPDATER_ARTIFACTS: false
           TAURI_UPDATER_PUBKEY: ${{ secrets.TAURI_UPDATER_PUBKEY }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
