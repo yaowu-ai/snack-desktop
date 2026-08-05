@@ -33,17 +33,20 @@ Snack 将企业增长工作流呈现在同一界面中：
 
 ## 本地打包
 
-macOS 安装包会内嵌 `Snack Recording Service.app`，用户无需再单独安装 Snack Record。本地构建默认从同级 `snack-record` 仓库读取源码；使用其他位置时设置 `SNACK_RECORD_SOURCE_DIR`。
-
 ```bash
+npm run dev:local # 加载 http://localhost:3000，并关闭桌面自动更新检查
+npm run build:local # macOS：生成使用稳定本地签名的 Debug Snack.app
 npm run dev -- prod
 npm run dev -- qa
-SNACK_RECORD_SOURCE_DIR=/path/to/snack-record npm run build -- prod
 npm run build -- prod
 npm run build -- qa
 ```
 
-录音辅助应用随主包发布，Python、FFmpeg 和语音模型由 Snack 的首次使用流程准备，并继续存放在 `~/Library/Application Support/Snack Record/`。
+本地联调前需先在 `http://localhost:3000` 启动 Web 服务。需要使用其他地址时，可设置
+`SNACK_LOCAL_FRONTEND_URL`。涉及麦克风或录屏权限时，优先使用 `npm run build:local`，再打开
+`src-tauri/target/debug/bundle/macos/Snack.app`；该命令只生成 Debug `.app`，不会生成本地正式安装包。
+它会复用并静默解锁已有的受管本地签名钥匙串；若稳定签名身份不存在则直接失败，不会回退到
+容易导致 macOS 重复请求权限的临时签名。
 
 ## 远端打包与发布
 
@@ -70,7 +73,7 @@ Snack_{version}_macos_x64.app.tar.gz
 Snack_{version}_macos_x64.app.tar.gz.sig
 ```
 
-远端构建使用 Node.js 22。Windows 构建需要 `TAURI_UPDATER_PUBKEY` 和 `TAURI_SIGNING_PRIVATE_KEY`；macOS 构建还需要 Apple 签名与公证相关的 GitHub Secrets，以及可读取 `yaowu-ai/snack-record` 的 `SNACK_RECORD_REPOSITORY_TOKEN`。可通过 `SNACK_RECORD_RUNTIME_REF` Repository Variable 固定录音运行时的分支、tag 或提交，默认读取 `main`。工作流会为 updater 安装包生成并上传 `.sig` 签名文件。
+远端构建使用 Node.js 22。Windows 构建需要 `TAURI_UPDATER_PUBKEY` 和 `TAURI_SIGNING_PRIVATE_KEY`；macOS 构建还需要 Apple 签名与公证相关的 GitHub Secrets。工作流会为 updater 安装包生成并上传 `.sig` 签名文件。
 
 ## 许可证
 

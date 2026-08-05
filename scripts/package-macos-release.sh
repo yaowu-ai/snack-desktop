@@ -13,7 +13,6 @@ set -euo pipefail
 APP_NAME="Snack"
 BUNDLE_ROOT="src-tauri/target/${TARGET_TRIPLE}/release/bundle"
 APP_PATH="${BUNDLE_ROOT}/macos/${APP_NAME}.app"
-RECORDING_RUNTIME_PATH="${APP_PATH}/Contents/Resources/Snack Recording Service.app"
 APP_ZIP_PATH="${BUNDLE_ROOT}/macos/${APP_NAME}.zip"
 DMG_DIR="${BUNDLE_ROOT}/dmg"
 if [[ "${DMG_ARCH_SUFFIX}" == "apple-silicon" ]]; then
@@ -117,13 +116,6 @@ if [[ ! -d "${APP_PATH}" ]]; then
   echo "Expected app bundle not found: ${APP_PATH}" >&2
   exit 1
 fi
-
-if [[ ! -x "${RECORDING_RUNTIME_PATH}/Contents/MacOS/Snack Record" ]]; then
-  echo "Expected embedded recording runtime not found: ${RECORDING_RUNTIME_PATH}" >&2
-  exit 1
-fi
-
-codesign --verify --deep --strict --verbose=2 "${RECORDING_RUNTIME_PATH}"
 
 xattr -crs "${APP_PATH}"
 

@@ -2,19 +2,18 @@
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
   "description": "Capabilities for the Snack desktop webview.",
-  "windows": ["main"],
+  "windows": ["main", "record_overlay"],
   "remote": {
     "urls": [
       "https://snack.mechlabs.cn/*",
       "https://qasnack.mechlabs.cn/*",
       "http://localhost:3000/*",
-      "http://localhost:3002/*",
-      "http://127.0.0.1:3000/*",
-      "http://127.0.0.1:3002/*"
+      "http://127.0.0.1:3000/*"
     ]
   },
   "permissions": [
     "core:default",
+    "core:window:allow-start-dragging",
     "notification:default",
     {
       "identifier": "opener:allow-open-url",
@@ -27,8 +26,7 @@
     "updater:default",
     "allow-desktop-diagnostics",
     "allow-download-snack-file",
-    "allow-snack-recording",
-    "allow-snack-record-resources",
+    "allow-meeting",
     "allow-set-desktop-attention"
   ]
 }

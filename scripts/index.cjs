@@ -13,6 +13,11 @@ const tauriBin = path.join(
   ".bin",
   process.platform === "win32" ? "tauri.cmd" : "tauri"
 );
+const localSigningUnlockScript = path.join(
+  repoRoot,
+  "scripts",
+  "unlock-local-signing-keychain.zsh"
+);
 
 dotenv.config({
   path: envPath,
@@ -48,17 +53,58 @@ const envValue = (name, fallback) => {
   return value || fallback;
 };
 
-const hostMap = {
-  local: null,
-  prod: envValue("SNACK_PROD_HOST", "snack.mechlabs.cn"),
-  qa: envValue("SNACK_QA_HOST", "qasnack.mechlabs.cn"),
+const LOCAL_MACOS_SIGNING_IDENTITY = "Snack Record Local Code Signing";
+
+const resolveMacosSigningIdentity = (targetEnv, shouldUnlockLocalKeychain) => {
+  if (process.platform !== "darwin") {
+    return "";
+  }
+
+  const configuredIdentity =
+    process.env.SNACK_MACOS_SIGNING_IDENTITY?.trim() ||
+    process.env.APPLE_SIGNING_IDENTITY?.trim();
+  if (configuredIdentity) {
+    return configuredIdentity;
+  }
+
+  if (targetEnv !== "local") {
+    return "";
+  }
+
+  if (shouldUnlockLocalKeychain) {
+    const unlockResult = spawnSync("/bin/zsh", [localSigningUnlockScript], {
+      encoding: "utf8",
+    });
+    if (unlockResult.status !== 0) {
+      const detail = unlockResult.stderr?.trim() || unlockResult.error?.message;
+      console.error("Unable to unlock the managed local signing keychain.");
+      if (detail) console.error(detail);
+      return "";
+    }
+  }
+
+  const result = spawnSync("security", ["find-identity", "-v", "-p", "codesigning"], {
+    encoding: "utf8",
+  });
+
+  if (
+    result.status === 0 &&
+    result.stdout.includes(`"${LOCAL_MACOS_SIGNING_IDENTITY}"`)
+  ) {
+    return LOCAL_MACOS_SIGNING_IDENTITY;
+  }
+
+  return "";
+};
+
+const frontendUrlMap = {
+  local: envValue("SNACK_LOCAL_FRONTEND_URL", "http://localhost:3000"),
+  prod: `https://${envValue("SNACK_PROD_HOST", "snack.mechlabs.cn")}`,
+  qa: `https://${envValue("SNACK_QA_HOST", "qasnack.mechlabs.cn")}`,
 };
 
 const updaterEndpointMap = {
-  local: envValue(
-    "SNACK_PROD_UPDATER_ENDPOINT",
-    "https://snack.mechlabs.cn/api/desktop-updates/update?currentVersion={{current_version}}&target={{target}}&arch={{arch}}",
-  ),
+  local: null,
   prod: envValue(
     "SNACK_PROD_UPDATER_ENDPOINT",
     "https://snack.mechlabs.cn/api/desktop-updates/update?currentVersion={{current_version}}&target={{target}}&arch={{arch}}",
@@ -83,18 +129,38 @@ if (args[0] && !args[0].startsWith("-")) {
   targetEnv = args.shift().toLowerCase();
 }
 
+const frontendUrl = frontendUrlMap[targetEnv];
 const updaterEndpoint = updaterEndpointMap[targetEnv];
 
-if (!(targetEnv in hostMap) || !updaterEndpoint) {
+if (!frontendUrl || updaterEndpoint === undefined) {
   console.error(`Unknown ${command} environment: ${targetEnv}`);
-  console.error(`Supported environments: ${Object.keys(hostMap).join(", ")}`);
+  console.error(`Supported environments: ${Object.keys(frontendUrlMap).join(", ")}`);
   process.exit(1);
 }
 
-const frontendUrl =
-  targetEnv === "local"
-    ? envValue("SNACK_LOCAL_FRONTEND_URL", "http://localhost:3000")
-    : `https://${hostMap[targetEnv]}`;
+const localDebugBuild =
+  command === "build" &&
+  targetEnv === "local" &&
+  (args.includes("--debug") || args.includes("-d"));
+
+if (command === "build" && targetEnv === "local" && !localDebugBuild) {
+  console.error(
+    "The local environment only supports debug builds. Pass --debug or use npm run build:local."
+  );
+  process.exit(1);
+}
+
+try {
+  const parsedFrontendUrl = new URL(frontendUrl);
+  if (!["http:", "https:"].includes(parsedFrontendUrl.protocol)) {
+    throw new Error(`unsupported protocol ${parsedFrontendUrl.protocol}`);
+  }
+} catch (error) {
+  console.error(`Invalid frontend URL for ${targetEnv}: ${frontendUrl}`);
+  console.error(error instanceof Error ? error.message : String(error));
+  process.exit(1);
+}
+
 const normalizeUpdaterPubkey = (value) => {
   const pubkey = value?.trim();
   if (!pubkey) {
@@ -127,38 +193,17 @@ const tauriConf = require(tauriConfPath);
 const createUpdaterArtifacts =
   process.env.SNACK_CREATE_UPDATER_ARTIFACTS === "true" &&
   tauriConf.bundle?.createUpdaterArtifacts !== false;
+const macosSigningIdentity = resolveMacosSigningIdentity(targetEnv, localDebugBuild);
 
-const prepareEmbeddedRecordingRuntime = () => {
-  if (
-    command !== "build" ||
-    process.platform !== "darwin" ||
-    process.env.SNACK_EMBED_RECORDING_RUNTIME === "false"
-  ) {
-    return undefined;
-  }
+if (localDebugBuild && process.platform === "darwin" && !macosSigningIdentity) {
+  console.error(
+    `Missing macOS signing identity "${LOCAL_MACOS_SIGNING_IDENTITY}". ` +
+      "Set SNACK_MACOS_SIGNING_IDENTITY or install the managed local identity first."
+  );
+  process.exit(1);
+}
 
-  const script = path.join(repoRoot, "scripts", "prepare-snack-record-runtime.sh");
-  const result = spawnSync("bash", [script], {
-    cwd: repoRoot,
-    env: process.env,
-    encoding: "utf8",
-  });
-  if (result.status !== 0) {
-    process.stderr.write(result.stdout || "");
-    process.stderr.write(result.stderr || "");
-    process.exit(result.status || 1);
-  }
-  const runtimePath = result.stdout.trim().split("\n").filter(Boolean).at(-1);
-  if (!runtimePath) {
-    console.error("Snack Record runtime build did not return an app path.");
-    process.exit(1);
-  }
-  return runtimePath;
-};
-
-const embeddedRecordingRuntimePath = prepareEmbeddedRecordingRuntime();
-
-if (command === "build" && targetEnv !== "local" && !updaterPubkey) {
+if (command === "build" && !localDebugBuild && !updaterPubkey) {
   console.error(
     "Missing TAURI_UPDATER_PUBKEY. Generate an updater keypair with `tauri signer generate`, then set the public key before building."
   );
@@ -166,36 +211,19 @@ if (command === "build" && targetEnv !== "local" && !updaterPubkey) {
 }
 
 const tauriConfig = {
-  ...(targetEnv === "local"
-    ? {
-        identifier: "cn.yaowutech.snack.record.local",
-        productName: "Snack Record Local",
-      }
-    : {}),
   build: {
     devUrl: frontendUrl,
     frontendDist: frontendUrl,
   },
   bundle: {
     createUpdaterArtifacts,
-    ...(embeddedRecordingRuntimePath
-      ? {
-          resources: {
-            [embeddedRecordingRuntimePath]: "Snack Recording Service.app",
-          },
-        }
+    ...(macosSigningIdentity
+      ? { macOS: { signingIdentity: macosSigningIdentity } }
       : {}),
   },
   plugins: {
-    ...(targetEnv === "local"
-      ? {
-          "deep-link": {
-            desktop: { schemes: ["snack-record-local"] },
-          },
-        }
-      : {}),
     updater: {
-      endpoints: [updaterEndpoint],
+      endpoints: updaterEndpoint ? [updaterEndpoint] : [],
       ...(updaterPubkey ? { pubkey: updaterPubkey } : {}),
     },
   },
@@ -209,70 +237,20 @@ const childEnv = {
   SNACK_FRONTEND_URL: frontendUrl,
 };
 
-const tauriArgs = [
-  command,
-  ...(targetEnv === "local" ? ["--config", JSON.stringify(tauriConfig)] : []),
-  ...args,
-];
+if (macosSigningIdentity) {
+  childEnv.APPLE_SIGNING_IDENTITY = macosSigningIdentity;
+}
 
 if (process.env.SNACK_DESKTOP_BASE_UA) {
   childEnv.SNACK_DESKTOP_BASE_UA = process.env.SNACK_DESKTOP_BASE_UA;
 }
 
-const child = spawn(tauriBin, tauriArgs, {
+const child = spawn(tauriBin, [command, ...args], {
   cwd: repoRoot,
   stdio: "inherit",
   env: childEnv,
   shell: process.platform === "win32",
 });
-
-const finalizeMacOSBundle = () => {
-  if (
-    command !== "build" ||
-    process.platform !== "darwin" ||
-    !embeddedRecordingRuntimePath ||
-    args.includes("--no-sign")
-  ) {
-    return true;
-  }
-  const targetIndex = args.indexOf("--target");
-  const target = targetIndex >= 0 ? args[targetIndex + 1] : undefined;
-  const bundleRoot = target
-    ? path.join(repoRoot, "src-tauri", "target", target, "release", "bundle", "macos")
-    : path.join(repoRoot, "src-tauri", "target", "release", "bundle", "macos");
-  const productName = targetEnv === "local" ? "Snack Record Local" : tauriConf.productName;
-  const appPath = path.join(bundleRoot, `${productName}.app`);
-  const signingIdentity = process.env.APPLE_SIGNING_IDENTITY || process.env.SIGN_IDENTITY || "-";
-  const sign = spawnSync(
-    "codesign",
-    [
-      "--force",
-      "--options",
-      "runtime",
-      "--sign",
-      signingIdentity,
-      "--entitlements",
-      path.join(repoRoot, "src-tauri", "Entitlements.plist"),
-      appPath,
-    ],
-    { cwd: repoRoot, encoding: "utf8" },
-  );
-  if (sign.status !== 0) {
-    process.stderr.write(sign.stdout || "");
-    process.stderr.write(sign.stderr || "");
-    return false;
-  }
-  const verify = spawnSync("codesign", ["--verify", "--deep", "--strict", "--verbose=2", appPath], {
-    cwd: repoRoot,
-    encoding: "utf8",
-  });
-  if (verify.status !== 0) {
-    process.stderr.write(verify.stdout || "");
-    process.stderr.write(verify.stderr || "");
-    return false;
-  }
-  return true;
-};
 
 child.on("exit", (code, signal) => {
   if (signal) {
@@ -280,8 +258,5 @@ child.on("exit", (code, signal) => {
     return;
   }
 
-  if (code === 0 && !finalizeMacOSBundle()) {
-    process.exit(1);
-  }
   process.exit(code ?? 1);
 });
