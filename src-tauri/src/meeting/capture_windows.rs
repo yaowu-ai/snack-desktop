@@ -26,10 +26,9 @@ use windows::Win32::System::Com::{
 };
 use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 
-use crate::meeting::audio::WavWriter;
+use crate::meeting::audio::{mix_samples, WavWriter};
 use crate::meeting::capture::{
-    downmix_f32, mix_samples, resample_to_target, CaptureError, CaptureShared, Recorder,
-    CAPTURE_CHUNK_SAMPLES,
+    downmix_f32, resample_to_target, CaptureError, CaptureShared, Recorder, CAPTURE_CHUNK_SAMPLES,
 };
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
