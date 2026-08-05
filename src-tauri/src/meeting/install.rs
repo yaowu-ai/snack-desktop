@@ -186,6 +186,7 @@ pub(crate) fn start_install(
                     store_for_task.save_resource(&resource).ok();
                 }
                 crate::meeting::emit_state(&app_for_task, &store_for_task);
+                crate::meeting::notifications::notify_model_ready(&app_for_task);
             }
             Err((state, message)) => {
                 log_install(

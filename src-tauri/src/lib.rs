@@ -63,6 +63,7 @@ pub fn run() {
             meeting::meeting_pause_install,
             meeting::meeting_resume_install,
             meeting::meeting_request_permissions,
+            meeting::meeting_request_quick_recording,
             meeting::meeting_retry_pipeline,
             meeting::meeting_retry_submit,
             meeting::meeting_retranscribe,

@@ -22,6 +22,7 @@ cpal = "0.15"
 crossbeam-channel = "0.5"
 fs4 = "1.1"
 futures-util = "0.3"
+notify-rust = "4.18.0"
 reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "stream", "json"] }
 rfd = "0.15"
 serde = { version = "1", features = ["derive"] }

@@ -4051,6 +4051,7 @@ dependencies = [
  "crossbeam-channel",
  "fs4",
  "futures-util",
+ "notify-rust",
  "objc2",
  "objc2-app-kit",
  "objc2-av-foundation",

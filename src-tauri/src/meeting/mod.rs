@@ -14,6 +14,7 @@ mod capture_windows;
 mod catalog;
 mod install;
 mod network;
+mod notifications;
 pub(crate) mod overlay;
 mod permissions;
 pub(crate) mod quick_access;
@@ -425,6 +426,16 @@ pub(crate) fn meeting_check_permissions(
         )
     };
     Ok(permission_status(microphone, system_audio))
+}
+
+#[tauri::command]
+pub(crate) fn meeting_request_quick_recording(
+    app: AppHandle,
+    window: WebviewWindow,
+) -> Result<(), String> {
+    require_allowed_window(&window)?;
+    quick_access::request_quick_recording(&app);
+    Ok(())
 }
 
 #[tauri::command]

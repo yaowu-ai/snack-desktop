@@ -19,6 +19,7 @@
           "meeting_pause_install",
           "meeting_resume_install",
           "meeting_request_permissions",
+          "meeting_request_quick_recording",
           "meeting_retry_pipeline",
           "meeting_retry_submit",
           "meeting_retranscribe",
