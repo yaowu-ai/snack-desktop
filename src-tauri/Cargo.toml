@@ -38,7 +38,7 @@ tauri-plugin-process = "2.3.1"
 tauri-plugin-single-instance = { version = "2.4.3", features = ["deep-link"] }
 tauri-plugin-updater = "2.10.1"
 tokio = { version = "1", features = ["fs", "io-util", "time", "sync"] }
-whisper-rs = { version = "0.14", features = ["metal"] }
+whisper-rs = "0.14"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 block2 = "0.6"
@@ -48,6 +48,7 @@ objc2-av-foundation = { version = "0.3.2", default-features = false, features = 
 objc2 = "0.6"
 objc2-foundation = { version = "0.3.2", features = ["NSString"] }
 screencapturekit = { version = "=1.5.4", features = ["macos_13_0"] }
+whisper-rs = { version = "0.14", features = ["metal"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { version = "0.60", default-features = false, features = ["Win32_Media_Audio", "Win32_System_Com", "Win32_System_Com_StructuredStorage", "Win32_System_Threading", "Win32_Foundation", "Win32_Security", "Win32_System_Variant"] }
