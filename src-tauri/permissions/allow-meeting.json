@@ -1,0 +1,37 @@
+{
+  "default": null,
+  "permission": [
+    {
+      "identifier": "allow-meeting",
+      "description": "Allow the Snack main webview to manage local meeting models, recording, transcription, and submission recovery.",
+      "commands": {
+        "allow": [
+          "meeting_cancel_install",
+          "meeting_check_permissions",
+          "meeting_choose_storage_directory",
+          "meeting_generate_notes",
+          "meeting_get_recording_status",
+          "meeting_get_snapshot",
+          "meeting_install_model",
+          "meeting_open_local_file",
+          "meeting_open_notes_in_chat",
+          "meeting_open_permission_settings",
+          "meeting_pause_install",
+          "meeting_resume_install",
+          "meeting_request_permissions",
+          "meeting_request_quick_recording",
+          "meeting_retry_pipeline",
+          "meeting_retry_submit",
+          "meeting_retranscribe",
+          "meeting_start_recording",
+          "meeting_stop_recording",
+          "meeting_uninstall_model",
+          "meeting_update_settings",
+          "dismiss_overlay",
+          "minimize_overlay"
+        ],
+        "deny": []
+      }
+    }
+  ]
+}

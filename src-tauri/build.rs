@@ -47,5 +47,10 @@ fn main() {
     println!("cargo:rustc-env=SNACK_DESKTOP_PLATFORM={platform}");
     println!("cargo:rustc-env=SNACK_DESKTOP_ARCH={arch}");
 
+    // The screencapturekit Swift bridge links libswift_Concurrency.dylib,
+    // which macOS resolves from the dyld shared cache at /usr/lib/swift.
+    #[cfg(target_os = "macos")]
+    println!("cargo:rustc-link-arg=-Wl,-rpath,/usr/lib/swift");
+
     tauri_build::build()
 }

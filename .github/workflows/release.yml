@@ -54,6 +54,9 @@ jobs:
       - name: Prepare release context
         id: version
         uses: ./.github/actions/prepare-release-context
+        with:
+          prod_host: ${{ vars.SNACK_HOST }}
+          qa_host: ${{ vars.SNACK_QA_HOST }}
 
       - name: Validate required secrets
         shell: bash
@@ -131,8 +134,6 @@ jobs:
           TAURI_UPDATER_PUBKEY: ${{ secrets.TAURI_UPDATER_PUBKEY }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-          SNACK_PROD_HOST: ${{ vars.SNACK_PROD_HOST }}
-          SNACK_QA_HOST: ${{ vars.SNACK_QA_HOST }}
           SNACK_PROD_UPDATER_ENDPOINT: ${{ secrets.SNACK_PROD_UPDATER_ENDPOINT }}
           SNACK_QA_UPDATER_ENDPOINT: ${{ secrets.SNACK_QA_UPDATER_ENDPOINT }}
           SNACK_DESKTOP_BASE_UA: ${{ secrets.SNACK_DESKTOP_BASE_UA }}
@@ -173,6 +174,9 @@ jobs:
       - name: Prepare release context
         id: version
         uses: ./.github/actions/prepare-release-context
+        with:
+          prod_host: ${{ vars.SNACK_HOST }}
+          qa_host: ${{ vars.SNACK_QA_HOST }}
 
       - name: Validate required secrets
         shell: bash
@@ -210,8 +214,6 @@ jobs:
           TAURI_UPDATER_PUBKEY: ${{ secrets.TAURI_UPDATER_PUBKEY }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-          SNACK_PROD_HOST: ${{ vars.SNACK_PROD_HOST }}
-          SNACK_QA_HOST: ${{ vars.SNACK_QA_HOST }}
           SNACK_PROD_UPDATER_ENDPOINT: ${{ secrets.SNACK_PROD_UPDATER_ENDPOINT }}
           SNACK_QA_UPDATER_ENDPOINT: ${{ secrets.SNACK_QA_UPDATER_ENDPOINT }}
           SNACK_DESKTOP_BASE_UA: ${{ secrets.SNACK_DESKTOP_BASE_UA }}

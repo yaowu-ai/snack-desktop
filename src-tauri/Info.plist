@@ -4,6 +4,8 @@
 <dict>
 	<key>NSHighResolutionCapable</key>
 	<true/>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Snack 需要使用麦克风录制现场声音并在本地生成会议转写。</string>
 	<key>NSSupportsAutomaticGraphicsSwitching</key>
 	<true/>
 </dict>

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-const { spawn } = require("node:child_process");
+const { spawn, spawnSync } = require("node:child_process");
 const path = require("node:path");
 const dotenv = require("dotenv");
 
@@ -13,14 +13,21 @@ const tauriBin = path.join(
   ".bin",
   process.platform === "win32" ? "tauri.cmd" : "tauri"
 );
+const localSigningUnlockScript = path.join(
+  repoRoot,
+  "scripts",
+  "unlock-local-signing-keychain.zsh"
+);
 
 dotenv.config({
   path: envPath,
+  override: false,
 });
 
-const commandMap = {
-  dev: "dev",
-  build: "build",
+const operationMap = {
+  dev: { command: "dev", disableUpdater: true, localSigning: false },
+  build: { command: "build", disableUpdater: false, localSigning: false },
+  "build-local": { command: "build", disableUpdater: true, localSigning: true },
 };
 
 const inferEnvFromGitRef = () => {
@@ -48,9 +55,46 @@ const envValue = (name, fallback) => {
   return value || fallback;
 };
 
-const hostMap = {
-  prod: envValue("SNACK_PROD_HOST", "snack.mechlabs.cn"),
-  qa: envValue("SNACK_QA_HOST", "qasnack.mechlabs.cn"),
+const LOCAL_MACOS_SIGNING_IDENTITY = "Snack Record Local Code Signing";
+
+const resolveMacosSigningIdentity = (useLocalSigning) => {
+  if (process.platform !== "darwin") {
+    return "";
+  }
+
+  const configuredIdentity =
+    process.env.SNACK_MACOS_SIGNING_IDENTITY?.trim() ||
+    process.env.APPLE_SIGNING_IDENTITY?.trim();
+  if (configuredIdentity) {
+    return configuredIdentity;
+  }
+
+  if (!useLocalSigning) {
+    return "";
+  }
+
+  const unlockResult = spawnSync("/bin/zsh", [localSigningUnlockScript], {
+    encoding: "utf8",
+  });
+  if (unlockResult.status !== 0) {
+    const detail = unlockResult.stderr?.trim() || unlockResult.error?.message;
+    console.error("Unable to unlock the managed local signing keychain.");
+    if (detail) console.error(detail);
+    return "";
+  }
+
+  const result = spawnSync("security", ["find-identity", "-v", "-p", "codesigning"], {
+    encoding: "utf8",
+  });
+
+  if (
+    result.status === 0 &&
+    result.stdout.includes(`"${LOCAL_MACOS_SIGNING_IDENTITY}"`)
+  ) {
+    return LOCAL_MACOS_SIGNING_IDENTITY;
+  }
+
+  return "";
 };
 
 const updaterEndpointMap = {
@@ -64,10 +108,11 @@ const updaterEndpointMap = {
   ),
 };
 
-const command = commandMap[process.argv[2]];
+const operationName = process.argv[2];
+const operation = operationMap[operationName];
 
-if (!command) {
-  console.error("Usage: node scripts/index.cjs <dev|build> [qa|prod] [...tauriArgs]");
+if (!operation) {
+  console.error("Usage: node scripts/index.cjs <dev|build|build-local> [qa|prod] [...tauriArgs]");
   process.exit(1);
 }
 
@@ -78,16 +123,39 @@ if (args[0] && !args[0].startsWith("-")) {
   targetEnv = args.shift().toLowerCase();
 }
 
-const host = hostMap[targetEnv];
-const updaterEndpoint = updaterEndpointMap[targetEnv];
-
-if (!host || !updaterEndpoint) {
-  console.error(`Unknown ${command} environment: ${targetEnv}`);
-  console.error(`Supported environments: ${Object.keys(hostMap).join(", ")}`);
+if (operation.localSigning && !args.includes("--debug") && !args.includes("-d")) {
+  console.error("Local app builds must use --debug. Run npm run build:local.");
   process.exit(1);
 }
 
-const frontendUrl = `https://${host}`;
+if (!(targetEnv in updaterEndpointMap)) {
+  console.error(`Unknown ${operation.command} environment: ${targetEnv}`);
+  console.error(`Supported environments: ${Object.keys(updaterEndpointMap).join(", ")}`);
+  process.exit(1);
+}
+
+const configuredHost = envValue("SNACK_HOST", "");
+if (!configuredHost) {
+  console.error("Missing SNACK_HOST. Set it in the command environment or the local .env file.");
+  process.exit(1);
+}
+
+const normalizeFrontendUrl = (hostOrUrl) =>
+  /^https?:\/\//i.test(hostOrUrl) ? hostOrUrl : `https://${hostOrUrl}`;
+const frontendUrl = normalizeFrontendUrl(configuredHost);
+const updaterEndpoint = operation.disableUpdater ? null : updaterEndpointMap[targetEnv];
+
+try {
+  const parsedFrontendUrl = new URL(frontendUrl);
+  if (!["http:", "https:"].includes(parsedFrontendUrl.protocol)) {
+    throw new Error(`unsupported protocol ${parsedFrontendUrl.protocol}`);
+  }
+} catch (error) {
+  console.error(`Invalid frontend URL for ${targetEnv}: ${frontendUrl}`);
+  console.error(error instanceof Error ? error.message : String(error));
+  process.exit(1);
+}
+
 const normalizeUpdaterPubkey = (value) => {
   const pubkey = value?.trim();
   if (!pubkey) {
@@ -120,8 +188,17 @@ const tauriConf = require(tauriConfPath);
 const createUpdaterArtifacts =
   process.env.SNACK_CREATE_UPDATER_ARTIFACTS === "true" &&
   tauriConf.bundle?.createUpdaterArtifacts !== false;
+const macosSigningIdentity = resolveMacosSigningIdentity(operation.localSigning);
 
-if (command === "build" && !updaterPubkey) {
+if (operation.localSigning && process.platform === "darwin" && !macosSigningIdentity) {
+  console.error(
+    `Missing macOS signing identity "${LOCAL_MACOS_SIGNING_IDENTITY}". ` +
+      "Set SNACK_MACOS_SIGNING_IDENTITY or install the managed local identity first."
+  );
+  process.exit(1);
+}
+
+if (operation.command === "build" && !operation.localSigning && !updaterPubkey) {
   console.error(
     "Missing TAURI_UPDATER_PUBKEY. Generate an updater keypair with `tauri signer generate`, then set the public key before building."
   );
@@ -135,10 +212,13 @@ const tauriConfig = {
   },
   bundle: {
     createUpdaterArtifacts,
+    ...(macosSigningIdentity
+      ? { macOS: { signingIdentity: macosSigningIdentity } }
+      : {}),
   },
   plugins: {
     updater: {
-      endpoints: [updaterEndpoint],
+      endpoints: updaterEndpoint ? [updaterEndpoint] : [],
       ...(updaterPubkey ? { pubkey: updaterPubkey } : {}),
     },
   },
@@ -152,11 +232,15 @@ const childEnv = {
   SNACK_FRONTEND_URL: frontendUrl,
 };
 
+if (macosSigningIdentity) {
+  childEnv.APPLE_SIGNING_IDENTITY = macosSigningIdentity;
+}
+
 if (process.env.SNACK_DESKTOP_BASE_UA) {
   childEnv.SNACK_DESKTOP_BASE_UA = process.env.SNACK_DESKTOP_BASE_UA;
 }
 
-const child = spawn(tauriBin, [command, ...args], {
+const child = spawn(tauriBin, [operation.command, ...args], {
   cwd: repoRoot,
   stdio: "inherit",
   env: childEnv,

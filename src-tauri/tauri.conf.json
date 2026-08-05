@@ -6,9 +6,7 @@
   "identifier": "cn.yaowutech.snack",
   "build": {
     "beforeDevCommand": "",
-    "beforeBuildCommand": "",
-    "devUrl": "https://snack.mechlabs.cn",
-    "frontendDist": "https://snack.mechlabs.cn"
+    "beforeBuildCommand": ""
   },
   "app": {
     "withGlobalTauri": true,

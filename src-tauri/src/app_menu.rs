@@ -14,7 +14,7 @@ use crate::constants::TRAY_ATTENTION_ICON;
 #[cfg(any(target_os = "macos", windows))]
 use crate::constants::{
     ABOUT_ICON, NAVIGATION_MENU_BACK_ID, NAVIGATION_MENU_ID, TRAY_DEFAULT_ICON, TRAY_ID,
-    TRAY_MENU_QUIT_ID, TRAY_MENU_SHOW_ID,
+    TRAY_MENU_MEETING_ID, TRAY_MENU_QUIT_ID, TRAY_MENU_SHOW_ID,
 };
 #[cfg(any(target_os = "macos", windows))]
 use crate::navigation::navigate_back;
@@ -167,12 +167,20 @@ pub(crate) fn setup_windows_tray(app: &mut tauri::App) -> tauri::Result<()> {
     app.manage(attention_state.clone());
 
     let show = MenuItem::with_id(app, TRAY_MENU_SHOW_ID, "显示 Snack", true, None::<&str>)?;
+    let meeting = MenuItem::with_id(
+        app,
+        TRAY_MENU_MEETING_ID,
+        "开始 Snack 会议录音",
+        true,
+        None::<&str>,
+    )?;
     let about = PredefinedMenuItem::about(app, Some("关于 Snack"), Some(about_metadata(app)))?;
     let quit = MenuItem::with_id(app, TRAY_MENU_QUIT_ID, "退出", true, None::<&str>)?;
     let menu = Menu::with_items(
         app,
         &[
             &show,
+            &meeting,
             &PredefinedMenuItem::separator(app)?,
             &about,
             &PredefinedMenuItem::separator(app)?,
@@ -262,6 +270,7 @@ fn register_status_menu_events(app: &mut tauri::App) {
             }
         }
         TRAY_MENU_SHOW_ID => show_main_window(app),
+        TRAY_MENU_MEETING_ID => crate::meeting::quick_access::request_quick_recording(app),
         TRAY_MENU_QUIT_ID => app.exit(0),
         _ => {}
     });
@@ -287,12 +296,20 @@ pub(crate) fn setup_macos_status_menu(app: &mut tauri::App) -> tauri::Result<()>
     use tauri::tray::TrayIconBuilder;
 
     let show = MenuItem::with_id(app, TRAY_MENU_SHOW_ID, "显示 Snack", true, None::<&str>)?;
+    let meeting = MenuItem::with_id(
+        app,
+        TRAY_MENU_MEETING_ID,
+        "开始 Snack 会议录音",
+        true,
+        None::<&str>,
+    )?;
     let about = PredefinedMenuItem::about(app, Some("关于 Snack"), Some(about_metadata(app)))?;
     let quit = MenuItem::with_id(app, TRAY_MENU_QUIT_ID, "退出", true, None::<&str>)?;
     let menu = Menu::with_items(
         app,
         &[
             &show,
+            &meeting,
             &PredefinedMenuItem::separator(app)?,
             &about,
             &PredefinedMenuItem::separator(app)?,

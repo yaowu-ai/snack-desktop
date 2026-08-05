@@ -9,6 +9,12 @@ use crate::web::is_allowed_web_origin;
 const RECORD_METADATA_TYPE: &str = "cn.yaowutech.snack.record-handoff+json";
 const MAX_TRANSCRIPT_BYTES: usize = 5 * 1024 * 1024;
 
+#[derive(Debug, PartialEq)]
+struct MeetingNavigationTarget {
+    path: &'static str,
+    query: Option<&'static str>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ClipboardMetadata {
@@ -127,11 +133,28 @@ pub(crate) fn initialize(app: &AppHandle) -> Result<(), String> {
     Ok(())
 }
 
-pub(crate) fn handle_open_url(app: &AppHandle, url: &tauri::Url) {
-    if !is_clipboard_import_url(url) {
-        return;
-    }
+/// Queue trusted local text and open the Snack composer with it prefilled.
+pub(crate) fn open_prefill(app: &AppHandle, text: String) -> Result<(), String> {
+    let record_import = build_internal_import(text)?;
+    app.state::<RecordImportStore>()
+        .replace(record_import.clone())?;
+    show_main_window(app);
+    let window = app
+        .get_webview_window("main")
+        .ok_or_else(|| "main webview is unavailable".to_string())?;
+    prefill_root_input(&window, &record_import)?;
+    navigate_to_root(app)
+}
 
+pub(crate) fn handle_open_url(app: &AppHandle, url: &tauri::Url) {
+    if let Some(target) = meeting_navigation_target(url) {
+        open_meeting_target(app, target);
+    } else if is_clipboard_import_url(url) {
+        handle_clipboard_import(app);
+    }
+}
+
+fn handle_clipboard_import(app: &AppHandle) {
     match read_clipboard_import() {
         Ok(import) => {
             if let Err(error) = app.state::<RecordImportStore>().replace(import) {
@@ -169,6 +192,19 @@ pub(crate) fn handle_open_url(app: &AppHandle, url: &tauri::Url) {
             "Clipboard import was rejected",
             Some(&serde_json::json!({ "reason": error })),
         ),
+    }
+}
+
+fn open_meeting_target(app: &AppHandle, target: MeetingNavigationTarget) {
+    show_main_window(app);
+    if let Err(error) = navigate_to_web_path(app, target.path, target.query) {
+        crate::logging::write_app_log(
+            app,
+            "warn",
+            "meeting-deep-link",
+            "Meeting deep link could not be opened",
+            Some(&serde_json::json!({ "reason": error })),
+        );
     }
 }
 
@@ -240,6 +276,30 @@ fn is_clipboard_import_url(url: &tauri::Url) -> bool {
             .any(|(key, value)| key == "source" && value == "clipboard")
 }
 
+fn meeting_navigation_target(url: &tauri::Url) -> Option<MeetingNavigationTarget> {
+    if url.scheme() != "snack" || url.host_str() != Some("meeting") {
+        return None;
+    }
+    let action = url
+        .query_pairs()
+        .find_map(|(key, value)| (key == "action").then(|| value.into_owned()));
+    match action.as_deref() {
+        Some("apps") | Some("record") => Some(MeetingNavigationTarget {
+            path: "/apps",
+            query: None,
+        }),
+        Some("settings") => Some(MeetingNavigationTarget {
+            path: "/meeting/settings",
+            query: None,
+        }),
+        Some("records") | None => Some(MeetingNavigationTarget {
+            path: "/meeting",
+            query: None,
+        }),
+        Some(_) => None,
+    }
+}
+
 fn show_main_window(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.show();
@@ -248,21 +308,41 @@ fn show_main_window(app: &AppHandle) {
 }
 
 fn navigate_to_root(app: &AppHandle) -> Result<(), String> {
+    navigate_to_web_path(app, "/", None)
+}
+
+fn navigate_to_web_path(app: &AppHandle, path: &str, query: Option<&str>) -> Result<(), String> {
     let window = app
         .get_webview_window("main")
         .ok_or_else(|| "main webview is unavailable".to_string())?;
     require_allowed_origin(&window)?;
     let mut root_url = window.url().map_err(|error| error.to_string())?;
-    root_url.set_path("/");
-    root_url.set_query(None);
+    root_url.set_path(path);
+    root_url.set_query(query);
     root_url.set_fragment(None);
     window.navigate(root_url).map_err(|error| error.to_string())
+}
+
+fn build_internal_import(text: String) -> Result<PendingRecordImport, String> {
+    let bytes = text.as_bytes();
+    if bytes.is_empty() || bytes.len() > MAX_TRANSCRIPT_BYTES {
+        return Err("会议转写内容为空或超过 5 MB".to_string());
+    }
+    let checksum = format!("{:x}", Sha256::digest(bytes));
+    Ok(PendingRecordImport {
+        id: format!("meeting-v1-{checksum}"),
+        text,
+        created_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        delivery_state: RecordImportDeliveryState::Pending,
+    })
 }
 
 fn prefill_root_input(window: &WebviewWindow, import: &PendingRecordImport) -> Result<(), String> {
     require_allowed_origin(window)?;
     let text = serde_json::to_string(&import.text).map_err(|error| error.to_string())?;
-    let script = format!("window.sessionStorage.setItem('prefill_message', {text});");
+    let script = format!(
+        "window.sessionStorage.setItem('prefill_message', {text});window.sessionStorage.removeItem('prefill_message_options');"
+    );
     window.eval(&script).map_err(|error| error.to_string())
 }
 
@@ -385,7 +465,10 @@ fn read_clipboard_import() -> Result<PendingRecordImport, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_clipboard_import_url, PendingRecordImport, RecordImportDeliveryState};
+    use super::{
+        build_internal_import, is_clipboard_import_url, meeting_navigation_target,
+        MeetingNavigationTarget, PendingRecordImport, RecordImportDeliveryState,
+    };
 
     #[test]
     fn accepts_only_the_v1_clipboard_link() {
@@ -401,6 +484,42 @@ mod tests {
     }
 
     #[test]
+    fn maps_meeting_links_to_the_requested_web_view() {
+        assert_eq!(
+            meeting_navigation_target(&"snack://meeting?action=record".parse().unwrap()),
+            Some(MeetingNavigationTarget {
+                path: "/apps",
+                query: None,
+            })
+        );
+        assert_eq!(
+            meeting_navigation_target(&"snack://meeting?action=apps".parse().unwrap()),
+            Some(MeetingNavigationTarget {
+                path: "/apps",
+                query: None,
+            })
+        );
+        assert_eq!(
+            meeting_navigation_target(&"snack://meeting?action=records".parse().unwrap()),
+            Some(MeetingNavigationTarget {
+                path: "/meeting",
+                query: None,
+            })
+        );
+        assert_eq!(
+            meeting_navigation_target(&"snack://meeting?action=settings".parse().unwrap()),
+            Some(MeetingNavigationTarget {
+                path: "/meeting/settings",
+                query: None,
+            })
+        );
+        assert_eq!(
+            meeting_navigation_target(&"snack://meeting?action=unknown".parse().unwrap()),
+            None
+        );
+    }
+
+    #[test]
     fn legacy_pending_import_defaults_to_pending_delivery() {
         let import: PendingRecordImport = serde_json::from_str(
             r#"{"id":"legacy","text":"transcript","createdAt":"2026-07-16T00:00:00Z"}"#,
@@ -408,5 +527,15 @@ mod tests {
         .unwrap();
 
         assert_eq!(import.delivery_state, RecordImportDeliveryState::Pending);
+    }
+
+    #[test]
+    fn trusted_meeting_prefill_has_a_stable_local_identifier() {
+        let first = build_internal_import("prompt\n\ntranscript".to_string()).unwrap();
+        let second = build_internal_import("prompt\n\ntranscript".to_string()).unwrap();
+
+        assert_eq!(first.id, second.id);
+        assert!(first.id.starts_with("meeting-v1-"));
+        assert_eq!(first.delivery_state, RecordImportDeliveryState::Pending);
     }
 }

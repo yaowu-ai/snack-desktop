@@ -31,14 +31,27 @@ Snack 将企业增长工作流呈现在同一界面中：
 
 更多产品能力、应用场景与使用方式，请访问 **[snack.mechlabs.cn](https://snack.mechlabs.cn/)**。
 
-## 本地打包
+## 本地开发及打包
 
 ```bash
+npm run dev # 热开发，并关闭桌面自动更新检查
+npm run build:local # macOS：生成使用稳定本地签名的 Debug Snack.app
 npm run dev -- prod
 npm run dev -- qa
 npm run build -- prod
 npm run build -- qa
 ```
+
+内置 WebView 加载 `SNACK_HOST` 指定的地址；它可以是域名，也可以是完整的 `http://` 或
+`https://` URL。本地 `.env` 只需配置 `SNACK_HOST`，启动命令显式传入的同名环境变量优先。
+所有 `dev` 启动都会关闭桌面自动更新检查，并在
+Tauri 代码改动后自动重编译。涉及麦克风或录屏权限时，优先使用 `npm run build:local`，再打开
+`src-tauri/target/debug/bundle/macos/Snack.app`；该命令只生成 Debug `.app`，不会生成本地正式安装包。
+它会复用并静默解锁已有的受管本地签名钥匙串；若稳定签名身份不存在则直接失败，不会回退到
+容易导致 macOS 重复请求权限的临时签名。
+
+发布工作流从 GitHub Actions Variables 读取 `SNACK_HOST` 和 `SNACK_QA_HOST`，并根据 release
+channel 将选中的地址统一作为 `SNACK_HOST` 写入桌面构建配置。对应变量未配置时构建直接失败。
 
 ## 远端打包与发布
 
@@ -66,6 +79,8 @@ Snack_{version}_macos_x64.app.tar.gz.sig
 ```
 
 远端构建使用 Node.js 22。Windows 构建需要 `TAURI_UPDATER_PUBKEY` 和 `TAURI_SIGNING_PRIVATE_KEY`；macOS 构建还需要 Apple 签名与公证相关的 GitHub Secrets。工作流会为 updater 安装包生成并上传 `.sig` 签名文件。
+
+最后发布的时候，要在 平台后面的 桌面端 版本管理中 填入对应的版本号进行发布。使用桌面端的同学会收到更新提醒。
 
 ## 许可证
 
