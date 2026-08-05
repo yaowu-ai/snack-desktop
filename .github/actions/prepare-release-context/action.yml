@@ -1,6 +1,14 @@
 name: Prepare release context
 description: Resolve Snack desktop release channel, version, and build environment.
 
+inputs:
+  prod_host:
+    description: Production WebView host from GitHub Actions Variables.
+    required: true
+  qa_host:
+    description: QA WebView host from GitHub Actions Variables.
+    required: true
+
 outputs:
   app_version:
     description: Version written into tauri.conf.json.
@@ -23,6 +31,9 @@ runs:
   steps:
     - id: context
       shell: bash
+      env:
+        PROD_HOST: ${{ inputs.prod_host }}
+        QA_HOST: ${{ inputs.qa_host }}
       run: |
         set -euo pipefail
 
@@ -51,6 +62,24 @@ runs:
           exit 1
         fi
 
+        if [[ "$RELEASE_CHANNEL" == "qa" ]]; then
+          WEBVIEW_HOST="$QA_HOST"
+          WEBVIEW_VARIABLE="SNACK_QA_HOST"
+        else
+          WEBVIEW_HOST="$PROD_HOST"
+          WEBVIEW_VARIABLE="SNACK_HOST"
+        fi
+
+        if [[ -z "$WEBVIEW_HOST" ]]; then
+          echo "::error::Missing required GitHub Actions Variable: ${WEBVIEW_VARIABLE}"
+          exit 1
+        fi
+
+        if [[ "$WEBVIEW_HOST" == *$'\n'* || "$WEBVIEW_HOST" == *$'\r'* ]]; then
+          echo "::error::GitHub Actions Variable ${WEBVIEW_VARIABLE} must be a single-line host or URL."
+          exit 1
+        fi
+
         APP_VERSION="${GITHUB_REF_NAME#v}"
         ARTIFACT_VERSION="$APP_VERSION"
 
@@ -74,6 +103,7 @@ runs:
 
         {
           echo "SNACK_ENV=${RELEASE_CHANNEL}"
+          echo "SNACK_HOST=${WEBVIEW_HOST}"
           echo "SNACK_RELEASE_CHANNEL=${RELEASE_CHANNEL}"
           echo "SNACK_RELEASE_PRERELEASE=${RELEASE_PRERELEASE}"
           echo "SNACK_DESKTOP_VERSION=${ARTIFACT_VERSION}"

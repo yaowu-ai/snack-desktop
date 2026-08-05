@@ -4,9 +4,8 @@
   "version": "0.1.0",
   "scripts": {
     "dev": "node scripts/index.cjs dev",
-    "dev:local": "node scripts/index.cjs dev local",
     "build": "node scripts/index.cjs build",
-    "build:local": "node scripts/index.cjs build local --debug --bundles app"
+    "build:local": "node scripts/index.cjs build-local --debug --bundles app"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2.11.3",

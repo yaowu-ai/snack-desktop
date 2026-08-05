@@ -21,11 +21,13 @@ const localSigningUnlockScript = path.join(
 
 dotenv.config({
   path: envPath,
+  override: false,
 });
 
-const commandMap = {
-  dev: "dev",
-  build: "build",
+const operationMap = {
+  dev: { command: "dev", disableUpdater: true, localSigning: false },
+  build: { command: "build", disableUpdater: false, localSigning: false },
+  "build-local": { command: "build", disableUpdater: true, localSigning: true },
 };
 
 const inferEnvFromGitRef = () => {
@@ -55,7 +57,7 @@ const envValue = (name, fallback) => {
 
 const LOCAL_MACOS_SIGNING_IDENTITY = "Snack Record Local Code Signing";
 
-const resolveMacosSigningIdentity = (targetEnv, shouldUnlockLocalKeychain) => {
+const resolveMacosSigningIdentity = (useLocalSigning) => {
   if (process.platform !== "darwin") {
     return "";
   }
@@ -67,20 +69,18 @@ const resolveMacosSigningIdentity = (targetEnv, shouldUnlockLocalKeychain) => {
     return configuredIdentity;
   }
 
-  if (targetEnv !== "local") {
+  if (!useLocalSigning) {
     return "";
   }
 
-  if (shouldUnlockLocalKeychain) {
-    const unlockResult = spawnSync("/bin/zsh", [localSigningUnlockScript], {
-      encoding: "utf8",
-    });
-    if (unlockResult.status !== 0) {
-      const detail = unlockResult.stderr?.trim() || unlockResult.error?.message;
-      console.error("Unable to unlock the managed local signing keychain.");
-      if (detail) console.error(detail);
-      return "";
-    }
+  const unlockResult = spawnSync("/bin/zsh", [localSigningUnlockScript], {
+    encoding: "utf8",
+  });
+  if (unlockResult.status !== 0) {
+    const detail = unlockResult.stderr?.trim() || unlockResult.error?.message;
+    console.error("Unable to unlock the managed local signing keychain.");
+    if (detail) console.error(detail);
+    return "";
   }
 
   const result = spawnSync("security", ["find-identity", "-v", "-p", "codesigning"], {
@@ -97,14 +97,7 @@ const resolveMacosSigningIdentity = (targetEnv, shouldUnlockLocalKeychain) => {
   return "";
 };
 
-const frontendUrlMap = {
-  local: envValue("SNACK_LOCAL_FRONTEND_URL", "http://localhost:3000"),
-  prod: `https://${envValue("SNACK_PROD_HOST", "snack.mechlabs.cn")}`,
-  qa: `https://${envValue("SNACK_QA_HOST", "qasnack.mechlabs.cn")}`,
-};
-
 const updaterEndpointMap = {
-  local: null,
   prod: envValue(
     "SNACK_PROD_UPDATER_ENDPOINT",
     "https://snack.mechlabs.cn/api/desktop-updates/update?currentVersion={{current_version}}&target={{target}}&arch={{arch}}",
@@ -115,10 +108,11 @@ const updaterEndpointMap = {
   ),
 };
 
-const command = commandMap[process.argv[2]];
+const operationName = process.argv[2];
+const operation = operationMap[operationName];
 
-if (!command) {
-  console.error("Usage: node scripts/index.cjs <dev|build> [local|qa|prod] [...tauriArgs]");
+if (!operation) {
+  console.error("Usage: node scripts/index.cjs <dev|build|build-local> [qa|prod] [...tauriArgs]");
   process.exit(1);
 }
 
@@ -129,26 +123,27 @@ if (args[0] && !args[0].startsWith("-")) {
   targetEnv = args.shift().toLowerCase();
 }
 
-const frontendUrl = frontendUrlMap[targetEnv];
-const updaterEndpoint = updaterEndpointMap[targetEnv];
-
-if (!frontendUrl || updaterEndpoint === undefined) {
-  console.error(`Unknown ${command} environment: ${targetEnv}`);
-  console.error(`Supported environments: ${Object.keys(frontendUrlMap).join(", ")}`);
+if (operation.localSigning && !args.includes("--debug") && !args.includes("-d")) {
+  console.error("Local app builds must use --debug. Run npm run build:local.");
   process.exit(1);
 }
 
-const localDebugBuild =
-  command === "build" &&
-  targetEnv === "local" &&
-  (args.includes("--debug") || args.includes("-d"));
-
-if (command === "build" && targetEnv === "local" && !localDebugBuild) {
-  console.error(
-    "The local environment only supports debug builds. Pass --debug or use npm run build:local."
-  );
+if (!(targetEnv in updaterEndpointMap)) {
+  console.error(`Unknown ${operation.command} environment: ${targetEnv}`);
+  console.error(`Supported environments: ${Object.keys(updaterEndpointMap).join(", ")}`);
   process.exit(1);
 }
+
+const configuredHost = envValue("SNACK_HOST", "");
+if (!configuredHost) {
+  console.error("Missing SNACK_HOST. Set it in the command environment or the local .env file.");
+  process.exit(1);
+}
+
+const normalizeFrontendUrl = (hostOrUrl) =>
+  /^https?:\/\//i.test(hostOrUrl) ? hostOrUrl : `https://${hostOrUrl}`;
+const frontendUrl = normalizeFrontendUrl(configuredHost);
+const updaterEndpoint = operation.disableUpdater ? null : updaterEndpointMap[targetEnv];
 
 try {
   const parsedFrontendUrl = new URL(frontendUrl);
@@ -193,9 +188,9 @@ const tauriConf = require(tauriConfPath);
 const createUpdaterArtifacts =
   process.env.SNACK_CREATE_UPDATER_ARTIFACTS === "true" &&
   tauriConf.bundle?.createUpdaterArtifacts !== false;
-const macosSigningIdentity = resolveMacosSigningIdentity(targetEnv, localDebugBuild);
+const macosSigningIdentity = resolveMacosSigningIdentity(operation.localSigning);
 
-if (localDebugBuild && process.platform === "darwin" && !macosSigningIdentity) {
+if (operation.localSigning && process.platform === "darwin" && !macosSigningIdentity) {
   console.error(
     `Missing macOS signing identity "${LOCAL_MACOS_SIGNING_IDENTITY}". ` +
       "Set SNACK_MACOS_SIGNING_IDENTITY or install the managed local identity first."
@@ -203,7 +198,7 @@ if (localDebugBuild && process.platform === "darwin" && !macosSigningIdentity) {
   process.exit(1);
 }
 
-if (command === "build" && !localDebugBuild && !updaterPubkey) {
+if (operation.command === "build" && !operation.localSigning && !updaterPubkey) {
   console.error(
     "Missing TAURI_UPDATER_PUBKEY. Generate an updater keypair with `tauri signer generate`, then set the public key before building."
   );
@@ -245,7 +240,7 @@ if (process.env.SNACK_DESKTOP_BASE_UA) {
   childEnv.SNACK_DESKTOP_BASE_UA = process.env.SNACK_DESKTOP_BASE_UA;
 }
 
-const child = spawn(tauriBin, [command, ...args], {
+const child = spawn(tauriBin, [operation.command, ...args], {
   cwd: repoRoot,
   stdio: "inherit",
   env: childEnv,
