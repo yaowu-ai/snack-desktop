@@ -12,6 +12,8 @@ use tauri::{
 pub(crate) const OVERLAY_LABEL: &str = "record_overlay";
 pub(crate) const OVERLAY_SCHEME: &str = "snack-overlay";
 const OVERLAY_STATE_EVENT: &str = "meeting-overlay-state";
+const OVERLAY_WIDTH: f64 = 248.0;
+const OVERLAY_HEIGHT: f64 = 88.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -150,7 +152,7 @@ fn text_response(status: u16, body: &str) -> tauri::http::Response<Vec<u8>> {
 /// Show the overlay window. Idempotent — recreates the window if missing.
 pub(crate) fn show_overlay(app: &AppHandle, state: OverlayState) -> Result<(), String> {
     if let Some(window) = app.get_webview_window(OVERLAY_LABEL) {
-        let _ = window.set_size(LogicalSize::new(392.0, 116.0));
+        let _ = window.set_size(LogicalSize::new(OVERLAY_WIDTH, OVERLAY_HEIGHT));
         let _ = window.unminimize();
         let _ = window.show();
         let _ = window.set_focus();
@@ -168,7 +170,7 @@ pub(crate) fn show_overlay(app: &AppHandle, state: OverlayState) -> Result<(), S
         ),
     )
     .title("Snack 会议录音")
-    .inner_size(392.0, 116.0)
+    .inner_size(OVERLAY_WIDTH, OVERLAY_HEIGHT)
     .resizable(false)
     .decorations(false)
     .always_on_top(true)
@@ -180,7 +182,7 @@ pub(crate) fn show_overlay(app: &AppHandle, state: OverlayState) -> Result<(), S
 
     if let Ok(Some(monitor)) = window.current_monitor() {
         let area = monitor.work_area();
-        let window_width = window.outer_size().map(|size| size.width).unwrap_or(392) as i32;
+        let window_width = window.outer_size().map(|size| size.width).unwrap_or(248) as i32;
         let x = area.position.x + area.size.width as i32 - window_width - 24;
         let y = area.position.y + 24;
         let _ = window.set_position(PhysicalPosition::new(x, y));
@@ -247,23 +249,20 @@ const OVERLAY_HTML: &str = r#"<!DOCTYPE html>
   body {
     font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif;
     background: rgba(255, 255, 255, 0.98); border: 1px solid #fee5d0;
-    border-radius: 14px; color: #0f172a;
+    border-radius: 12px; color: #0f172a;
     user-select: none; -webkit-user-select: none;
   }
   .bar {
-    position: relative; display: flex; align-items: center; gap: 12px;
-    height: 116px; padding: 22px 16px 12px; cursor: grab;
+    position: relative; display: flex; align-items: center; gap: 10px;
+    height: 88px; padding: 17px 12px 8px; cursor: grab;
   }
   .bar:active { cursor: grabbing; }
-  .window-actions { position: absolute; right: 7px; top: 5px; display: flex; gap: 2px; }
-  .window-action {
-    width: 22px; height: 18px; border: 0; border-radius: 5px; background: transparent;
-    color: #94a3b8; cursor: pointer; font-size: 15px; line-height: 16px;
+  .drag-hint {
+    position: absolute; left: 50%; top: 3px; transform: translateX(-50%);
+    color: #cbd5e1; font-size: 9px; line-height: 12px; pointer-events: none; white-space: nowrap;
   }
-  .window-action:hover { background: #fff2e8; color: #fe720a; }
-  .window-action.close:hover { background: #ffedd5; color: #c2410c; }
   .status-icon {
-    display: flex; width: 26px; height: 26px; flex-shrink: 0; align-items: center;
+    display: flex; width: 22px; height: 22px; flex-shrink: 0; align-items: center;
     justify-content: center; border-radius: 50%; background: #fff2e8;
     color: #fe720a; font-size: 13px; font-weight: 700;
   }
@@ -274,63 +273,30 @@ const OVERLAY_HTML: &str = r#"<!DOCTYPE html>
   @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .35; } }
   @keyframes spin { to { transform: rotate(360deg); } }
   .info { flex: 1; min-width: 0; }
-  .title { font-size: 13px; font-weight: 650; }
-  .metric { margin-top: 3px; font-size: 20px; font-weight: 700; font-variant-numeric: tabular-nums; }
-  .detail { display: none; margin-top: 5px; overflow: hidden; color: #64748b; font-size: 11px; line-height: 16px; text-overflow: ellipsis; white-space: nowrap; }
-  .sources { display: flex; gap: 9px; margin-top: 4px; color: #64748b; font-size: 11px; }
-  .source { display: inline-flex; align-items: center; gap: 4px; }
-  .src-dot { width: 7px; height: 7px; border-radius: 50%; background: #cbd5e1; }
-  .src-dot.on { background: #22c55e; }
+  .title { font-size: 12px; font-weight: 650; }
+  .metric { margin-top: 2px; font-size: 18px; font-weight: 700; font-variant-numeric: tabular-nums; }
+  .detail { display: none; margin-top: 3px; overflow: hidden; color: #64748b; font-size: 9px; line-height: 12px; text-overflow: ellipsis; white-space: nowrap; }
   .progress { display: none; height: 4px; margin-top: 8px; overflow: hidden; border-radius: 999px; background: #ffedd5; }
   .progress-fill { height: 100%; border-radius: inherit; background: #fe720a; transition: width .25s ease; }
   .primary-action {
-    flex-shrink: 0; border: none; border-radius: 10px; padding: 9px 14px;
-    background: #fe720a; color: #fff; cursor: pointer; font-size: 12px; font-weight: 650;
+    flex-shrink: 0; border: none; border-radius: 9px; padding: 9px 12px;
+    background: #fe720a; color: #fff; cursor: pointer; font-size: 11px; font-weight: 650;
   }
   .primary-action:hover { background: #e96608; }
   .primary-action:disabled { cursor: default; opacity: .6; }
-  .confirm-layer {
-    display: none; position: fixed; inset: 0; z-index: 10; align-items: center;
-    gap: 12px; padding: 16px; background: rgba(255, 255, 255, 0.995);
-  }
-  .confirm-layer.visible { display: flex; }
-  .confirm-copy { flex: 1; min-width: 0; }
-  .confirm-title { font-size: 13px; font-weight: 650; }
-  .confirm-detail { margin-top: 4px; color: #64748b; font-size: 11px; }
-  .confirm-actions { display: flex; gap: 8px; flex-shrink: 0; }
-  .confirm-button { border: 1px solid #e2e8f0; border-radius: 8px; padding: 8px 11px; background: #f8fafc; color: #475569; cursor: pointer; font-size: 12px; font-weight: 600; }
-  .confirm-button:hover { background: #f1f5f9; }
-  .confirm-button.danger { border-color: #fe720a; background: #fe720a; color: #fff; }
 </style>
 </head>
 <body data-phase="recording">
   <div class="bar" data-tauri-drag-region>
-    <div class="window-actions">
-      <button class="window-action" id="minimize" aria-label="最小化">−</button>
-      <button class="window-action close" id="close" aria-label="关闭">×</button>
-    </div>
+    <div class="drag-hint">拖动可移动</div>
     <div class="status-icon recording" id="status-icon">●</div>
     <div class="info">
       <div class="title" id="title">正在录音</div>
       <div class="metric" id="metric">00:00</div>
       <div class="detail" id="detail"></div>
-      <div class="sources" id="sources">
-        <span class="source"><span class="src-dot" id="mic"></span>麦克风</span>
-        <span class="source"><span class="src-dot" id="sys"></span>系统音频</span>
-      </div>
       <div class="progress" id="progress"><div class="progress-fill" id="progress-fill"></div></div>
     </div>
     <button class="primary-action" id="primary-action">结束</button>
-  </div>
-  <div class="confirm-layer" id="close-confirm" role="dialog" aria-modal="true" aria-labelledby="close-confirm-title">
-    <div class="confirm-copy">
-      <div class="confirm-title" id="close-confirm-title">确定结束录音？</div>
-      <div class="confirm-detail">录音会立即停止，并继续在本地转写</div>
-    </div>
-    <div class="confirm-actions">
-      <button class="confirm-button" id="cancel-close">取消</button>
-      <button class="confirm-button danger" id="confirm-close">结束录音</button>
-    </div>
   </div>
   <script>
     (function () {
@@ -342,14 +308,9 @@ const OVERLAY_HTML: &str = r#"<!DOCTYPE html>
       var titleEl = document.getElementById('title');
       var metricEl = document.getElementById('metric');
       var detailEl = document.getElementById('detail');
-      var sourcesEl = document.getElementById('sources');
-      var micEl = document.getElementById('mic');
-      var sysEl = document.getElementById('sys');
       var progressEl = document.getElementById('progress');
       var progressFillEl = document.getElementById('progress-fill');
       var actionEl = document.getElementById('primary-action');
-      var closeConfirmEl = document.getElementById('close-confirm');
-      var cancelCloseEl = document.getElementById('cancel-close');
 
       function invoke(command, args) {
         if (window.__TAURI__ && window.__TAURI__.core) return window.__TAURI__.core.invoke(command, args || {});
@@ -378,7 +339,6 @@ const OVERLAY_HTML: &str = r#"<!DOCTYPE html>
       function resetView() {
         metricEl.style.display = 'none';
         detailEl.style.display = 'none';
-        sourcesEl.style.display = 'none';
         progressEl.style.display = 'none';
         actionEl.style.display = 'none';
         actionEl.disabled = false;
@@ -392,9 +352,6 @@ const OVERLAY_HTML: &str = r#"<!DOCTYPE html>
         titleEl.textContent = '正在录音';
         metricEl.textContent = formatDuration(current.elapsedMs || 0);
         metricEl.style.display = 'block';
-        sourcesEl.style.display = 'flex';
-        micEl.className = 'src-dot' + (current.micActive ? ' on' : '');
-        sysEl.className = 'src-dot' + (current.systemAudioActive ? ' on' : '');
         actionEl.textContent = stopPending ? '结束中…' : '结束';
         actionEl.disabled = stopPending;
         actionEl.style.display = 'block';
@@ -487,26 +444,6 @@ const OVERLAY_HTML: &str = r#"<!DOCTYPE html>
         if (current.phase === 'recording') stopRecording();
         else if (current.phase === 'ready') openNotes();
       });
-      document.getElementById('minimize').addEventListener('click', function () {
-        invoke('minimize_overlay', {}).catch(function () {});
-      });
-      document.getElementById('close').addEventListener('click', function () {
-        if (current.phase !== 'recording') {
-          invoke('dismiss_overlay', {}).catch(function () {});
-          return;
-        }
-        closeConfirmEl.classList.add('visible');
-        cancelCloseEl.focus();
-      });
-      cancelCloseEl.addEventListener('click', function () { closeConfirmEl.classList.remove('visible'); });
-      document.getElementById('confirm-close').addEventListener('click', function () {
-        closeConfirmEl.classList.remove('visible');
-        stopRecording();
-      });
-      document.addEventListener('keydown', function (event) {
-        if (event.key === 'Escape') closeConfirmEl.classList.remove('visible');
-      });
-
       render();
       try {
         var eventApi = window.__TAURI__ && window.__TAURI__.event;
@@ -544,6 +481,11 @@ mod tests {
         assert!(!html.contains("做会议纪要"));
         assert!(html.contains("color-scheme: light"));
         assert!(html.contains("background: rgba(255, 255, 255, 0.98)"));
+        assert!(html.contains("拖动可移动"));
+        assert!(!html.contains("aria-label=\"最小化\""));
+        assert!(!html.contains("aria-label=\"关闭\""));
+        assert!(!html.contains(">麦克风<"));
+        assert!(!html.contains(">系统音频<"));
         assert!(!html.contains("stopViaProtocol(),\n          invokeWithTimeout"));
     }
 

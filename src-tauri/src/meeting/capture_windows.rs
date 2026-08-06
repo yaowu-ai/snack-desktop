@@ -28,7 +28,8 @@ use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 
 use crate::meeting::audio::{mix_samples, WavWriter};
 use crate::meeting::capture::{
-    downmix_f32, resample_to_target, CaptureError, CaptureShared, Recorder, CAPTURE_CHUNK_SAMPLES,
+    downmix_f32, prepare_audio_output, resample_to_target, CaptureError, CaptureShared, Recorder,
+    CAPTURE_CHUNK_SAMPLES,
 };
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
@@ -73,6 +74,7 @@ pub(crate) fn start_windows_capture(
             let start_result = (|| -> Result<(), CaptureError> {
                 let mic_stream = start_windows_mic(mic_tx.clone(), &shared_for_thread)?;
                 let loopback_thread = start_windows_loopback(sys_tx.clone(), &shared_for_thread)?;
+                prepare_audio_output(&audio_for_thread)?;
                 // Hold the mic stream on this thread; the loopback thread
                 // stops via the shared stop flag when the session exits.
                 let _mic_stream = mic_stream;

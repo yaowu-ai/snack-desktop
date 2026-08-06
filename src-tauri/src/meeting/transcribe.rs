@@ -56,6 +56,30 @@ pub(crate) fn transcribe_file(
         return Err("本地转写已停止".to_string());
     }
 
+    let wav_samples = wav_path
+        .extension()
+        .and_then(|value| value.to_str())
+        .filter(|value| value.eq_ignore_ascii_case("wav"))
+        .map(|_| crate::meeting::audio::read_wav_samples(wav_path))
+        .transpose()?;
+    if wav_samples
+        .as_deref()
+        .is_some_and(|samples| !crate::meeting::audio::has_audio_signal(samples))
+    {
+        if !on_progress(TranscriptionProgress {
+            percent: 100,
+            current_text: String::new(),
+            segment_count: 0,
+        }) {
+            return Err("本地转写已停止".to_string());
+        }
+        return Ok(TranscriptionOutcome {
+            segments: Vec::new(),
+            text: String::new(),
+            language: language.to_string(),
+        });
+    }
+
     let python = model_dir.join("runtime/venv/bin/python");
     let script = model_dir.join("runtime/funasr_transcribe.py");
     let cache_dir = model_dir.join("modelscope-cache");
@@ -76,8 +100,7 @@ pub(crate) fn transcribe_file(
         ));
     }
 
-    let decoded: ModelScopeTranscript = serde_json::from_slice(&output.stdout)
-        .map_err(|error| format!("本地转写结果无效: {error}"))?;
+    let decoded = parse_modelscope_transcript(&output.stdout)?;
     let segments = decoded
         .segments
         .into_iter()
@@ -102,6 +125,29 @@ pub(crate) fn transcribe_file(
     })
 }
 
+/// FunASR versions may print their version or progress logs to stdout before
+/// the wrapper emits its final one-line JSON result. Prefer a fully clean
+/// payload, then fall back to the last independently valid transcript line.
+fn parse_modelscope_transcript(output: &[u8]) -> Result<ModelScopeTranscript, String> {
+    match serde_json::from_slice(output) {
+        Ok(decoded) => return Ok(decoded),
+        Err(full_output_error) => {
+            let output = String::from_utf8_lossy(output);
+            for line in output
+                .lines()
+                .rev()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+            {
+                if let Ok(decoded) = serde_json::from_str::<ModelScopeTranscript>(line) {
+                    return Ok(decoded);
+                }
+            }
+            Err(format!("本地转写结果无效: {full_output_error}"))
+        }
+    }
+}
+
 /// Installation validation deliberately checks the complete local runtime and
 /// cache instead of loading the multi-GB model a second time.
 pub(crate) fn validate_model(model_key: ModelKey, model_dir: &Path) -> Result<(), String> {
@@ -112,5 +158,67 @@ pub(crate) fn validate_model(model_key: ModelKey, model_dir: &Path) -> Result<()
         Ok(())
     } else {
         Err("本地 FunASR 运行环境不完整".to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::meeting::audio::WavWriter;
+    use std::fs;
+    use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn silent_recording_finishes_without_loading_the_model_runtime() {
+        let wav_path = std::env::temp_dir().join(format!(
+            "snack-silent-transcription-{}.wav",
+            std::process::id()
+        ));
+        let _ = fs::remove_file(&wav_path);
+        let mut writer = WavWriter::create(&wav_path).unwrap();
+        writer.write_samples(&vec![0; 16_000]).unwrap();
+        writer.finalize().unwrap();
+
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let observed_for_callback = Arc::clone(&observed);
+        let outcome = transcribe_file(
+            ModelKey::FunAsr2G,
+            Path::new("/model-runtime-does-not-exist"),
+            &wav_path,
+            "zh",
+            move |progress| {
+                observed_for_callback.lock().unwrap().push(progress.percent);
+                true
+            },
+        )
+        .unwrap();
+
+        assert!(outcome.text.is_empty());
+        assert!(outcome.segments.is_empty());
+        assert_eq!(*observed.lock().unwrap(), vec![2, 100]);
+        fs::remove_file(&wav_path).ok();
+    }
+
+    #[test]
+    fn transcript_parser_ignores_funasr_stdout_logs() {
+        let output = concat!(
+            "funasr version: 1.2.7\n",
+            "{\"text\":\"会议内容\",\"segments\":[{\"startMs\":0,",
+            "\"endMs\":1200,\"text\":\"会议内容\",\"speaker\":\"说话人 1\"}]}\n"
+        );
+
+        let decoded = parse_modelscope_transcript(output.as_bytes()).unwrap();
+
+        assert_eq!(decoded.text, "会议内容");
+        assert_eq!(decoded.segments.len(), 1);
+        assert_eq!(decoded.segments[0].end_ms, 1200);
+    }
+
+    #[test]
+    fn transcript_parser_rejects_logs_without_a_json_result() {
+        let error =
+            parse_modelscope_transcript(b"funasr version: 1.2.7\nloading model\n").unwrap_err();
+
+        assert!(error.starts_with("本地转写结果无效:"));
     }
 }

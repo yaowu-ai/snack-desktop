@@ -8,11 +8,13 @@
         "allow": [
           "meeting_cancel_install",
           "meeting_check_permissions",
+          "meeting_clear_task_records",
           "meeting_choose_storage_directory",
           "meeting_generate_notes",
           "meeting_get_recording_status",
           "meeting_get_snapshot",
           "meeting_install_model",
+          "meeting_import_audio",
           "meeting_open_local_file",
           "meeting_open_notes_in_chat",
           "meeting_open_permission_settings",
