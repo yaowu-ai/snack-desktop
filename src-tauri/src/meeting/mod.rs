@@ -62,7 +62,6 @@ pub(crate) struct CatalogInfo {
     display_name: &'static str,
     size_bytes: u64,
     installed_size_bytes: u64,
-    download_url: &'static str,
     languages: &'static str,
     capabilities: &'static str,
     default: bool,
@@ -75,11 +74,6 @@ impl From<&CatalogModel> for CatalogInfo {
             display_name: model.display_name,
             size_bytes: model.size_bytes,
             installed_size_bytes: model.installed_size_bytes(),
-            download_url: model
-                .artifacts
-                .first()
-                .map(|artifact| artifact.url)
-                .unwrap_or(""),
             languages: model.languages,
             capabilities: model.capabilities,
             default: model.key == catalog::ModelKey::DEFAULT,
@@ -340,18 +334,13 @@ fn save_and_activate_settings(
 }
 
 #[tauri::command]
-pub(crate) fn meeting_install_model(
-    app: AppHandle,
-    window: WebviewWindow,
-    model_key: String,
-) -> Result<(), String> {
+pub(crate) fn meeting_install_model(app: AppHandle, window: WebviewWindow) -> Result<(), String> {
     require_allowed_window(&window)?;
-    let model_key = catalog::ModelKey::parse(&model_key).ok_or_else(|| "未知的模型".to_string())?;
     let (store, manager) = {
         let state = app.state::<MeetingManagerState>();
         (state.store.clone_for_task(), Arc::clone(&state.manager))
     };
-    install::start_install(app, store, manager, model_key)
+    install::start_install(app, store, manager, catalog::ModelKey::DEFAULT)
 }
 
 #[tauri::command]
@@ -1018,14 +1007,7 @@ fn spawn_transcription(app: AppHandle, store: MeetingStore) {
                     language: outcome.language,
                     segments: outcome.segments,
                     model_key: model_key.as_str().to_string(),
-                    engine: match model_key {
-                        catalog::ModelKey::FunAsr2G => {
-                            format!("sherpa-onnx FunASR {}", env!("CARGO_PKG_VERSION"))
-                        }
-                        catalog::ModelKey::LargeV3 | catalog::ModelKey::Small => {
-                            format!("whisper.cpp {}", env!("CARGO_PKG_VERSION"))
-                        }
-                    },
+                    engine: format!("FunASR ModelScope {}", env!("CARGO_PKG_VERSION")),
                     generated_at: now_rfc3339(),
                 },
                 Err(message) => {
