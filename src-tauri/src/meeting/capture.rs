@@ -21,6 +21,20 @@ use crate::meeting::audio::mix_samples;
 
 pub(crate) const CAPTURE_CHUNK_SAMPLES: usize = 1600; // 100 ms @ 16 kHz
 
+/// Creates only the immediate audio output directory after native capture has
+/// started successfully. `create_dir` deliberately refuses to recreate a
+/// missing user-selected storage root.
+pub(crate) fn prepare_audio_output(audio_path: &std::path::Path) -> Result<(), CaptureError> {
+    let parent = audio_path
+        .parent()
+        .ok_or_else(|| CaptureError::start_failed("录音保存路径无效"))?;
+    if parent.is_dir() {
+        return Ok(());
+    }
+    std::fs::create_dir(parent)
+        .map_err(|error| CaptureError::start_failed(format!("无法创建录音文件夹: {error}")))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CaptureErrorKind {
     PermissionDenied,
@@ -28,7 +42,7 @@ pub(crate) enum CaptureErrorKind {
     CaptureStartFailed,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct CaptureError {
     pub(crate) kind: CaptureErrorKind,
     pub(crate) message: String,
@@ -248,7 +262,7 @@ pub(crate) fn mix_chunks(mic: &[f32], system: &[f32]) -> Vec<i16> {
 
 #[cfg(test)]
 mod tests {
-    use super::{downmix_f32, pcm_bytes_to_f32_mono, resample_to_target};
+    use super::{downmix_f32, pcm_bytes_to_f32_mono, prepare_audio_output, resample_to_target};
 
     #[test]
     fn pcm_i16_bytes_decode() {
@@ -277,5 +291,35 @@ mod tests {
         let samples: Vec<f32> = (0..48000).map(|i| (i % 100) as f32).collect();
         let out = resample_to_target(&samples, 48_000);
         assert_eq!(out.len(), 16_000);
+    }
+
+    #[test]
+    fn audio_output_directory_is_created_only_when_capture_prepares_it() {
+        let root = std::env::temp_dir().join(format!(
+            "snack-capture-output-{}",
+            crate::meeting::state::unix_millis()
+        ));
+        let selected_root = root.join("selected");
+        let audio_directory = selected_root.join("audio");
+        std::fs::create_dir_all(&selected_root).unwrap();
+        let audio_path = audio_directory.join("recording.wav");
+
+        assert!(!audio_directory.exists());
+        prepare_audio_output(&audio_path).unwrap();
+        assert!(audio_directory.is_dir());
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn audio_output_does_not_recreate_a_missing_selected_root() {
+        let root = std::env::temp_dir().join(format!(
+            "snack-capture-missing-root-{}",
+            crate::meeting::state::unix_millis()
+        ));
+        let audio_path = root.join("selected").join("audio").join("recording.wav");
+
+        assert!(prepare_audio_output(&audio_path).is_err());
+        assert!(!root.exists());
     }
 }

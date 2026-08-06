@@ -31,7 +31,13 @@ struct ClipboardMetadata {
 pub(crate) struct PendingRecordImport {
     pub id: String,
     pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attachment_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attachment_text: Option<String>,
     pub created_at: String,
+    #[serde(default)]
+    pub auto_submit: bool,
     #[serde(default)]
     delivery_state: RecordImportDeliveryState,
 }
@@ -133,9 +139,16 @@ pub(crate) fn initialize(app: &AppHandle) -> Result<(), String> {
     Ok(())
 }
 
-/// Queue trusted local text and open the Snack composer with it prefilled.
-pub(crate) fn open_prefill(app: &AppHandle, text: String) -> Result<(), String> {
-    let record_import = build_internal_import(text)?;
+/// Queue the meeting notes prompt separately from the transcript attachment.
+pub(crate) fn open_prefill_with_attachment(
+    app: &AppHandle,
+    prompt: String,
+    attachment_name: String,
+    attachment_text: String,
+    auto_submit: bool,
+) -> Result<(), String> {
+    let record_import =
+        build_meeting_import(prompt, attachment_name, attachment_text, auto_submit)?;
     app.state::<RecordImportStore>()
         .replace(record_import.clone())?;
     show_main_window(app);
@@ -323,16 +336,29 @@ fn navigate_to_web_path(app: &AppHandle, path: &str, query: Option<&str>) -> Res
     window.navigate(root_url).map_err(|error| error.to_string())
 }
 
-fn build_internal_import(text: String) -> Result<PendingRecordImport, String> {
-    let bytes = text.as_bytes();
-    if bytes.is_empty() || bytes.len() > MAX_TRANSCRIPT_BYTES {
-        return Err("会议转写内容为空或超过 5 MB".to_string());
+fn build_meeting_import(
+    prompt: String,
+    attachment_name: String,
+    attachment_text: String,
+    auto_submit: bool,
+) -> Result<PendingRecordImport, String> {
+    if prompt.trim().is_empty() || prompt.len() > MAX_TRANSCRIPT_BYTES {
+        return Err("会议纪要 Prompt 为空或超过 5 MB".to_string());
     }
-    let checksum = format!("{:x}", Sha256::digest(bytes));
+    if attachment_name.trim().is_empty() || attachment_text.len() > MAX_TRANSCRIPT_BYTES {
+        return Err("会议转写文件无效或超过 5 MB".to_string());
+    }
+    let checksum = format!(
+        "{:x}",
+        Sha256::digest(format!("{prompt}\0{attachment_name}\0{attachment_text}").as_bytes())
+    );
     Ok(PendingRecordImport {
-        id: format!("meeting-v1-{checksum}"),
-        text,
+        id: format!("meeting-v2-{checksum}"),
+        text: prompt,
+        attachment_name: Some(attachment_name),
+        attachment_text: Some(attachment_text),
         created_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        auto_submit,
         delivery_state: RecordImportDeliveryState::Pending,
     })
 }
@@ -384,7 +410,10 @@ fn read_clipboard_import() -> Result<PendingRecordImport, String> {
     Ok(PendingRecordImport {
         id: format!("clipboard-v1-{checksum}"),
         text,
+        attachment_name: None,
+        attachment_text: None,
         created_at: metadata.created_at,
+        auto_submit: false,
         delivery_state: RecordImportDeliveryState::Pending,
     })
 }
@@ -422,7 +451,10 @@ fn read_clipboard_import() -> Result<PendingRecordImport, String> {
             Ok(PendingRecordImport {
                 id: format!("clipboard-v1-{checksum}"),
                 text,
+                attachment_name: None,
+                attachment_text: None,
                 created_at: metadata.created_at,
+                auto_submit: false,
                 delivery_state: RecordImportDeliveryState::Pending,
             })
         })();
@@ -466,7 +498,7 @@ fn read_clipboard_import() -> Result<PendingRecordImport, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_internal_import, is_clipboard_import_url, meeting_navigation_target,
+        build_meeting_import, is_clipboard_import_url, meeting_navigation_target,
         MeetingNavigationTarget, PendingRecordImport, RecordImportDeliveryState,
     };
 
@@ -530,12 +562,35 @@ mod tests {
     }
 
     #[test]
-    fn trusted_meeting_prefill_has_a_stable_local_identifier() {
-        let first = build_internal_import("prompt\n\ntranscript".to_string()).unwrap();
-        let second = build_internal_import("prompt\n\ntranscript".to_string()).unwrap();
+    fn meeting_handoff_keeps_prompt_and_transcript_attachment_separate() {
+        let import = build_meeting_import(
+            "请生成会议纪要".to_string(),
+            "Snack会议-2026-08-06.txt".to_string(),
+            "会议转写正文".to_string(),
+            false,
+        )
+        .unwrap();
 
-        assert_eq!(first.id, second.id);
-        assert!(first.id.starts_with("meeting-v1-"));
-        assert_eq!(first.delivery_state, RecordImportDeliveryState::Pending);
+        assert_eq!(import.text, "请生成会议纪要");
+        assert_eq!(
+            import.attachment_name.as_deref(),
+            Some("Snack会议-2026-08-06.txt")
+        );
+        assert_eq!(import.attachment_text.as_deref(), Some("会议转写正文"));
+        assert!(!import.auto_submit);
+        assert!(import.id.starts_with("meeting-v2-"));
+    }
+
+    #[test]
+    fn meeting_notification_handoff_can_request_automatic_submission() {
+        let import = build_meeting_import(
+            "请生成会议纪要".to_string(),
+            "Snack会议.txt".to_string(),
+            "会议转写正文".to_string(),
+            true,
+        )
+        .unwrap();
+
+        assert!(import.auto_submit);
     }
 }

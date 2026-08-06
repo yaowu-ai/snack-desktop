@@ -9,6 +9,7 @@
 //! Every transition is validated by a state machine so illegal jumps fail fast
 //! and crash recovery can reconcile persisted state on startup.
 
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -46,7 +47,7 @@ impl Default for MeetingSettings {
     fn default() -> Self {
         Self {
             storage_directory: None,
-            shortcut: "CommandOrControl+Shift+R".to_string(),
+            shortcut: "CommandOrControl+R".to_string(),
             retain_audio: true,
             organize_transcripts_by_date: false,
             notes_prompt: default_meeting_notes_prompt(),
@@ -183,7 +184,6 @@ impl TaskState {
         )
     }
 
-    #[allow(dead_code)]
     pub(crate) fn is_active(self) -> bool {
         matches!(
             self,
@@ -198,10 +198,7 @@ impl TaskState {
     pub(crate) fn blocks_recording(self) -> bool {
         matches!(
             self,
-            TaskState::Checking
-                | TaskState::Recording
-                | TaskState::Finalizing
-                | TaskState::TranscribingLocal
+            TaskState::Checking | TaskState::Recording | TaskState::Finalizing
         )
     }
 }
@@ -263,6 +260,8 @@ impl Default for ServerSubmission {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct MeetingTask {
     pub(crate) recording_id: String,
+    #[serde(default)]
+    pub(crate) display_name: Option<String>,
     pub(crate) state: TaskState,
     pub(crate) started_at: Option<String>,
     pub(crate) ended_at: Option<String>,
@@ -286,6 +285,7 @@ impl MeetingTask {
         let now = now_rfc3339();
         Self {
             recording_id,
+            display_name: None,
             state: TaskState::Idle,
             started_at: None,
             ended_at: None,
@@ -331,8 +331,7 @@ impl MeetingStore {
         let default_recordings_root = app
             .path()
             .desktop_dir()
-            .map_err(|error| error.to_string())?
-            .join("Snack会议");
+            .map_err(|error| error.to_string())?;
         fs::create_dir_all(&root).map_err(|error| error.to_string())?;
         for sub in [
             MODELS_DIR_NAME,
@@ -343,7 +342,6 @@ impl MeetingStore {
         ] {
             fs::create_dir_all(root.join(sub)).map_err(|error| error.to_string())?;
         }
-        fs::create_dir_all(&default_recordings_root).map_err(|error| error.to_string())?;
         Ok(Self {
             root,
             default_recordings_root,
@@ -372,6 +370,12 @@ impl MeetingStore {
             .join(format!("{recording_id}.wav"))
     }
 
+    pub(crate) fn imported_audio_path(&self, recording_id: &str, extension: &str) -> PathBuf {
+        self.recordings_root()
+            .join(AUDIO_DIR_NAME)
+            .join(format!("{recording_id}.{extension}"))
+    }
+
     pub(crate) fn transcript_path(&self, recording_id: &str) -> PathBuf {
         self.recordings_root()
             .join(TRANSCRIPTS_DIR_NAME)
@@ -379,15 +383,21 @@ impl MeetingStore {
     }
 
     pub(crate) fn transcript_text_path(&self, task: &MeetingTask) -> PathBuf {
-        let created_at = chrono::DateTime::parse_from_rfc3339(&task.created_at)
-            .map(|time| {
-                time.with_timezone(&chrono::Local)
-                    .format("%Y-%m-%d-%H%M%S")
-                    .to_string()
-            })
-            .unwrap_or_else(|_| task.recording_id.clone());
-        self.transcript_text_root(task)
-            .join(format!("Snack会议-{created_at}.txt"))
+        let file_name = task
+            .display_name
+            .as_deref()
+            .and_then(|name| normalize_transcript_file_name(name).ok())
+            .unwrap_or_else(|| {
+                let created_at = chrono::DateTime::parse_from_rfc3339(&task.created_at)
+                    .map(|time| {
+                        time.with_timezone(&chrono::Local)
+                            .format("%Y-%m-%d-%H%M%S")
+                            .to_string()
+                    })
+                    .unwrap_or_else(|_| task.recording_id.clone());
+                format!("Snack会议-{created_at}.txt")
+            });
+        self.transcript_text_root(task).join(file_name)
     }
 
     pub(crate) fn ensure_transcript_output_directory(
@@ -416,20 +426,23 @@ impl MeetingStore {
         if settings.organize_transcripts_by_date {
             root.join(meeting_task_local_date(task))
         } else {
-            root.join(TRANSCRIPTS_DIR_NAME)
+            root
         }
     }
 
-    pub(crate) fn ensure_recording_directories(&self) -> Result<(), String> {
-        self.ensure_recording_directories_for(&self.load_settings())
+    pub(crate) fn audio_directory(&self) -> PathBuf {
+        self.recordings_root().join(AUDIO_DIR_NAME)
     }
 
-    fn ensure_recording_directories_for(&self, settings: &MeetingSettings) -> Result<(), String> {
-        let root = self.recordings_root_for_settings(settings);
-        for sub in [AUDIO_DIR_NAME, TRANSCRIPTS_DIR_NAME] {
-            fs::create_dir_all(root.join(sub)).map_err(|error| error.to_string())?;
+    pub(crate) fn ensure_audio_directory(&self) -> Result<bool, String> {
+        let settings = self.load_settings();
+        let root = self.recordings_root_for_settings(&settings);
+        let audio_directory = root.join(AUDIO_DIR_NAME);
+        if audio_directory.is_dir() {
+            return Ok(false);
         }
-        Ok(())
+        fs::create_dir_all(audio_directory).map_err(|error| error.to_string())?;
+        Ok(true)
     }
 
     pub(crate) fn load_resource(&self) -> ResourceStatus {
@@ -489,6 +502,130 @@ impl MeetingStore {
         tasks
     }
 
+    /// Clear completed task records only. Active recording/transcription work
+    /// must remain indexed so its background worker can keep updating it.
+    /// User-owned WAV/TXT/transcript files are deliberately left untouched.
+    pub(crate) fn clear_task_records(&self) -> Result<usize, String> {
+        let mut cleared = 0usize;
+        let entries =
+            fs::read_dir(self.root.join(TASKS_DIR_NAME)).map_err(|error| error.to_string())?;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|value| value.to_str()) != Some("json") {
+                continue;
+            }
+            if fs::read(&path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<MeetingTask>(&bytes).ok())
+                .is_some_and(|task| task.state.is_active())
+            {
+                continue;
+            }
+            fs::remove_file(&path).map_err(|error| error.to_string())?;
+            cleared += 1;
+        }
+        if !self.load_task().is_some_and(|task| task.state.is_active()) {
+            match fs::remove_file(self.root.join(TASK_FILE)) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+        Ok(cleared)
+    }
+
+    /// Keep only the newest local audio copies while preserving transcripts and
+    /// record metadata. Cleared task lists are covered by scanning the current
+    /// audio directory directly.
+    pub(crate) fn prune_recording_audio(&self, keep: usize) -> Result<usize, String> {
+        let tasks = self.load_task_records();
+        let mut candidates = HashMap::<PathBuf, u64>::new();
+        let mut directories = HashSet::from([self.recordings_root().join(AUDIO_DIR_NAME)]);
+        for task in &tasks {
+            let Some(path) = task.audio_path.as_deref().map(PathBuf::from) else {
+                continue;
+            };
+            if let Some(parent) = path.parent() {
+                directories.insert(parent.to_path_buf());
+            }
+            candidates.insert(path, parse_rfc3339_millis(&task.created_at).unwrap_or(0));
+        }
+        for directory in directories {
+            let Ok(entries) = fs::read_dir(directory) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if !path
+                    .extension()
+                    .and_then(|value| value.to_str())
+                    .is_some_and(is_supported_audio_extension)
+                {
+                    continue;
+                }
+                candidates.entry(path).or_insert_with(|| {
+                    entry
+                        .metadata()
+                        .and_then(|value| value.modified())
+                        .ok()
+                        .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
+                        .map(|value| value.as_millis() as u64)
+                        .unwrap_or(0)
+                });
+            }
+        }
+        let mut ordered = candidates.into_iter().collect::<Vec<_>>();
+        ordered.sort_by(|left, right| right.1.cmp(&left.1));
+        let mut removed = HashSet::new();
+        for (path, _) in ordered.into_iter().skip(keep) {
+            match fs::remove_file(&path) {
+                Ok(()) => {
+                    removed.insert(path);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    removed.insert(path);
+                }
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+        self.clear_removed_audio_references(&tasks, &removed)?;
+        Ok(removed.len())
+    }
+
+    fn clear_removed_audio_references(
+        &self,
+        tasks: &[MeetingTask],
+        removed: &HashSet<PathBuf>,
+    ) -> Result<(), String> {
+        for task in tasks {
+            if !task
+                .audio_path
+                .as_deref()
+                .map(PathBuf::from)
+                .is_some_and(|path| removed.contains(&path))
+            {
+                continue;
+            }
+            let mut next = task.clone();
+            next.audio_path = None;
+            next.audio_bytes = None;
+            self.save_task_record(&next)?;
+        }
+        if let Some(mut current) = self.load_task() {
+            if current
+                .audio_path
+                .as_deref()
+                .map(PathBuf::from)
+                .is_some_and(|path| removed.contains(&path))
+            {
+                current.audio_path = None;
+                current.audio_bytes = None;
+                self.save_task(&current)?;
+            }
+        }
+        Ok(())
+    }
+
     fn ensure_transcript_text_file(&self, task: &mut MeetingTask) {
         if task
             .transcript_path
@@ -515,6 +652,15 @@ impl MeetingStore {
             .ok()
             .and_then(|bytes| serde_json::from_slice(&bytes).ok())
             .unwrap_or_default();
+        let legacy_default = self.default_recordings_root.join("Snack会议");
+        if settings
+            .storage_directory
+            .as_deref()
+            .is_some_and(|path| PathBuf::from(path) == legacy_default)
+        {
+            settings.storage_directory =
+                Some(self.default_recordings_root.to_string_lossy().into());
+        }
         if settings
             .storage_directory
             .as_deref()
@@ -526,6 +672,9 @@ impl MeetingStore {
         if settings.notes_prompt.trim().is_empty() {
             settings.notes_prompt = default_meeting_notes_prompt();
         }
+        if settings.shortcut == "CommandOrControl+Shift+R" {
+            settings.shortcut = "CommandOrControl+R".to_string();
+        }
         settings
     }
 
@@ -535,8 +684,10 @@ impl MeetingStore {
         if !recordings_root.is_absolute() {
             return Err("录音保存位置必须是完整的文件夹路径".to_string());
         }
-        self.ensure_recording_directories_for(settings)
-            .map_err(|error| format!("无法使用所选录音保存位置: {error}"))
+        if !recordings_root.is_dir() {
+            return Err("录音保存位置不存在或不是文件夹".to_string());
+        }
+        Ok(())
     }
 
     pub(crate) fn save_settings(&self, settings: &MeetingSettings) -> Result<(), String> {
@@ -552,6 +703,44 @@ impl MeetingStore {
             .join(TASKS_DIR_NAME)
             .join(format!("{recording_id}.json"))
     }
+}
+
+pub(crate) fn is_supported_audio_extension(extension: &str) -> bool {
+    matches!(
+        extension.to_ascii_lowercase().as_str(),
+        "wav" | "mp3" | "m4a" | "aac" | "flac" | "ogg" | "opus" | "wma"
+    )
+}
+
+/// Normalize a user-facing record name to the transcript file name written to
+/// the chosen local directory. Names may not escape that directory.
+pub(crate) fn normalize_transcript_file_name(value: &str) -> Result<String, String> {
+    let name = value.trim();
+    if name.is_empty() {
+        return Err("文件名不能为空".to_string());
+    }
+    if name
+        .chars()
+        .any(|character| matches!(character, '/' | '\\' | '\0'))
+        || matches!(name, "." | "..")
+    {
+        return Err("文件名不能包含路径字符".to_string());
+    }
+    let without_txt = name
+        .strip_suffix(".txt")
+        .or_else(|| name.strip_suffix(".TXT"))
+        .unwrap_or(name)
+        .trim();
+    let stem = without_txt
+        .rsplit_once('.')
+        .filter(|(_, extension)| is_supported_audio_extension(extension))
+        .map(|(base, _)| base)
+        .unwrap_or(without_txt)
+        .trim();
+    if stem.is_empty() || matches!(stem, "." | "..") {
+        return Err("文件名不能为空".to_string());
+    }
+    Ok(format!("{stem}.txt"))
 }
 
 pub(crate) fn validate_meeting_settings(settings: &MeetingSettings) -> Result<(), String> {
@@ -662,7 +851,7 @@ mod tests {
         assert!(!TaskState::TranscriptReady.blocks_recording());
         assert!(!TaskState::Ready.blocks_recording());
         assert!(TaskState::Recording.blocks_recording());
-        assert!(TaskState::TranscribingLocal.blocks_recording());
+        assert!(!TaskState::TranscribingLocal.blocks_recording());
     }
 
     #[test]
@@ -670,7 +859,7 @@ mod tests {
         let settings = MeetingSettings::default();
         assert!(settings.retain_audio);
         assert!(!settings.organize_transcripts_by_date);
-        assert_eq!(settings.shortcut, "CommandOrControl+Shift+R");
+        assert_eq!(settings.shortcut, "CommandOrControl+R");
         assert_eq!(settings.notes_prompt, DEFAULT_MEETING_NOTES_PROMPT);
         assert!(validate_meeting_settings(&settings).is_ok());
     }
@@ -719,6 +908,198 @@ mod tests {
         );
 
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn transcript_without_date_organization_is_written_to_the_selected_directory() {
+        let root = std::env::temp_dir().join(format!(
+            "snack-meeting-transcript-root-{}",
+            super::unix_millis()
+        ));
+        let state_root = root.join("state");
+        let recordings_root = root.join("selected");
+        fs::create_dir_all(&state_root).unwrap();
+        fs::create_dir_all(&recordings_root).unwrap();
+        let store = MeetingStore {
+            root: state_root,
+            default_recordings_root: root.join("Desktop"),
+        };
+        let mut settings = MeetingSettings::default();
+        settings.storage_directory = Some(recordings_root.to_string_lossy().into_owned());
+        store.save_settings(&settings).unwrap();
+        let task = MeetingTask::new("rec-1".to_string(), "zh".to_string());
+
+        store.ensure_transcript_output_directory(&task).unwrap();
+        assert_eq!(
+            store.transcript_text_path(&task).parent(),
+            Some(recordings_root.as_path())
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn transcript_name_uses_the_renamed_text_file_name() {
+        assert_eq!(
+            super::normalize_transcript_file_name("产品周会.txt").unwrap(),
+            "产品周会.txt"
+        );
+        assert_eq!(
+            super::normalize_transcript_file_name("产品周会.wav").unwrap(),
+            "产品周会.txt"
+        );
+        assert!(super::normalize_transcript_file_name("../产品周会").is_err());
+    }
+
+    #[test]
+    fn validating_desktop_storage_does_not_create_recording_folders() {
+        let root = std::env::temp_dir().join(format!(
+            "snack-meeting-lazy-storage-{}",
+            super::unix_millis()
+        ));
+        let state_root = root.join("state");
+        let desktop_root = root.join("Desktop");
+        fs::create_dir_all(&state_root).unwrap();
+        fs::create_dir_all(&desktop_root).unwrap();
+        let store = MeetingStore {
+            root: state_root,
+            default_recordings_root: desktop_root.clone(),
+        };
+        let mut settings = MeetingSettings::default();
+        settings.storage_directory = Some(desktop_root.to_string_lossy().into_owned());
+
+        store.prepare_settings(&settings).unwrap();
+        assert!(!desktop_root.join(super::AUDIO_DIR_NAME).exists());
+        assert!(!desktop_root.join(super::TRANSCRIPTS_DIR_NAME).exists());
+
+        assert!(store.ensure_audio_directory().unwrap());
+        assert!(desktop_root.join(super::AUDIO_DIR_NAME).is_dir());
+        assert!(!desktop_root.join(super::TRANSCRIPTS_DIR_NAME).exists());
+        assert!(!store.ensure_audio_directory().unwrap());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn clearing_task_records_preserves_local_audio_and_transcripts() {
+        let root = std::env::temp_dir().join(format!(
+            "snack-meeting-clear-records-{}",
+            super::unix_millis()
+        ));
+        let state_root = root.join("state");
+        let recordings_root = root.join("recordings");
+        fs::create_dir_all(state_root.join(super::TASKS_DIR_NAME)).unwrap();
+        fs::create_dir_all(&recordings_root).unwrap();
+        let store = MeetingStore {
+            root: state_root,
+            default_recordings_root: recordings_root.clone(),
+        };
+        let audio_path = recordings_root.join("rec-1.wav");
+        let transcript_path = recordings_root.join("rec-1.txt");
+        fs::write(&audio_path, b"audio").unwrap();
+        fs::write(&transcript_path, b"transcript").unwrap();
+        let mut task = MeetingTask::new("rec-1".to_string(), "zh".to_string());
+        task.audio_path = Some(audio_path.to_string_lossy().into_owned());
+        task.transcript_path = Some(transcript_path.to_string_lossy().into_owned());
+        store.save_task(&task).unwrap();
+
+        assert_eq!(store.clear_task_records().unwrap(), 1);
+        assert!(store.load_task().is_none());
+        assert!(store.load_task_records().is_empty());
+        assert!(audio_path.exists());
+        assert!(transcript_path.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn clearing_task_records_keeps_active_transcriptions() {
+        let root = std::env::temp_dir().join(format!(
+            "snack-meeting-clear-active-records-{}",
+            super::unix_millis()
+        ));
+        let state_root = root.join("state");
+        let recordings_root = root.join("recordings");
+        fs::create_dir_all(state_root.join(super::TASKS_DIR_NAME)).unwrap();
+        fs::create_dir_all(&recordings_root).unwrap();
+        let store = MeetingStore {
+            root: state_root,
+            default_recordings_root: recordings_root,
+        };
+        let completed = MeetingTask::new("completed".to_string(), "zh".to_string());
+        store.save_task(&completed).unwrap();
+        let mut transcribing = MeetingTask::new("transcribing".to_string(), "zh".to_string());
+        transcribing.state = TaskState::TranscribingLocal;
+        store.save_task_record(&transcribing).unwrap();
+
+        assert_eq!(store.clear_task_records().unwrap(), 1);
+        assert!(store.load_task().is_none());
+        assert!(store.load_task_record("completed").is_none());
+        assert_eq!(
+            store.load_task_record("transcribing").unwrap().state,
+            TaskState::TranscribingLocal
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn audio_retention_keeps_the_latest_ten_without_deleting_transcripts() {
+        let root = std::env::temp_dir().join(format!(
+            "snack-meeting-audio-retention-{}",
+            super::unix_millis()
+        ));
+        let state_root = root.join("state");
+        let recordings_root = root.join("recordings");
+        let audio_root = recordings_root.join(super::AUDIO_DIR_NAME);
+        let transcript_root = recordings_root.join(super::TRANSCRIPTS_DIR_NAME);
+        fs::create_dir_all(state_root.join(super::TASKS_DIR_NAME)).unwrap();
+        fs::create_dir_all(&audio_root).unwrap();
+        fs::create_dir_all(&transcript_root).unwrap();
+        let store = MeetingStore {
+            root: state_root,
+            default_recordings_root: recordings_root,
+        };
+
+        let mut audio_paths = Vec::new();
+        let mut transcript_paths = Vec::new();
+        for index in 0..12 {
+            let audio_path = audio_root.join(format!("rec-{index}.wav"));
+            let transcript_path = transcript_root.join(format!("rec-{index}.txt"));
+            fs::write(&audio_path, format!("audio-{index}")).unwrap();
+            fs::write(&transcript_path, format!("transcript-{index}")).unwrap();
+            let mut task = MeetingTask::new(format!("rec-{index}"), "zh".to_string());
+            task.created_at = format!("2026-08-06T10:00:{index:02}Z");
+            task.updated_at = task.created_at.clone();
+            task.audio_path = Some(audio_path.to_string_lossy().into_owned());
+            task.audio_bytes = Some(7);
+            task.transcript_path = Some(transcript_path.to_string_lossy().into_owned());
+            store.save_task_record(&task).unwrap();
+            audio_paths.push(audio_path);
+            transcript_paths.push(transcript_path);
+        }
+
+        assert_eq!(store.prune_recording_audio(10).unwrap(), 2);
+        assert!(!audio_paths[0].exists());
+        assert!(!audio_paths[1].exists());
+        assert!(audio_paths[2..].iter().all(|path| path.exists()));
+        assert!(transcript_paths.iter().all(|path| path.exists()));
+        assert!(store
+            .load_task_record("rec-0")
+            .unwrap()
+            .audio_path
+            .is_none());
+        assert!(store
+            .load_task_record("rec-1")
+            .unwrap()
+            .audio_path
+            .is_none());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn imported_audio_formats_participate_in_local_retention() {
+        assert!(super::is_supported_audio_extension("MP3"));
+        assert!(super::is_supported_audio_extension("m4a"));
+        assert!(super::is_supported_audio_extension("wav"));
+        assert!(!super::is_supported_audio_extension("txt"));
     }
 
     #[test]

@@ -22,8 +22,8 @@ use screencapturekit::prelude::{
 
 use crate::meeting::audio::WavWriter;
 use crate::meeting::capture::{
-    downmix_f32, mix_chunks, pcm_bytes_to_f32_mono, resample_to_target, CaptureError,
-    CaptureShared, Recorder, CAPTURE_CHUNK_SAMPLES,
+    downmix_f32, mix_chunks, pcm_bytes_to_f32_mono, prepare_audio_output, resample_to_target,
+    CaptureError, CaptureShared, Recorder, CAPTURE_CHUNK_SAMPLES,
 };
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
@@ -44,7 +44,7 @@ pub(crate) fn start_macos_capture(
     let shared = CaptureShared::new(started_millis);
     let (mic_tx, mic_rx) = bounded::<Vec<f32>>(CHANNEL_CAPACITY);
     let (sys_tx, sys_rx) = bounded::<Vec<f32>>(CHANNEL_CAPACITY);
-    let (started_tx, started_rx) = std::sync::mpsc::channel::<Result<(), String>>();
+    let (started_tx, started_rx) = std::sync::mpsc::channel::<Result<(), CaptureError>>();
 
     let audio_for_thread = audio_path.clone();
     let shared_for_thread = Arc::clone(&shared);
@@ -65,14 +65,10 @@ pub(crate) fn start_macos_capture(
                     None
                 };
                 let sc_stream = start_mac_system_audio(sys_tx.clone(), &shared_for_thread)?;
+                prepare_audio_output(&audio_for_thread)?;
                 Ok((mic_stream, sc_stream))
             })();
-            let _ = started_tx.send(
-                start_result
-                    .as_ref()
-                    .map_err(|error| error.message.clone())
-                    .map(|_| ()),
-            );
+            let _ = started_tx.send(start_result.as_ref().map(|_| ()).map_err(|error| error.clone()));
             match start_result {
                 Ok((_mic_stream, _sc_stream)) => {
                     // Keep both native streams alive for the entire writer
@@ -88,10 +84,10 @@ pub(crate) fn start_macos_capture(
 
     match started_rx.recv_timeout(START_TIMEOUT) {
         Ok(Ok(())) => {}
-        Ok(Err(message)) => {
+        Ok(Err(error)) => {
             shared.request_stop();
             let _ = session.join();
-            return Err(CaptureError::start_failed(message));
+            return Err(error);
         }
         Err(_) => {
             shared.request_stop();
@@ -217,8 +213,17 @@ fn start_mac_system_audio(
         .map_err(|_| CaptureError::permission("system_audio", "获取系统音频权限状态失败"))?
         .map_err(|error| {
             let message = error.to_string();
-            if message.contains("not allowed") || message.contains("NotAllowed") {
-                CaptureError::permission("system_audio", "需要屏幕录制权限才能采集系统音频")
+            let normalized = message.to_ascii_lowercase();
+            if normalized.contains("not allowed")
+                || normalized.contains("notallowed")
+                || normalized.contains("denied")
+                || normalized.contains("tcc")
+                || message.contains("用户拒绝")
+            {
+                CaptureError::permission(
+                    "system_audio",
+                    "当前 Snack 未获得系统音频权限，请允许屏幕与系统录音后完全退出并重新打开 Snack",
+                )
             } else {
                 CaptureError::start_failed(format!("无法访问系统音频: {message}"))
             }

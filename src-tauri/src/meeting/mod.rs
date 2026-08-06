@@ -28,15 +28,14 @@ use std::sync::{Arc, Mutex};
 
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, WebviewWindow};
-use tauri_plugin_notification::NotificationExt;
 
 use capture::{check_capture_permissions, LiveCaptureStatus, Recorder};
 use catalog::{catalog, platform_label, CatalogModel};
 use install::InstallManager;
 use permissions::{request_mac_permissions, PermissionAccess};
 use state::{
-    now_rfc3339, unix_millis, MeetingSettings, MeetingStore, MeetingTask, ResourceState,
-    ResourceStatus, TaskState, Transcript,
+    normalize_transcript_file_name, now_rfc3339, unix_millis, MeetingSettings, MeetingStore,
+    MeetingTask, ResourceState, ResourceStatus, TaskState, Transcript,
 };
 
 const STATE_EVENT: &str = "meeting-state";
@@ -187,6 +186,7 @@ pub(crate) fn initialize(app: &AppHandle) -> Result<(), String> {
 }
 
 fn reconcile_tasks(app: &AppHandle, store: &MeetingStore) {
+    let current_task_id = store.load_task().map(|task| task.recording_id);
     if let Some(mut task) = store.load_task() {
         if normalize_chat_handoff_state(&mut task) {
             let _ = store.save_task(&task);
@@ -197,8 +197,26 @@ fn reconcile_tasks(app: &AppHandle, store: &MeetingStore) {
         if normalize_chat_handoff_state(&mut task) {
             let _ = store.save_task_progress(&task);
         }
+        if task.state == TaskState::TranscribingLocal
+            && current_task_id.as_deref() != Some(task.recording_id.as_str())
+        {
+            spawn_transcription(
+                app.clone(),
+                store.clone_for_task(),
+                task.recording_id.clone(),
+            );
+        }
     }
     reconcile_current_task(app, store);
+    if let Err(error) = store.prune_recording_audio(10) {
+        crate::logging::write_app_log(
+            app,
+            "warn",
+            "meeting",
+            "old meeting audio could not be pruned",
+            Some(&serde_json::json!({ "error": error })),
+        );
+    }
 }
 
 /// Meeting notes are now produced by handing the local transcript to Snack
@@ -246,7 +264,11 @@ fn reconcile_current_task(app: &AppHandle, store: &MeetingStore) {
                             task.updated_at = now;
                             let _ = store.save_task(&task);
                             emit_state(app, store);
-                            spawn_transcription(app.clone(), store.clone_for_task());
+                            spawn_transcription(
+                                app.clone(),
+                                store.clone_for_task(),
+                                task.recording_id.clone(),
+                            );
                         }
                         Err(message) => {
                             task.state = TaskState::CaptureFailed;
@@ -269,7 +291,11 @@ fn reconcile_current_task(app: &AppHandle, store: &MeetingStore) {
             task.updated_at = now_rfc3339();
             let _ = store.save_task(&task);
             emit_state(app, store);
-            spawn_transcription(app.clone(), store.clone_for_task());
+            spawn_transcription(
+                app.clone(),
+                store.clone_for_task(),
+                task.recording_id.clone(),
+            );
         }
         _ => {}
     }
@@ -290,6 +316,26 @@ pub(crate) fn meeting_get_snapshot(
 }
 
 #[tauri::command]
+pub(crate) fn meeting_clear_task_records(
+    app: AppHandle,
+    window: WebviewWindow,
+) -> Result<(), String> {
+    require_allowed_window(&window)?;
+    let state = app.state::<MeetingManagerState>();
+    let current_task_active = state
+        .store
+        .load_task()
+        .is_some_and(|task| task.state.is_active());
+    state.store.prune_recording_audio(10)?;
+    state.store.clear_task_records()?;
+    if !current_task_active {
+        overlay::hide_overlay(&app);
+    }
+    emit_state(&app, &state.store);
+    Ok(())
+}
+
+#[tauri::command]
 pub(crate) async fn meeting_choose_storage_directory(
     window: WebviewWindow,
 ) -> Result<Option<String>, String> {
@@ -299,6 +345,82 @@ pub(crate) async fn meeting_choose_storage_directory(
         .pick_folder()
         .await
         .map(|folder| folder.path().to_string_lossy().to_string()))
+}
+
+#[tauri::command]
+pub(crate) async fn meeting_import_audio(
+    app: AppHandle,
+    window: WebviewWindow,
+) -> Result<Option<String>, String> {
+    require_allowed_window(&window)?;
+    let state = app.state::<MeetingManagerState>();
+    let store = state.store.clone_for_task();
+    if store.load_resource().state != ResourceState::Ready {
+        return Err("请先在录音设置中下载并安装本地模型".to_string());
+    }
+    let Some(file) = rfd::AsyncFileDialog::new()
+        .set_title("选择需要本地转写的音频")
+        .add_filter(
+            "音频文件",
+            &["wav", "mp3", "m4a", "aac", "flac", "ogg", "opus", "wma"],
+        )
+        .pick_file()
+        .await
+    else {
+        return Ok(None);
+    };
+    let source = file.path();
+    let extension = source
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(str::to_ascii_lowercase)
+        .filter(|value| state::is_supported_audio_extension(value))
+        .ok_or_else(|| "请选择 WAV、MP3、M4A、AAC、FLAC、OGG、OPUS 或 WMA 音频文件".to_string())?;
+    let source_bytes = fs::metadata(source)
+        .map_err(|error| format!("无法读取所选音频: {error}"))?
+        .len();
+    match install::free_disk_bytes(&store) {
+        Ok(free) if free < source_bytes.saturating_add(MIN_RECORDING_DISK_BYTES) => {
+            return Err("磁盘空间不足，无法导入音频".to_string());
+        }
+        Err(message) => return Err(format!("无法检查磁盘空间: {message}")),
+        _ => {}
+    }
+
+    let audio_directory_created = store.ensure_audio_directory()?;
+    let recording_id = generate_recording_id();
+    let destination = store.imported_audio_path(&recording_id, &extension);
+    if let Err(error) = fs::copy(source, &destination) {
+        cleanup_failed_audio_import(&store, &destination, audio_directory_created);
+        return Err(format!("无法导入所选音频: {error}"));
+    }
+
+    let now = now_rfc3339();
+    let mut task = MeetingTask::new(recording_id.clone(), "zh".to_string());
+    task.display_name = source
+        .file_stem()
+        .and_then(|name| normalize_transcript_file_name(&name.to_string_lossy()).ok());
+    task.state = TaskState::TranscribingLocal;
+    task.started_at = Some(now.clone());
+    task.ended_at = Some(now);
+    task.audio_path = Some(destination.to_string_lossy().into_owned());
+    task.audio_bytes = Some(source_bytes);
+    if let Err(error) = store.save_task_record(&task) {
+        cleanup_failed_audio_import(&store, &destination, audio_directory_created);
+        return Err(error);
+    }
+    if let Err(error) = store.prune_recording_audio(10) {
+        crate::logging::write_app_log(
+            &app,
+            "warn",
+            "meeting-import",
+            "old meeting audio could not be pruned",
+            Some(&serde_json::json!({ "error": error })),
+        );
+    }
+    emit_state(&app, &store);
+    spawn_transcription(app, store, recording_id.clone());
+    Ok(Some(recording_id))
 }
 
 #[tauri::command]
@@ -379,14 +501,17 @@ pub(crate) fn meeting_uninstall_model(
     let state = app.state::<MeetingManagerState>();
     let store = &state.store;
 
-    // Blocked while recording or transcribing.
-    if let Some(task) = store.load_task() {
-        if matches!(
+    // The model must stay in place while any capture or local transcription is active.
+    if store.load_task_records().iter().any(|task| {
+        matches!(
             task.state,
-            TaskState::Recording | TaskState::TranscribingLocal | TaskState::Finalizing
-        ) {
-            return Err("录音或转写进行中，无法卸载模型".to_string());
-        }
+            TaskState::Checking
+                | TaskState::Recording
+                | TaskState::Finalizing
+                | TaskState::TranscribingLocal
+        )
+    }) {
+        return Err("录音或转写进行中，无法卸载模型".to_string());
     }
 
     let resource = store.load_resource();
@@ -418,13 +543,12 @@ pub(crate) fn meeting_check_permissions(
 }
 
 #[tauri::command]
-pub(crate) fn meeting_request_quick_recording(
+pub(crate) async fn meeting_request_quick_recording(
     app: AppHandle,
     window: WebviewWindow,
 ) -> Result<(), String> {
     require_allowed_window(&window)?;
-    quick_access::request_quick_recording(&app);
-    Ok(())
+    quick_access::request_quick_recording_and_wait(app).await
 }
 
 #[tauri::command]
@@ -458,9 +582,54 @@ pub(crate) async fn meeting_start_recording(
 }
 
 pub(crate) async fn start_quick_recording(app: AppHandle) -> Result<(), String> {
+    let (current_microphone, current_system_audio) = current_permission_statuses()?;
+    if can_attempt_recording_without_permission_request(current_microphone, current_system_audio) {
+        return start_recording(app, Some("zh".to_string()), true);
+    }
+
+    // CoreGraphics can report a stale false value after the Screen & System
+    // Audio Recording switch is enabled. Let the actual ScreenCaptureKit
+    // recorder make the definitive check only after the user presses Record.
+    if current_microphone == PermissionAccess::Granted
+        && current_system_audio == PermissionAccess::Unknown
+    {
+        match start_recording(app.clone(), Some("zh".to_string()), true) {
+            Ok(()) => return Ok(()),
+            Err(error) if is_system_audio_permission_error(&error) => {}
+            Err(error) => return Err(error),
+        }
+    }
+
     let (microphone, system_audio) = request_capture_permissions(&app).await?;
     ensure_quick_recording_permissions(&app, microphone, system_audio)?;
     start_recording(app, Some("zh".to_string()), true)
+}
+
+fn is_system_audio_permission_error(error: &str) -> bool {
+    error.contains("系统音频") || error.contains("屏幕与系统录音")
+}
+
+fn current_permission_statuses() -> Result<(PermissionAccess, PermissionAccess), String> {
+    #[cfg(target_os = "macos")]
+    {
+        Ok(permissions::check_mac_permission_statuses())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let (microphone, system_audio) =
+            check_capture_permissions().map_err(|error| error.to_string())?;
+        Ok((
+            PermissionAccess::from_granted(microphone),
+            PermissionAccess::from_granted(system_audio),
+        ))
+    }
+}
+
+fn can_attempt_recording_without_permission_request(
+    microphone: PermissionAccess,
+    system_audio: PermissionAccess,
+) -> bool {
+    microphone == PermissionAccess::Granted && system_audio == PermissionAccess::Granted
 }
 
 async fn request_capture_permissions(
@@ -551,7 +720,6 @@ fn start_recording(
     }
 
     let language = language.unwrap_or_else(|| "zh".to_string());
-    store.ensure_recording_directories()?;
     let recording_id = generate_recording_id();
     let mut task = MeetingTask::new(recording_id.clone(), language);
     task.state = TaskState::Checking;
@@ -586,6 +754,11 @@ fn start_recording(
             task.error = Some(error.message.clone());
             store.save_task(&task)?;
             emit_state(&app, store);
+            if error.kind == capture::CaptureErrorKind::PermissionDenied {
+                if let Some(permission) = error.missing_permission {
+                    let _ = open_permission_settings(&app, permission);
+                }
+            }
             Err(error.message)
         }
     }
@@ -630,10 +803,7 @@ fn stop_recording(app: AppHandle, source: &str) -> Result<(), String> {
     task.state = TaskState::Finalizing;
     store.save_task(&task)?;
     emit_state(&app, &store);
-    update_overlay_if_present(
-        &app,
-        overlay::OverlayState::transcribing(task.recording_id.clone(), 0),
-    );
+    overlay::hide_overlay(&app);
 
     crate::logging::write_app_log(
         &app,
@@ -683,15 +853,21 @@ fn finalize_recording(app: AppHandle, store: MeetingStore, recorder: Recorder) {
     task.ended_at = Some(now_rfc3339());
     task.audio_bytes = fs::metadata(&audio_path).ok().map(|meta| meta.len());
     task.error = None;
-    if let Err(message) = store.save_task(&task) {
+    if let Err(message) = store.save_task_record(&task) {
         fail_finalize(&app, &store, message);
         return;
     }
+    store.delete_task_file();
+    if let Err(message) = store.prune_recording_audio(10) {
+        crate::logging::write_app_log(
+            &app,
+            "warn",
+            "meeting-finalize",
+            "old meeting audio could not be pruned",
+            Some(&serde_json::json!({ "error": message })),
+        );
+    }
     emit_state(&app, &store);
-    update_overlay_if_present(
-        &app,
-        overlay::OverlayState::transcribing(task.recording_id.clone(), 0),
-    );
     crate::logging::write_app_log(
         &app,
         "info",
@@ -699,7 +875,7 @@ fn finalize_recording(app: AppHandle, store: MeetingStore, recorder: Recorder) {
         "recording finalized and transcription started",
         Some(&serde_json::json!({ "recordingId": task.recording_id })),
     );
-    spawn_transcription(app, store);
+    spawn_transcription(app, store, task.recording_id);
 }
 
 fn fail_finalize(app: &AppHandle, store: &MeetingStore, message: String) {
@@ -709,7 +885,7 @@ fn fail_finalize(app: &AppHandle, store: &MeetingStore, message: String) {
         task.error = Some(message.clone());
         let _ = store.save_task(&task);
         emit_state(app, store);
-        update_overlay_if_present(app, overlay::OverlayState::failed(recording_id, message));
+        notifications::notify_transcript_failed(app, &recording_id);
     }
 }
 
@@ -755,7 +931,7 @@ pub(crate) fn meeting_retry_pipeline(app: AppHandle, window: WebviewWindow) -> R
             task.error = None;
             store.save_task(&task)?;
             emit_state(&app, &store);
-            spawn_transcription(app, store);
+            spawn_transcription(app, store, task.recording_id);
             Ok(())
         }
         TaskState::TranscriptionFailed => {
@@ -763,7 +939,7 @@ pub(crate) fn meeting_retry_pipeline(app: AppHandle, window: WebviewWindow) -> R
             task.error = None;
             store.save_task(&task)?;
             emit_state(&app, &store);
-            spawn_transcription(app, store);
+            spawn_transcription(app, store, task.recording_id);
             Ok(())
         }
         _ => Err("当前状态不允许重试".to_string()),
@@ -799,18 +975,47 @@ pub(crate) fn meeting_open_notes_in_chat(
     recording_id: String,
 ) -> Result<(), String> {
     require_allowed_window(&window)?;
+    open_notes_in_chat(&app, &recording_id, false)
+}
+
+pub(crate) fn open_notes_from_notification(
+    app: &AppHandle,
+    recording_id: &str,
+) -> Result<(), String> {
+    open_notes_in_chat(app, recording_id, true)
+}
+
+fn open_notes_in_chat(
+    app: &AppHandle,
+    recording_id: &str,
+    auto_submit: bool,
+) -> Result<(), String> {
     let state = app.state::<MeetingManagerState>();
     let task = state
         .store
-        .load_task_record(&recording_id)
+        .load_task_record(recording_id)
         .ok_or_else(|| "没有找到本地转写记录".to_string())?;
     let transcript = task
         .transcript
         .as_ref()
         .ok_or_else(|| "本地转写尚未完成".to_string())?;
     let settings = state.store.load_settings();
-    let prompt = build_notes_chat_prompt(&settings.notes_prompt, transcript);
-    crate::record_import::open_prefill(&app, prompt)?;
+    let transcript_name = task
+        .transcript_path
+        .as_deref()
+        .and_then(|path| {
+            PathBuf::from(path)
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+        })
+        .unwrap_or_else(|| format!("Snack会议-{}.txt", task.recording_id));
+    crate::record_import::open_prefill_with_attachment(
+        &app,
+        settings.notes_prompt,
+        transcript_name,
+        state::transcript_text(transcript),
+        auto_submit,
+    )?;
     overlay::hide_overlay(&app);
     Ok(())
 }
@@ -837,7 +1042,44 @@ pub(crate) fn meeting_open_local_file(
     if !path.exists() {
         return Err("本地文件不存在".to_string());
     }
-    crate::platform::open_path(&path)
+    if kind == "transcript" {
+        crate::platform::reveal_path(&path)
+    } else {
+        crate::platform::open_path(&path)
+    }
+}
+
+#[tauri::command]
+pub(crate) fn meeting_rename_task_record(
+    app: AppHandle,
+    window: WebviewWindow,
+    recording_id: String,
+    display_name: String,
+) -> Result<(), String> {
+    require_allowed_window(&window)?;
+    let state = app.state::<MeetingManagerState>();
+    let store = state.store.clone_for_task();
+    let mut task = store
+        .load_task_record(&recording_id)
+        .ok_or_else(|| "没有找到本地转写记录".to_string())?;
+    let display_name = normalize_transcript_file_name(&display_name)?;
+
+    if let Some(current_path) = task.transcript_path.as_deref().map(PathBuf::from) {
+        let next_path = current_path.with_file_name(&display_name);
+        if next_path != current_path {
+            if next_path.exists() {
+                return Err("同名转写文件已存在，请换一个名称".to_string());
+            }
+            fs::rename(&current_path, &next_path)
+                .map_err(|error| format!("无法重命名本地转写文件: {error}"))?;
+            task.transcript_path = Some(next_path.to_string_lossy().into_owned());
+        }
+    }
+    task.display_name = Some(display_name);
+    task.updated_at = now_rfc3339();
+    store.save_task_progress(&task)?;
+    emit_state(&app, &store);
+    Ok(())
 }
 
 #[tauri::command]
@@ -849,12 +1091,6 @@ pub(crate) fn meeting_retranscribe(
     require_allowed_window(&window)?;
     let state = app.state::<MeetingManagerState>();
     let store = state.store.clone_for_task();
-    if store
-        .load_task()
-        .is_some_and(|task| task.recording_id != recording_id && task.state.blocks_recording())
-    {
-        return Err("另一个录音或转写任务正在进行中".to_string());
-    }
     let mut task = store
         .load_task_record(&recording_id)
         .ok_or_else(|| "没有找到本地录音".to_string())?;
@@ -864,15 +1100,26 @@ pub(crate) fn meeting_retranscribe(
         .map(PathBuf::from)
         .filter(|path| path.exists())
         .ok_or_else(|| "源录音文件不存在".to_string())?;
-    let (_, duration_ms) = audio::read_wav_i16(&audio_path)
-        .map_err(|message| format!("源录音文件无法读取: {message}"))?;
+    let duration_ms = if audio_path
+        .extension()
+        .and_then(|value| value.to_str())
+        .is_some_and(|value| value.eq_ignore_ascii_case("wav"))
+    {
+        Some(
+            audio::read_wav_i16(&audio_path)
+                .map_err(|message| format!("源录音文件无法读取: {message}"))?
+                .1,
+        )
+    } else {
+        task.duration_ms
+    };
     task.state = TaskState::TranscribingLocal;
-    task.duration_ms = Some(duration_ms);
+    task.duration_ms = duration_ms;
     task.error = None;
     task.updated_at = now_rfc3339();
-    store.save_task(&task)?;
+    store.save_task_progress(&task)?;
     emit_state(&app, &store);
-    spawn_transcription(app, store);
+    spawn_transcription(app, store, recording_id);
     Ok(())
 }
 
@@ -880,7 +1127,7 @@ pub(crate) fn meeting_retranscribe(
 // Transcription orchestration
 // ---------------------------------------------------------------------------
 
-fn spawn_transcription(app: AppHandle, store: MeetingStore) {
+fn spawn_transcription(app: AppHandle, store: MeetingStore, recording_id: String) {
     std::thread::Builder::new()
         .name("snack-transcribe".to_string())
         .spawn(move || {
@@ -892,62 +1139,47 @@ fn spawn_transcription(app: AppHandle, store: MeetingStore) {
             {
                 Some(key) => key,
                 None => {
-                    let mut task = store.load_task().unwrap();
-                    let recording_id = task.recording_id.clone();
+                    let mut task = store.load_task_record(&recording_id).unwrap();
                     let message = "本地模型未安装".to_string();
                     task.state = TaskState::TranscriptionFailed;
                     task.error = Some(message.clone());
-                    let _ = store.save_task(&task);
+                    let _ = store.save_task_progress(&task);
                     emit_state(&app, &store);
-                    update_overlay_if_present(
-                        &app,
-                        overlay::OverlayState::failed(recording_id, message),
-                    );
+                    notifications::notify_transcript_failed(&app, &recording_id);
                     return;
                 }
             };
             let model_path = match install::installed_model_path(&store, &resource) {
                 Ok(path) => path,
                 Err(message) => {
-                    let mut task = store.load_task().unwrap();
-                    let recording_id = task.recording_id.clone();
+                    let mut task = store.load_task_record(&recording_id).unwrap();
                     task.state = TaskState::TranscriptionFailed;
                     task.error = Some(message.clone());
-                    let _ = store.save_task(&task);
+                    let _ = store.save_task_progress(&task);
                     emit_state(&app, &store);
-                    update_overlay_if_present(
-                        &app,
-                        overlay::OverlayState::failed(recording_id, message),
-                    );
+                    notifications::notify_transcript_failed(&app, &recording_id);
                     return;
                 }
             };
             let Some(model_dir) = model_path.parent().map(PathBuf::from) else {
-                let mut task = store.load_task().unwrap();
+                let mut task = store.load_task_record(&recording_id).unwrap();
                 let message = "本地模型路径无效".to_string();
                 task.state = TaskState::TranscriptionFailed;
                 task.error = Some(message.clone());
-                let _ = store.save_task(&task);
+                let _ = store.save_task_progress(&task);
                 emit_state(&app, &store);
-                update_overlay_if_present(
-                    &app,
-                    overlay::OverlayState::failed(task.recording_id, message),
-                );
+                notifications::notify_transcript_failed(&app, &task.recording_id);
                 return;
             };
 
-            let mut task = store.load_task().unwrap();
-            let recording_id = task.recording_id.clone();
+            let mut task = store.load_task_record(&recording_id).unwrap();
             if let Err(message) = store.ensure_transcript_output_directory(&task) {
                 let message = format!("无法创建当天转写目录: {message}");
                 task.state = TaskState::TranscriptionFailed;
                 task.error = Some(message.clone());
-                let _ = store.save_task(&task);
+                let _ = store.save_task_progress(&task);
                 emit_state(&app, &store);
-                update_overlay_if_present(
-                    &app,
-                    overlay::OverlayState::failed(recording_id, message),
-                );
+                notifications::notify_transcript_failed(&app, &recording_id);
                 return;
             }
             let wav_path = match task.audio_path.clone().map(PathBuf::from) {
@@ -956,12 +1188,9 @@ fn spawn_transcription(app: AppHandle, store: MeetingStore) {
                     let message = "录音文件缺失，无法转写".to_string();
                     task.state = TaskState::TranscriptionFailed;
                     task.error = Some(message.clone());
-                    let _ = store.save_task(&task);
+                    let _ = store.save_task_progress(&task);
                     emit_state(&app, &store);
-                    update_overlay_if_present(
-                        &app,
-                        overlay::OverlayState::failed(recording_id, message),
-                    );
+                    notifications::notify_transcript_failed(&app, &recording_id);
                     return;
                 }
             };
@@ -986,16 +1215,9 @@ fn spawn_transcription(app: AppHandle, store: MeetingStore) {
                             "segmentCount": progress.segment_count,
                         }),
                     );
-                    update_overlay_if_present(
-                        &app_for_progress,
-                        overlay::OverlayState::transcribing(
-                            recording_id_for_progress.clone(),
-                            progress.percent,
-                        ),
-                    );
                     // Abort if the task is no longer in transcribing state.
                     store_for_progress
-                        .load_task()
+                        .load_task_record(&recording_id_for_progress)
                         .map(|task| task.state == TaskState::TranscribingLocal)
                         .unwrap_or(false)
                 },
@@ -1011,15 +1233,12 @@ fn spawn_transcription(app: AppHandle, store: MeetingStore) {
                     generated_at: now_rfc3339(),
                 },
                 Err(message) => {
-                    let mut task = store.load_task().unwrap();
+                    let mut task = store.load_task_record(&recording_id).unwrap();
                     task.state = TaskState::TranscriptionFailed;
                     task.error = Some(message.clone());
-                    let _ = store.save_task(&task);
+                    let _ = store.save_task_progress(&task);
                     emit_state(&app, &store);
-                    update_overlay_if_present(
-                        &app,
-                        overlay::OverlayState::failed(recording_id.clone(), message.clone()),
-                    );
+                    notifications::notify_transcript_failed(&app, &recording_id);
                     crate::logging::write_app_log(
                         &app,
                         "error",
@@ -1034,28 +1253,30 @@ fn spawn_transcription(app: AppHandle, store: MeetingStore) {
             };
 
             // Atomically persist the transcript and retain the user-owned audio.
-            let mut task = match store.load_task() {
+            let mut task = match store.load_task_record(&recording_id) {
                 Some(task) => task,
                 None => return,
             };
             if let Err(message) = network::persist_transcript(&store, &mut task, transcript) {
                 task.state = TaskState::TranscriptionFailed;
                 task.error = Some(message.clone());
-                let _ = store.save_task(&task);
+                let _ = store.save_task_progress(&task);
                 emit_state(&app, &store);
-                update_overlay_if_present(
-                    &app,
-                    overlay::OverlayState::failed(recording_id.clone(), message),
-                );
+                notifications::notify_transcript_failed(&app, &recording_id);
                 return;
             }
             task.state = TaskState::TranscriptReady;
+            if task.duration_ms.is_none() {
+                task.duration_ms = task
+                    .transcript
+                    .as_ref()
+                    .and_then(|value| value.segments.iter().map(|segment| segment.end_ms).max());
+            }
             task.error = None;
             task.updated_at = now_rfc3339();
-            let _ = store.save_task(&task);
+            let _ = store.save_task_progress(&task);
             emit_state(&app, &store);
-            update_overlay_if_present(&app, overlay::OverlayState::ready(recording_id.clone()));
-            notify_transcript_ready(&app, &recording_id);
+            notifications::notify_transcript_ready(&app, &recording_id);
         })
         .expect("failed to spawn transcription thread");
 }
@@ -1088,26 +1309,6 @@ fn generate_notes(app: AppHandle, store: MeetingStore, recording_id: String) -> 
         }
     });
     Ok(())
-}
-
-fn notify_transcript_ready(app: &AppHandle, recording_id: &str) {
-    let _ = app
-        .notification()
-        .builder()
-        .title("Snack 会议转写完成")
-        .body("可在录音浮窗中一键打开 Snack，生成会议纪要。")
-        .group(recording_id)
-        .show();
-}
-
-// ---------------------------------------------------------------------------
-// Overlay updater
-// ---------------------------------------------------------------------------
-
-fn update_overlay_if_present(app: &AppHandle, state: overlay::OverlayState) {
-    if let Some(window) = app.get_webview_window(overlay::OVERLAY_LABEL) {
-        overlay::update_overlay(&window, state);
-    }
 }
 
 fn spawn_overlay_updater(app: AppHandle, recording_id: String) {
@@ -1150,14 +1351,6 @@ fn spawn_overlay_updater(app: AppHandle, recording_id: String) {
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn build_notes_chat_prompt(notes_prompt: &str, transcript: &Transcript) -> String {
-    format!(
-        "{}\n\n{}",
-        notes_prompt.trim(),
-        state::transcript_text(transcript)
-    )
-}
-
 fn require_allowed_window(window: &WebviewWindow) -> Result<(), String> {
     if overlay::is_overlay_window(window) {
         return Ok(());
@@ -1174,6 +1367,17 @@ fn generate_recording_id() -> String {
     let counter = RECORDING_ID_COUNTER.fetch_add(1, Ordering::SeqCst);
     let process = std::process::id();
     format!("rec-{}-{}-{}", unix_millis(), process, counter)
+}
+
+fn cleanup_failed_audio_import(
+    store: &MeetingStore,
+    destination: &std::path::Path,
+    audio_directory_created: bool,
+) {
+    let _ = fs::remove_file(destination);
+    if audio_directory_created {
+        let _ = fs::remove_dir(store.audio_directory());
+    }
 }
 
 fn open_permission_settings(_app: &AppHandle, permission: &str) -> Result<(), String> {
@@ -1202,10 +1406,31 @@ fn open_permission_settings(_app: &AppHandle, permission: &str) -> Result<(), St
 
 #[cfg(test)]
 mod tests {
-    use super::state::TranscriptSegment;
+    use super::permissions::PermissionAccess;
     use super::{
-        build_notes_chat_prompt, normalize_chat_handoff_state, MeetingTask, TaskState, Transcript,
+        can_attempt_recording_without_permission_request, normalize_chat_handoff_state,
+        MeetingTask, TaskState, Transcript,
     };
+
+    #[test]
+    fn quick_recording_requests_any_permission_that_is_not_preflight_granted() {
+        assert!(can_attempt_recording_without_permission_request(
+            PermissionAccess::Granted,
+            PermissionAccess::Granted
+        ));
+        assert!(!can_attempt_recording_without_permission_request(
+            PermissionAccess::Granted,
+            PermissionAccess::Unknown
+        ));
+        assert!(!can_attempt_recording_without_permission_request(
+            PermissionAccess::Unknown,
+            PermissionAccess::Granted
+        ));
+        assert!(!can_attempt_recording_without_permission_request(
+            PermissionAccess::Granted,
+            PermissionAccess::Denied
+        ));
+    }
 
     #[test]
     fn legacy_server_states_return_to_local_transcript_ready() {
@@ -1243,35 +1468,5 @@ mod tests {
         task.state = TaskState::TranscribingLocal;
         assert!(!normalize_chat_handoff_state(&mut task));
         assert_eq!(task.state, TaskState::TranscribingLocal);
-    }
-
-    #[test]
-    fn editable_prompt_and_timestamped_transcript_share_one_handoff_payload() {
-        let transcript = Transcript {
-            text: "第一段第二段".to_string(),
-            language: "zh".to_string(),
-            segments: vec![
-                TranscriptSegment {
-                    start_ms: 0,
-                    end_ms: 1_200,
-                    speaker: "说话人 1".to_string(),
-                    text: "第一段".to_string(),
-                },
-                TranscriptSegment {
-                    start_ms: 65_000,
-                    end_ms: 68_000,
-                    speaker: "说话人 2".to_string(),
-                    text: "第二段".to_string(),
-                },
-            ],
-            model_key: "small".to_string(),
-            engine: "whisper.cpp".to_string(),
-            generated_at: "2026-08-04T14:00:00+08:00".to_string(),
-        };
-
-        assert_eq!(
-            build_notes_chat_prompt("请生成我的会议纪要", &transcript),
-            "请生成我的会议纪要\n\n[00:00] 说话人 1：第一段\n[01:05] 说话人 2：第二段"
-        );
     }
 }

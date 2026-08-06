@@ -3,8 +3,8 @@
 //! - Microphone: `AVCaptureDevice authorizationStatusForMediaType:` — exact,
 //!   non-prompting status (notDetermined/restricted/denied/authorized).
 //! - Screen recording (required for system audio capture): CoreGraphics
-//!   preflight/request APIs, which avoid conflating display enumeration
-//!   failures with permission denial.
+//!   preflight/request APIs, which avoid turning an ordinary status check into
+//!   a user-visible privacy request during app startup.
 
 #[cfg(target_os = "macos")]
 use tauri::AppHandle;
@@ -58,7 +58,6 @@ pub(crate) fn check_mac_permission_statuses() -> (PermissionAccess, PermissionAc
 
     let system_audio = {
         use core_graphics::access::ScreenCaptureAccess;
-
         if ScreenCaptureAccess.preflight() {
             PermissionAccess::Granted
         } else {
@@ -81,20 +80,19 @@ pub(crate) fn check_mac_permissions() -> (bool, bool) {
 pub(crate) async fn request_mac_permissions(
     app: &AppHandle,
 ) -> Result<(PermissionAccess, PermissionAccess), String> {
-    let (microphone, system_audio) = check_mac_permissions();
-    let mut microphone = PermissionAccess::from_granted(microphone);
+    let (mut microphone, system_audio) = check_mac_permission_statuses();
     if microphone != PermissionAccess::Granted {
-        let current = check_mac_permission_statuses().0;
-        microphone = if current == PermissionAccess::Unknown {
+        microphone = if microphone == PermissionAccess::Unknown {
             request_microphone_permission(app).await?
         } else {
-            current
+            microphone
         };
     }
-    let mut system_audio = PermissionAccess::from_granted(system_audio);
-    if microphone == PermissionAccess::Granted && system_audio != PermissionAccess::Granted {
-        system_audio = request_screen_capture_permission().await?;
-    }
+
+    // Do not call CGRequestScreenCaptureAccess here. On some macOS releases it
+    // displays a prompt even when the privacy switch is already enabled. The
+    // ScreenCaptureKit recorder performs the definitive check only after the
+    // user explicitly starts a recording.
     Ok((microphone, system_audio))
 }
 
@@ -127,15 +125,6 @@ async fn request_microphone_permission(app: &AppHandle) -> Result<PermissionAcce
         Ok(Err(_)) => Err("麦克风权限请求未完成".to_string()),
         Err(_) => Ok(PermissionAccess::Denied),
     }
-}
-
-#[cfg(target_os = "macos")]
-async fn request_screen_capture_permission() -> Result<PermissionAccess, String> {
-    use core_graphics::access::ScreenCaptureAccess;
-
-    tokio::task::spawn_blocking(|| PermissionAccess::from_granted(ScreenCaptureAccess.request()))
-        .await
-        .map_err(|error| format!("无法请求屏幕录制权限: {error}"))
 }
 
 #[cfg(not(target_os = "macos"))]

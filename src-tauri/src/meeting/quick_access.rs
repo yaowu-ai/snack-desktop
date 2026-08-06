@@ -59,17 +59,26 @@ pub(crate) fn handle_shortcut(app: &AppHandle, state: ShortcutState) {
 }
 
 pub(crate) fn request_quick_recording(app: &AppHandle) {
-    if QUICK_RECORDING_PENDING.swap(true, Ordering::SeqCst) {
-        return;
-    }
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
-        let result = super::start_quick_recording(app.clone()).await;
-        QUICK_RECORDING_PENDING.store(false, Ordering::SeqCst);
-        if let Err(message) = result {
+        if let Err(message) = request_quick_recording_and_wait(app.clone()).await {
             notify_quick_recording_error(&app, &message);
         }
     });
+}
+
+/// Runs the quick-recording flow to its real startup result. Webview callers use
+/// this variant so capture and permission failures can be shown in the page
+/// instead of being hidden behind an asynchronous system notification.
+pub(crate) async fn request_quick_recording_and_wait(app: AppHandle) -> Result<(), String> {
+    if QUICK_RECORDING_PENDING.swap(true, Ordering::SeqCst) {
+        return Err("录音正在启动，请稍候".to_string());
+    }
+    // The native entry first checks existing permission state. Fully
+    // authorized users start immediately without entering a request flow.
+    let result = super::start_quick_recording(app).await;
+    QUICK_RECORDING_PENDING.store(false, Ordering::SeqCst);
+    result
 }
 
 fn notify_quick_recording_error(app: &AppHandle, message: &str) {

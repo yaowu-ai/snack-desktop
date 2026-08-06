@@ -3,9 +3,8 @@
 import json
 import os
 import sys
+from contextlib import redirect_stdout
 from pathlib import Path
-
-from funasr import AutoModel
 
 MODEL_NAMES = (
     "iic--speech_seaco_paraformer_large_asr_nat-zh-cn-16k-common-vocab8404-pytorch",
@@ -25,11 +24,18 @@ def model_dir(cache: Path, name: str) -> Path:
 def main() -> None:
     cache = Path(os.environ["MODELSCOPE_CACHE"])
     asr, vad, punc, speaker = (model_dir(cache, name) for name in MODEL_NAMES)
-    model = AutoModel(
-        model=str(asr), vad_model=str(vad), punc_model=str(punc), spk_model=str(speaker),
-        disable_update=True, disable_pbar=True,
-    )
-    result = model.generate(input=str(Path(sys.argv[1])), batch_size_s=300, sentence_timestamp=True)
+    # FunASR and its dependencies print version/progress logs to stdout. Keep
+    # stdout as a machine-readable channel containing only the final JSON.
+    with redirect_stdout(sys.stderr):
+        from funasr import AutoModel
+
+        model = AutoModel(
+            model=str(asr), vad_model=str(vad), punc_model=str(punc), spk_model=str(speaker),
+            disable_update=True, disable_pbar=True,
+        )
+        result = model.generate(
+            input=str(Path(sys.argv[1])), batch_size_s=300, sentence_timestamp=True
+        )
     item = result[0] if result else {}
     text = (item.get("text") or "").strip()
     segments = []
@@ -42,7 +48,8 @@ def main() -> None:
                 "text": value,
                 "speaker": f"说话人 {int(sentence.get('spk', 0)) + 1}",
             })
-    print(json.dumps({"text": text, "segments": segments}, ensure_ascii=False))
+    sys.stdout.write(json.dumps({"text": text, "segments": segments}, ensure_ascii=False))
+    sys.stdout.write("\n")
 
 
 if __name__ == "__main__":

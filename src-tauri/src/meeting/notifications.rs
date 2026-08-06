@@ -2,7 +2,7 @@ use notify_rust::Notification;
 use tauri::{AppHandle, Manager, Url};
 
 const MEETING_SETTINGS_PATH: &str = "/meeting/settings";
-const MEETING_SETTINGS_QUERY: &str = "guide=record";
+const MEETING_RECORDS_PATH: &str = "/meeting";
 
 /// Notify after the user-initiated local transcription resource install finishes.
 /// The notification is created through notify-rust directly because its desktop
@@ -13,12 +13,32 @@ pub(crate) fn notify_model_ready(app: &AppHandle) {
     tauri::async_runtime::spawn_blocking(move || show_model_ready_notification(app));
 }
 
+/// Notify after a local transcription finishes. Clicking the notification
+/// starts a new Snack conversation with the configured prompt and transcript.
+pub(crate) fn notify_transcript_ready(app: &AppHandle, recording_id: &str) {
+    let app = app.clone();
+    let recording_id = recording_id.to_string();
+    tauri::async_runtime::spawn_blocking(move || {
+        show_transcript_ready_notification(app, recording_id)
+    });
+}
+
+/// Notify only after the local pipeline has reached a terminal failure.
+/// Clicking the notification opens the audio transcription task list.
+pub(crate) fn notify_transcript_failed(app: &AppHandle, recording_id: &str) {
+    let app = app.clone();
+    let recording_id = recording_id.to_string();
+    tauri::async_runtime::spawn_blocking(move || {
+        show_transcript_failed_notification(app, recording_id)
+    });
+}
+
 fn show_model_ready_notification(app: AppHandle) {
     configure_notification_identity(&app);
     let result = Notification::new()
-        .summary("Snack 本地转写资源已就绪")
-        .body("现在可以开始会议录音。点击返回 Snack 会议设置页。")
-        .action("open-meeting-settings", "返回会议设置")
+        .summary("模型已经下载完成")
+        .body("完成设置，马上体验 Snack 会议录音。")
+        .action("open-meeting-settings", "完成设置")
         .show();
 
     let handle = match result {
@@ -31,6 +51,55 @@ fn show_model_ready_notification(app: AppHandle) {
     handle.wait_for_action(move |action| handle_notification_action(&app, action));
 }
 
+fn show_transcript_ready_notification(app: AppHandle, recording_id: String) {
+    configure_notification_identity(&app);
+    let result = Notification::new()
+        .summary("音频转写已完成")
+        .body("点击调用 Snack，立即生成会议纪要。")
+        .action("generate-meeting-notes", "生成会议纪要")
+        .show();
+
+    let handle = match result {
+        Ok(handle) => handle,
+        Err(error) => {
+            log_notification_error(&app, &error.to_string());
+            return;
+        }
+    };
+    handle.wait_for_action(move |action| {
+        if should_open_notification(action) {
+            if let Err(error) = super::open_notes_from_notification(&app, &recording_id) {
+                log_notification_error(&app, &error);
+            }
+        }
+    });
+}
+
+fn show_transcript_failed_notification(app: AppHandle, recording_id: String) {
+    configure_notification_identity(&app);
+    let result = Notification::new()
+        .summary("音频转写失败")
+        .body("点击查看音频转写任务并重试。")
+        .action("open-meeting-records", "查看任务")
+        .show();
+
+    let handle = match result {
+        Ok(handle) => handle,
+        Err(error) => {
+            log_notification_error(&app, &error.to_string());
+            return;
+        }
+    };
+    handle.wait_for_action(move |action| {
+        if should_open_notification(action) {
+            if let Err(error) = open_meeting_path(&app, MEETING_RECORDS_PATH) {
+                log_notification_error(&app, &error);
+            }
+        }
+        let _ = recording_id;
+    });
+}
+
 fn configure_notification_identity(app: &AppHandle) {
     #[cfg(target_os = "macos")]
     let _ = notify_rust::set_application(&app.config().identifier);
@@ -39,10 +108,10 @@ fn configure_notification_identity(app: &AppHandle) {
 }
 
 fn handle_notification_action(app: &AppHandle, action: &str) {
-    if !should_open_meeting_settings(action) {
+    if !should_open_notification(action) {
         return;
     }
-    if let Err(error) = open_meeting_settings(app) {
+    if let Err(error) = open_meeting_path(app, MEETING_SETTINGS_PATH) {
         log_notification_error(app, &error);
     }
 }
@@ -57,11 +126,11 @@ fn log_notification_error(app: &AppHandle, error: &str) {
     );
 }
 
-fn should_open_meeting_settings(action: &str) -> bool {
+fn should_open_notification(action: &str) -> bool {
     action != "__closed"
 }
 
-fn open_meeting_settings(app: &AppHandle) -> Result<(), String> {
+fn open_meeting_path(app: &AppHandle, path: &str) -> Result<(), String> {
     let window = app
         .get_webview_window("main")
         .ok_or_else(|| "main webview is unavailable".to_string())?;
@@ -70,7 +139,7 @@ fn open_meeting_settings(app: &AppHandle) -> Result<(), String> {
         return Err("main webview origin is not allowed".to_string());
     }
 
-    let target_url = meeting_settings_url(current_url);
+    let target_url = meeting_url(current_url, path);
     let _ = window.show();
     let _ = window.unminimize();
     crate::window_state::recover_if_unreachable(&window);
@@ -80,9 +149,9 @@ fn open_meeting_settings(app: &AppHandle) -> Result<(), String> {
         .map_err(|error| error.to_string())
 }
 
-fn meeting_settings_url(mut url: Url) -> Url {
-    url.set_path(MEETING_SETTINGS_PATH);
-    url.set_query(Some(MEETING_SETTINGS_QUERY));
+fn meeting_url(mut url: Url, path: &str) -> Url {
+    url.set_path(path);
+    url.set_query(None);
     url.set_fragment(None);
     url
 }
@@ -93,15 +162,22 @@ mod tests {
 
     #[test]
     fn notification_click_targets_guided_meeting_settings() {
-        let url = meeting_settings_url(
+        let url = meeting_url(
             Url::parse("http://localhost:3000/apps?from=test#section").expect("valid URL"),
+            MEETING_SETTINGS_PATH,
         );
-        assert_eq!(
-            url.as_str(),
-            "http://localhost:3000/meeting/settings?guide=record"
+        assert_eq!(url.as_str(), "http://localhost:3000/meeting/settings");
+        assert!(should_open_notification("default"));
+        assert!(should_open_notification("open-meeting-settings"));
+        assert!(!should_open_notification("__closed"));
+    }
+
+    #[test]
+    fn failed_transcription_notification_targets_audio_records() {
+        let url = meeting_url(
+            Url::parse("http://localhost:3000/meeting/settings?from=notice").expect("valid URL"),
+            MEETING_RECORDS_PATH,
         );
-        assert!(should_open_meeting_settings("default"));
-        assert!(should_open_meeting_settings("open-meeting-settings"));
-        assert!(!should_open_meeting_settings("__closed"));
+        assert_eq!(url.as_str(), "http://localhost:3000/meeting");
     }
 }
