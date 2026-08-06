@@ -224,6 +224,13 @@ const tauriConfig = {
   },
 };
 
+// Tauri reads productName while generating the native bundle, so this must be
+// passed through the CLI config layer rather than TAURI_CONFIG. The bundle id
+// stays unchanged to preserve local models and app data.
+const localBuildConfig = operation.localSigning
+  ? JSON.stringify({ ...tauriConfig, productName: "Snack Local" })
+  : null;
+
 const childEnv = {
   ...process.env,
   TAURI_CONFIG: JSON.stringify(tauriConfig),
@@ -240,12 +247,16 @@ if (process.env.SNACK_DESKTOP_BASE_UA) {
   childEnv.SNACK_DESKTOP_BASE_UA = process.env.SNACK_DESKTOP_BASE_UA;
 }
 
-const child = spawn(tauriBin, [operation.command, ...args], {
+const child = spawn(
+  tauriBin,
+  [operation.command, ...args, ...(localBuildConfig ? ["--config", localBuildConfig] : [])],
+  {
   cwd: repoRoot,
   stdio: "inherit",
   env: childEnv,
   shell: process.platform === "win32",
-});
+  },
+);
 
 child.on("exit", (code, signal) => {
   if (signal) {

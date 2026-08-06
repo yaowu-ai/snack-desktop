@@ -59,6 +59,7 @@ pub fn run() {
             meeting::meeting_generate_notes,
             meeting::meeting_open_local_file,
             meeting::meeting_open_notes_in_chat,
+            meeting::meeting_rename_task_record,
             meeting::meeting_install_model,
             meeting::meeting_import_audio,
             meeting::meeting_open_permission_settings,
