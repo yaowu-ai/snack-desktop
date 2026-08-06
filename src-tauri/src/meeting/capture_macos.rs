@@ -269,7 +269,7 @@ fn start_mac_system_audio(
 }
 
 /// Extract f32 mono samples from an SCK audio sample buffer.
-fn sample_buffer_to_f32_mono(sample: &CMSampleBuffer) -> Option<Vec<f32>> {
+pub(super) fn sample_buffer_to_f32_mono(sample: &CMSampleBuffer) -> Option<Vec<f32>> {
     let num_samples = usize::try_from(sample.num_samples()).ok()?;
     if num_samples == 0 {
         return None;

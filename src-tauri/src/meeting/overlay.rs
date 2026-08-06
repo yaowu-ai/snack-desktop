@@ -11,9 +11,12 @@ use tauri::{
 
 pub(crate) const OVERLAY_LABEL: &str = "record_overlay";
 pub(crate) const OVERLAY_SCHEME: &str = "snack-overlay";
+pub(crate) const REMINDER_LABEL: &str = "recording_reminder";
 const OVERLAY_STATE_EVENT: &str = "meeting-overlay-state";
 const OVERLAY_WIDTH: f64 = 248.0;
 const OVERLAY_HEIGHT: f64 = 88.0;
+const REMINDER_WIDTH: f64 = 326.0;
+const REMINDER_HEIGHT: f64 = 116.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -53,10 +56,10 @@ pub(crate) fn serve_overlay_request(
     request: tauri::http::Request<Vec<u8>>,
 ) -> tauri::http::Response<Vec<u8>> {
     let path = request.uri().path();
-    let body = if path == "/" || path == "/index.html" {
-        OVERLAY_HTML.as_bytes().to_vec()
-    } else {
-        Vec::new()
+    let body = match path {
+        "/" | "/index.html" => OVERLAY_HTML.as_bytes().to_vec(),
+        "/reminder.html" => REMINDER_HTML.as_bytes().to_vec(),
+        _ => Vec::new(),
     };
     let status = if body.is_empty() { 404 } else { 200 };
     tauri::http::Response::builder()
@@ -160,6 +163,64 @@ pub(crate) fn hide_overlay(app: &AppHandle) {
     }
 }
 
+/// Show a Snack-owned recording reminder without stealing focus from the
+/// meeting application. The window and its assets are completely local.
+pub(crate) fn show_recording_reminder(
+    app: &AppHandle,
+    application_name: &str,
+) -> Result<(), String> {
+    let application_json = serde_json::to_string(application_name)
+        .map_err(|error| format!("无法显示录音提醒: {error}"))?;
+    if let Some(window) = app.get_webview_window(REMINDER_LABEL) {
+        let _ = window.eval(format!(
+            "window.setSnackReminderApplication && window.setSnackReminderApplication({application_json});"
+        ));
+        let _ = window.unminimize();
+        window.show().map_err(|error| error.to_string())?;
+        return Ok(());
+    }
+
+    let window = WebviewWindowBuilder::new(
+        app,
+        REMINDER_LABEL,
+        WebviewUrl::CustomProtocol(
+            format!("{OVERLAY_SCHEME}://localhost/reminder.html")
+                .parse()
+                .map_err(|_| "录音提醒地址无效".to_string())?,
+        ),
+    )
+    .title("Snack 录音提醒")
+    .inner_size(REMINDER_WIDTH, REMINDER_HEIGHT)
+    .resizable(false)
+    .decorations(false)
+    .always_on_top(true)
+    .skip_taskbar(true)
+    .shadow(true)
+    .focused(false)
+    .visible(false)
+    .initialization_script(format!(
+        "window.__SNACK_REMINDER_APPLICATION__ = {application_json};"
+    ))
+    .build()
+    .map_err(|error| format!("无法创建录音提醒: {error}"))?;
+
+    if let Ok(Some(monitor)) = window.current_monitor() {
+        let area = monitor.work_area();
+        let window_width = window.outer_size().map(|size| size.width).unwrap_or(326) as i32;
+        let x = area.position.x + area.size.width as i32 - window_width - 24;
+        let y = area.position.y + 24;
+        let _ = window.set_position(PhysicalPosition::new(x, y));
+    }
+
+    window.show().map_err(|error| error.to_string())
+}
+
+pub(crate) fn hide_recording_reminder(app: &AppHandle) {
+    if let Some(window) = app.get_webview_window(REMINDER_LABEL) {
+        let _ = window.close();
+    }
+}
+
 /// Bring an existing recording overlay back after the user minimized it.
 pub(crate) fn restore_overlay(app: &AppHandle) -> Result<(), String> {
     let window = app
@@ -173,6 +234,31 @@ pub(crate) fn restore_overlay(app: &AppHandle) -> Result<(), String> {
 /// True when the given window is the overlay (used by origin checks).
 pub(crate) fn is_overlay_window(window: &tauri::WebviewWindow) -> bool {
     window.label() == OVERLAY_LABEL
+}
+
+fn is_reminder_window(window: &tauri::WebviewWindow) -> bool {
+    window.label() == REMINDER_LABEL
+}
+
+#[tauri::command]
+pub(crate) async fn start_recording_from_reminder(
+    app: AppHandle,
+    window: tauri::WebviewWindow,
+) -> Result<(), String> {
+    if !is_reminder_window(&window) {
+        return Err("只有录音提醒可以执行此操作".to_string());
+    }
+    super::start_quick_recording(app).await?;
+    let _ = window.close();
+    Ok(())
+}
+
+#[tauri::command]
+pub(crate) fn dismiss_recording_reminder(window: tauri::WebviewWindow) -> Result<(), String> {
+    if !is_reminder_window(&window) {
+        return Err("只有录音提醒可以执行此操作".to_string());
+    }
+    window.close().map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -354,6 +440,107 @@ const OVERLAY_HTML: &str = r#"<!DOCTYPE html>
 </html>
 "#;
 
+const REMINDER_HTML: &str = r#"<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<title>Snack 录音提醒</title>
+<style>
+  :root { color-scheme: light; }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { width: 100%; height: 100%; overflow: hidden; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif;
+    background: rgba(255, 255, 255, .98); border: 1px solid #fee5d0;
+    border-radius: 14px; color: #0f172a; user-select: none; -webkit-user-select: none;
+  }
+  .card { position: relative; display: flex; align-items: center; gap: 12px; height: 116px; padding: 18px; }
+  .icon {
+    display: flex; width: 38px; height: 38px; flex: 0 0 auto; align-items: center; justify-content: center;
+    border-radius: 12px; background: #fff2e8; color: #fe720a; font-size: 20px;
+  }
+  .content { min-width: 0; flex: 1; }
+  .title { font-size: 14px; font-weight: 700; line-height: 20px; }
+  .description { margin-top: 3px; color: #64748b; font-size: 11px; line-height: 16px; }
+  .error { display: none; margin-top: 3px; color: #dc2626; font-size: 10px; line-height: 14px; }
+  .start {
+    flex: 0 0 auto; border: 0; border-radius: 9px; padding: 9px 12px;
+    background: #fe720a; color: white; cursor: pointer; font-size: 11px; font-weight: 650;
+  }
+  .start:hover { background: #e96608; }
+  .start:disabled { cursor: default; opacity: .6; }
+  .close {
+    position: absolute; top: 6px; right: 8px; width: 22px; height: 22px;
+    border: 0; background: transparent; color: #94a3b8; cursor: pointer; font-size: 17px;
+  }
+</style>
+</head>
+<body>
+  <div class="card">
+    <div class="icon" aria-hidden="true">●</div>
+    <div class="content">
+      <div class="title">会议录音提醒</div>
+      <div class="description" id="description">检测到会议应用正在播放声音</div>
+      <div class="error" id="error"></div>
+    </div>
+    <button class="start" id="start">开始录音</button>
+    <button class="close" id="close" aria-label="关闭">×</button>
+  </div>
+  <script>
+    (function () {
+      var startButton = document.getElementById('start');
+      var closeButton = document.getElementById('close');
+      var description = document.getElementById('description');
+      var error = document.getElementById('error');
+      var dismissTimer;
+
+      function invoke(command) {
+        if (window.__TAURI__ && window.__TAURI__.core) return window.__TAURI__.core.invoke(command);
+        if (window.__TAURI_INTERNALS__ && window.__TAURI_INTERNALS__.invoke) return window.__TAURI_INTERNALS__.invoke(command);
+        return Promise.reject(new Error('native bridge unavailable'));
+      }
+
+      function resetDismissTimer() {
+        clearTimeout(dismissTimer);
+        dismissTimer = setTimeout(function () {
+          invoke('dismiss_recording_reminder').catch(function () {});
+        }, 15000);
+      }
+
+      window.setSnackReminderApplication = function (applicationName) {
+        var name = applicationName || '会议应用';
+        description.textContent = '检测到' + name + '正在播放声音';
+        error.style.display = 'none';
+        startButton.disabled = false;
+        startButton.textContent = '开始录音';
+        resetDismissTimer();
+      };
+
+      startButton.addEventListener('click', function () {
+        if (startButton.disabled) return;
+        clearTimeout(dismissTimer);
+        startButton.disabled = true;
+        startButton.textContent = '启动中…';
+        error.style.display = 'none';
+        invoke('start_recording_from_reminder').catch(function (reason) {
+          startButton.disabled = false;
+          startButton.textContent = '重试';
+          error.textContent = (reason && reason.message) || String(reason || '启动录音失败');
+          error.style.display = 'block';
+          resetDismissTimer();
+        });
+      });
+      closeButton.addEventListener('click', function () {
+        clearTimeout(dismissTimer);
+        invoke('dismiss_recording_reminder').catch(function () {});
+      });
+      window.setSnackReminderApplication(window.__SNACK_REMINDER_APPLICATION__);
+    })();
+  </script>
+</body>
+</html>
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -397,6 +584,26 @@ mod tests {
         let response = serve_overlay_request(request);
 
         assert_eq!(response.status(), 404);
+    }
+
+    #[test]
+    fn reminder_html_is_local_and_auto_dismisses() {
+        let request = tauri::http::Request::builder()
+            .uri("snack-overlay://localhost/reminder.html")
+            .body(Vec::new())
+            .unwrap();
+
+        let response = serve_overlay_request(request);
+
+        assert_eq!(response.status(), 200);
+        let html = String::from_utf8(response.into_body()).unwrap();
+        assert!(html.contains("start_recording_from_reminder"));
+        assert!(html.contains("dismiss_recording_reminder"));
+        assert!(html.contains("15000"));
+        assert!(html.contains("开始录音"));
+        assert!(!html.contains("Snack Record"));
+        assert!(!html.contains("http://"));
+        assert!(!html.contains("https://"));
     }
 
     #[test]

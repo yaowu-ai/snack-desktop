@@ -38,6 +38,8 @@ pub(crate) struct MeetingSettings {
     pub(crate) shortcut: String,
     pub(crate) retain_audio: bool,
     #[serde(default)]
+    pub(crate) recording_reminder_enabled: bool,
+    #[serde(default)]
     pub(crate) organize_transcripts_by_date: bool,
     #[serde(default = "default_meeting_notes_prompt")]
     pub(crate) notes_prompt: String,
@@ -49,6 +51,7 @@ impl Default for MeetingSettings {
             storage_directory: None,
             shortcut: "CommandOrControl+R".to_string(),
             retain_audio: true,
+            recording_reminder_enabled: false,
             organize_transcripts_by_date: false,
             notes_prompt: default_meeting_notes_prompt(),
         }
@@ -858,6 +861,7 @@ mod tests {
     fn settings_retain_audio_by_default() {
         let settings = MeetingSettings::default();
         assert!(settings.retain_audio);
+        assert!(!settings.recording_reminder_enabled);
         assert!(!settings.organize_transcripts_by_date);
         assert_eq!(settings.shortcut, "CommandOrControl+R");
         assert_eq!(settings.notes_prompt, DEFAULT_MEETING_NOTES_PROMPT);
@@ -874,6 +878,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(settings.notes_prompt, DEFAULT_MEETING_NOTES_PROMPT);
+        assert!(!settings.recording_reminder_enabled);
         assert!(!settings.organize_transcripts_by_date);
     }
 
