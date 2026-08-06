@@ -772,10 +772,7 @@ fn stop_recording(app: AppHandle, source: &str) -> Result<(), String> {
     task.state = TaskState::Finalizing;
     store.save_task(&task)?;
     emit_state(&app, &store);
-    update_overlay_if_present(
-        &app,
-        overlay::OverlayState::transcribing(task.recording_id.clone(), 0),
-    );
+    overlay::hide_overlay(&app);
 
     crate::logging::write_app_log(
         &app,
@@ -839,10 +836,6 @@ fn finalize_recording(app: AppHandle, store: MeetingStore, recorder: Recorder) {
         );
     }
     emit_state(&app, &store);
-    update_overlay_if_present(
-        &app,
-        overlay::OverlayState::transcribing(task.recording_id.clone(), 0),
-    );
     crate::logging::write_app_log(
         &app,
         "info",
@@ -860,7 +853,7 @@ fn fail_finalize(app: &AppHandle, store: &MeetingStore, message: String) {
         task.error = Some(message.clone());
         let _ = store.save_task(&task);
         emit_state(app, store);
-        update_overlay_if_present(app, overlay::OverlayState::failed(recording_id, message));
+        notifications::notify_transcript_failed(app, &recording_id);
     }
 }
 
@@ -950,10 +943,25 @@ pub(crate) fn meeting_open_notes_in_chat(
     recording_id: String,
 ) -> Result<(), String> {
     require_allowed_window(&window)?;
+    open_notes_in_chat(&app, &recording_id, false)
+}
+
+pub(crate) fn open_notes_from_notification(
+    app: &AppHandle,
+    recording_id: &str,
+) -> Result<(), String> {
+    open_notes_in_chat(app, recording_id, true)
+}
+
+fn open_notes_in_chat(
+    app: &AppHandle,
+    recording_id: &str,
+    auto_submit: bool,
+) -> Result<(), String> {
     let state = app.state::<MeetingManagerState>();
     let task = state
         .store
-        .load_task_record(&recording_id)
+        .load_task_record(recording_id)
         .ok_or_else(|| "没有找到本地转写记录".to_string())?;
     let transcript = task
         .transcript
@@ -974,6 +982,7 @@ pub(crate) fn meeting_open_notes_in_chat(
         settings.notes_prompt,
         transcript_name,
         state::transcript_text(transcript),
+        auto_submit,
     )?;
     overlay::hide_overlay(&app);
     Ok(())
@@ -1078,10 +1087,7 @@ fn spawn_transcription(app: AppHandle, store: MeetingStore) {
                     task.error = Some(message.clone());
                     let _ = store.save_task(&task);
                     emit_state(&app, &store);
-                    update_overlay_if_present(
-                        &app,
-                        overlay::OverlayState::failed(recording_id, message),
-                    );
+                    notifications::notify_transcript_failed(&app, &recording_id);
                     return;
                 }
             };
@@ -1094,10 +1100,7 @@ fn spawn_transcription(app: AppHandle, store: MeetingStore) {
                     task.error = Some(message.clone());
                     let _ = store.save_task(&task);
                     emit_state(&app, &store);
-                    update_overlay_if_present(
-                        &app,
-                        overlay::OverlayState::failed(recording_id, message),
-                    );
+                    notifications::notify_transcript_failed(&app, &recording_id);
                     return;
                 }
             };
@@ -1108,10 +1111,7 @@ fn spawn_transcription(app: AppHandle, store: MeetingStore) {
                 task.error = Some(message.clone());
                 let _ = store.save_task(&task);
                 emit_state(&app, &store);
-                update_overlay_if_present(
-                    &app,
-                    overlay::OverlayState::failed(task.recording_id, message),
-                );
+                notifications::notify_transcript_failed(&app, &task.recording_id);
                 return;
             };
 
@@ -1123,10 +1123,7 @@ fn spawn_transcription(app: AppHandle, store: MeetingStore) {
                 task.error = Some(message.clone());
                 let _ = store.save_task(&task);
                 emit_state(&app, &store);
-                update_overlay_if_present(
-                    &app,
-                    overlay::OverlayState::failed(recording_id, message),
-                );
+                notifications::notify_transcript_failed(&app, &recording_id);
                 return;
             }
             let wav_path = match task.audio_path.clone().map(PathBuf::from) {
@@ -1137,10 +1134,7 @@ fn spawn_transcription(app: AppHandle, store: MeetingStore) {
                     task.error = Some(message.clone());
                     let _ = store.save_task(&task);
                     emit_state(&app, &store);
-                    update_overlay_if_present(
-                        &app,
-                        overlay::OverlayState::failed(recording_id, message),
-                    );
+                    notifications::notify_transcript_failed(&app, &recording_id);
                     return;
                 }
             };
@@ -1165,13 +1159,6 @@ fn spawn_transcription(app: AppHandle, store: MeetingStore) {
                             "segmentCount": progress.segment_count,
                         }),
                     );
-                    update_overlay_if_present(
-                        &app_for_progress,
-                        overlay::OverlayState::transcribing(
-                            recording_id_for_progress.clone(),
-                            progress.percent,
-                        ),
-                    );
                     // Abort if the task is no longer in transcribing state.
                     store_for_progress
                         .load_task()
@@ -1195,10 +1182,7 @@ fn spawn_transcription(app: AppHandle, store: MeetingStore) {
                     task.error = Some(message.clone());
                     let _ = store.save_task(&task);
                     emit_state(&app, &store);
-                    update_overlay_if_present(
-                        &app,
-                        overlay::OverlayState::failed(recording_id.clone(), message.clone()),
-                    );
+                    notifications::notify_transcript_failed(&app, &recording_id);
                     crate::logging::write_app_log(
                         &app,
                         "error",
@@ -1222,10 +1206,7 @@ fn spawn_transcription(app: AppHandle, store: MeetingStore) {
                 task.error = Some(message.clone());
                 let _ = store.save_task(&task);
                 emit_state(&app, &store);
-                update_overlay_if_present(
-                    &app,
-                    overlay::OverlayState::failed(recording_id.clone(), message),
-                );
+                notifications::notify_transcript_failed(&app, &recording_id);
                 return;
             }
             task.state = TaskState::TranscriptReady;
@@ -1239,7 +1220,6 @@ fn spawn_transcription(app: AppHandle, store: MeetingStore) {
             task.updated_at = now_rfc3339();
             let _ = store.save_task(&task);
             emit_state(&app, &store);
-            update_overlay_if_present(&app, overlay::OverlayState::ready(recording_id.clone()));
             notifications::notify_transcript_ready(&app, &recording_id);
         })
         .expect("failed to spawn transcription thread");
@@ -1273,16 +1253,6 @@ fn generate_notes(app: AppHandle, store: MeetingStore, recording_id: String) -> 
         }
     });
     Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Overlay updater
-// ---------------------------------------------------------------------------
-
-fn update_overlay_if_present(app: &AppHandle, state: overlay::OverlayState) {
-    if let Some(window) = app.get_webview_window(overlay::OVERLAY_LABEL) {
-        overlay::update_overlay(&window, state);
-    }
 }
 
 fn spawn_overlay_updater(app: AppHandle, recording_id: String) {

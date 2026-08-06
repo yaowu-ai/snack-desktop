@@ -19,9 +19,6 @@ const OVERLAY_HEIGHT: f64 = 88.0;
 #[serde(rename_all = "snake_case")]
 pub(crate) enum OverlayPhase {
     Recording,
-    Transcribing,
-    Ready,
-    Failed,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -32,8 +29,6 @@ pub(crate) struct OverlayState {
     pub(crate) mic_active: bool,
     pub(crate) system_audio_active: bool,
     pub(crate) recording_id: String,
-    pub(crate) progress_percent: u8,
-    pub(crate) message: Option<String>,
 }
 
 impl OverlayState {
@@ -49,44 +44,6 @@ impl OverlayState {
             mic_active,
             system_audio_active,
             recording_id,
-            progress_percent: 0,
-            message: None,
-        }
-    }
-
-    pub(crate) fn transcribing(recording_id: String, progress_percent: u8) -> Self {
-        Self {
-            phase: OverlayPhase::Transcribing,
-            elapsed_ms: 0,
-            mic_active: false,
-            system_audio_active: false,
-            recording_id,
-            progress_percent,
-            message: None,
-        }
-    }
-
-    pub(crate) fn ready(recording_id: String) -> Self {
-        Self {
-            phase: OverlayPhase::Ready,
-            elapsed_ms: 0,
-            mic_active: false,
-            system_audio_active: false,
-            recording_id,
-            progress_percent: 100,
-            message: None,
-        }
-    }
-
-    pub(crate) fn failed(recording_id: String, message: String) -> Self {
-        Self {
-            phase: OverlayPhase::Failed,
-            elapsed_ms: 0,
-            mic_active: false,
-            system_audio_active: false,
-            recording_id,
-            progress_percent: 0,
-            message: Some(message),
         }
     }
 }
@@ -267,17 +224,11 @@ const OVERLAY_HTML: &str = r#"<!DOCTYPE html>
     color: #fe720a; font-size: 13px; font-weight: 700;
   }
   .status-icon.recording { color: #fe720a; animation: pulse 1.2s infinite; }
-  .status-icon.transcribing { border: 2px solid #fed7aa; border-top-color: #fe720a; background: #fff; animation: spin .8s linear infinite; }
-  .status-icon.ready { background: #ecfdf3; color: #16a34a; }
-  .status-icon.failed { background: #fef2f2; color: #dc2626; }
   @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .35; } }
-  @keyframes spin { to { transform: rotate(360deg); } }
   .info { flex: 1; min-width: 0; }
   .title { font-size: 12px; font-weight: 650; }
   .metric { margin-top: 2px; font-size: 18px; font-weight: 700; font-variant-numeric: tabular-nums; }
   .detail { display: none; margin-top: 3px; overflow: hidden; color: #64748b; font-size: 9px; line-height: 12px; text-overflow: ellipsis; white-space: nowrap; }
-  .progress { display: none; height: 4px; margin-top: 8px; overflow: hidden; border-radius: 999px; background: #ffedd5; }
-  .progress-fill { height: 100%; border-radius: inherit; background: #fe720a; transition: width .25s ease; }
   .primary-action {
     flex-shrink: 0; border: none; border-radius: 9px; padding: 9px 12px;
     background: #fe720a; color: #fff; cursor: pointer; font-size: 11px; font-weight: 650;
@@ -294,22 +245,18 @@ const OVERLAY_HTML: &str = r#"<!DOCTYPE html>
       <div class="title" id="title">正在录音</div>
       <div class="metric" id="metric">00:00</div>
       <div class="detail" id="detail"></div>
-      <div class="progress" id="progress"><div class="progress-fill" id="progress-fill"></div></div>
     </div>
     <button class="primary-action" id="primary-action">结束</button>
   </div>
   <script>
     (function () {
-      var current = { phase: 'recording', elapsedMs: 0, recordingId: '', progressPercent: 0 };
+      var current = { phase: 'recording', elapsedMs: 0, recordingId: '' };
       var stopPending = false;
-      var actionPending = false;
       var stopError = '';
       var iconEl = document.getElementById('status-icon');
       var titleEl = document.getElementById('title');
       var metricEl = document.getElementById('metric');
       var detailEl = document.getElementById('detail');
-      var progressEl = document.getElementById('progress');
-      var progressFillEl = document.getElementById('progress-fill');
       var actionEl = document.getElementById('primary-action');
 
       function invoke(command, args) {
@@ -339,8 +286,6 @@ const OVERLAY_HTML: &str = r#"<!DOCTYPE html>
       function resetView() {
         metricEl.style.display = 'none';
         detailEl.style.display = 'none';
-        progressEl.style.display = 'none';
-        actionEl.style.display = 'none';
         actionEl.disabled = false;
         iconEl.textContent = '';
         iconEl.className = 'status-icon ' + current.phase;
@@ -361,51 +306,17 @@ const OVERLAY_HTML: &str = r#"<!DOCTYPE html>
         }
       }
 
-      function renderTranscribing() {
-        titleEl.textContent = '正在转写';
-        metricEl.textContent = String(current.progressPercent || 0) + '%';
-        metricEl.style.display = 'block';
-        detailEl.textContent = current.message || '录音已保存，正在本地生成转写文本';
-        detailEl.style.display = 'block';
-        progressFillEl.style.width = String(current.progressPercent || 0) + '%';
-        progressEl.style.display = 'block';
-      }
-
-      function renderReady() {
-        iconEl.textContent = '✓';
-        titleEl.textContent = '转写完成';
-        detailEl.textContent = current.message || '录音和转写已保存，可以直接生成会议纪要';
-        detailEl.style.display = 'block';
-        actionEl.textContent = actionPending ? '正在打开…' : '生成纪要';
-        actionEl.disabled = actionPending;
-        actionEl.style.display = 'block';
-      }
-
-      function renderFailed() {
-        iconEl.textContent = '!';
-        titleEl.textContent = '转写失败';
-        detailEl.textContent = current.message || '请在 Snack 的我的录音中查看并重试';
-        detailEl.style.display = 'block';
-      }
-
       function render() {
         resetView();
-        if (current.phase === 'recording') renderRecording();
-        else if (current.phase === 'transcribing') renderTranscribing();
-        else if (current.phase === 'ready') renderReady();
-        else renderFailed();
+        renderRecording();
       }
 
       function apply(next) {
         if (!next) return;
-        var nextPhase = next.phase || current.phase;
-        var sameRecording = next.recordingId && next.recordingId === current.recordingId;
-        if (current.phase !== 'recording' && nextPhase === 'recording' && sameRecording) return;
         var changedRecording = next.recordingId && next.recordingId !== current.recordingId;
-        current = Object.assign({}, current, next, { phase: nextPhase });
-        if (changedRecording && nextPhase === 'recording') {
+        current = Object.assign({}, current, next, { phase: 'recording' });
+        if (changedRecording) {
           stopPending = false;
-          actionPending = false;
           stopError = '';
         }
         render();
@@ -422,27 +333,14 @@ const OVERLAY_HTML: &str = r#"<!DOCTYPE html>
         if (stopPending || current.phase !== 'recording') return;
         stopPending = true;
         stopError = '';
-        apply({ phase: 'transcribing', recordingId: current.recordingId, progressPercent: 0 });
+        render();
         withTimeout(invoke('meeting_stop_recording', {}), 4000)
           .catch(function () { return stopViaProtocol(); })
           .catch(showStopError);
       }
 
-      function openNotes() {
-        if (actionPending || !current.recordingId) return;
-        actionPending = true;
-        render();
-        withTimeout(invoke('meeting_open_notes_in_chat', { recordingId: current.recordingId }), 6000)
-          .catch(function (error) {
-            actionPending = false;
-            current.message = (error && error.message) || '打开 Snack 失败，请重试';
-            render();
-          });
-      }
-
       actionEl.addEventListener('click', function () {
-        if (current.phase === 'recording') stopRecording();
-        else if (current.phase === 'ready') openNotes();
+        stopRecording();
       });
       render();
       try {
@@ -474,10 +372,10 @@ mod tests {
         assert!(html.contains("fetch('/stop'"));
         assert!(html.contains("meeting_stop_recording"));
         assert!(html.contains("return stopViaProtocol();"));
-        assert!(html.contains("meeting_open_notes_in_chat"));
-        assert!(html.contains("正在转写"));
-        assert!(html.contains("转写完成"));
-        assert!(html.contains("生成纪要"));
+        assert!(!html.contains("meeting_open_notes_in_chat"));
+        assert!(!html.contains("正在转写"));
+        assert!(!html.contains("转写完成"));
+        assert!(!html.contains("生成纪要"));
         assert!(!html.contains("做会议纪要"));
         assert!(html.contains("color-scheme: light"));
         assert!(html.contains("background: rgba(255, 255, 255, 0.98)"));
@@ -502,11 +400,17 @@ mod tests {
     }
 
     #[test]
-    fn ready_state_serializes_the_recording_identity() {
-        let value = serde_json::to_value(OverlayState::ready("rec-1".to_string())).unwrap();
+    fn recording_state_serializes_the_recording_identity() {
+        let value = serde_json::to_value(OverlayState::recording(
+            "rec-1".to_string(),
+            2500,
+            true,
+            true,
+        ))
+        .unwrap();
 
-        assert_eq!(value["phase"], "ready");
+        assert_eq!(value["phase"], "recording");
         assert_eq!(value["recordingId"], "rec-1");
-        assert_eq!(value["progressPercent"], 100);
+        assert_eq!(value["elapsedMs"], 2500);
     }
 }

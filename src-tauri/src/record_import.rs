@@ -37,6 +37,8 @@ pub(crate) struct PendingRecordImport {
     pub attachment_text: Option<String>,
     pub created_at: String,
     #[serde(default)]
+    pub auto_submit: bool,
+    #[serde(default)]
     delivery_state: RecordImportDeliveryState,
 }
 
@@ -143,8 +145,10 @@ pub(crate) fn open_prefill_with_attachment(
     prompt: String,
     attachment_name: String,
     attachment_text: String,
+    auto_submit: bool,
 ) -> Result<(), String> {
-    let record_import = build_meeting_import(prompt, attachment_name, attachment_text)?;
+    let record_import =
+        build_meeting_import(prompt, attachment_name, attachment_text, auto_submit)?;
     app.state::<RecordImportStore>()
         .replace(record_import.clone())?;
     show_main_window(app);
@@ -336,6 +340,7 @@ fn build_meeting_import(
     prompt: String,
     attachment_name: String,
     attachment_text: String,
+    auto_submit: bool,
 ) -> Result<PendingRecordImport, String> {
     if prompt.trim().is_empty() || prompt.len() > MAX_TRANSCRIPT_BYTES {
         return Err("会议纪要 Prompt 为空或超过 5 MB".to_string());
@@ -353,6 +358,7 @@ fn build_meeting_import(
         attachment_name: Some(attachment_name),
         attachment_text: Some(attachment_text),
         created_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        auto_submit,
         delivery_state: RecordImportDeliveryState::Pending,
     })
 }
@@ -407,6 +413,7 @@ fn read_clipboard_import() -> Result<PendingRecordImport, String> {
         attachment_name: None,
         attachment_text: None,
         created_at: metadata.created_at,
+        auto_submit: false,
         delivery_state: RecordImportDeliveryState::Pending,
     })
 }
@@ -447,6 +454,7 @@ fn read_clipboard_import() -> Result<PendingRecordImport, String> {
                 attachment_name: None,
                 attachment_text: None,
                 created_at: metadata.created_at,
+                auto_submit: false,
                 delivery_state: RecordImportDeliveryState::Pending,
             })
         })();
@@ -559,6 +567,7 @@ mod tests {
             "请生成会议纪要".to_string(),
             "Snack会议-2026-08-06.txt".to_string(),
             "会议转写正文".to_string(),
+            false,
         )
         .unwrap();
 
@@ -568,6 +577,20 @@ mod tests {
             Some("Snack会议-2026-08-06.txt")
         );
         assert_eq!(import.attachment_text.as_deref(), Some("会议转写正文"));
+        assert!(!import.auto_submit);
         assert!(import.id.starts_with("meeting-v2-"));
+    }
+
+    #[test]
+    fn meeting_notification_handoff_can_request_automatic_submission() {
+        let import = build_meeting_import(
+            "请生成会议纪要".to_string(),
+            "Snack会议.txt".to_string(),
+            "会议转写正文".to_string(),
+            true,
+        )
+        .unwrap();
+
+        assert!(import.auto_submit);
     }
 }

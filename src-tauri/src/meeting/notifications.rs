@@ -14,11 +14,23 @@ pub(crate) fn notify_model_ready(app: &AppHandle) {
 }
 
 /// Notify after a local transcription finishes. Clicking the notification
-/// always returns to the audio transcription records tab.
+/// starts a new Snack conversation with the configured prompt and transcript.
 pub(crate) fn notify_transcript_ready(app: &AppHandle, recording_id: &str) {
     let app = app.clone();
-    let _ = recording_id;
-    tauri::async_runtime::spawn_blocking(move || show_transcript_ready_notification(app));
+    let recording_id = recording_id.to_string();
+    tauri::async_runtime::spawn_blocking(move || {
+        show_transcript_ready_notification(app, recording_id)
+    });
+}
+
+/// Notify only after the local pipeline has reached a terminal failure.
+/// Clicking the notification opens the audio transcription task list.
+pub(crate) fn notify_transcript_failed(app: &AppHandle, recording_id: &str) {
+    let app = app.clone();
+    let recording_id = recording_id.to_string();
+    tauri::async_runtime::spawn_blocking(move || {
+        show_transcript_failed_notification(app, recording_id)
+    });
 }
 
 fn show_model_ready_notification(app: AppHandle) {
@@ -39,12 +51,36 @@ fn show_model_ready_notification(app: AppHandle) {
     handle.wait_for_action(move |action| handle_notification_action(&app, action));
 }
 
-fn show_transcript_ready_notification(app: AppHandle) {
+fn show_transcript_ready_notification(app: AppHandle, recording_id: String) {
     configure_notification_identity(&app);
     let result = Notification::new()
         .summary("音频转写已完成")
-        .body("点击查看音频转写记录。")
-        .action("open-meeting-records", "查看记录")
+        .body("点击调用 Snack，立即生成会议纪要。")
+        .action("generate-meeting-notes", "生成会议纪要")
+        .show();
+
+    let handle = match result {
+        Ok(handle) => handle,
+        Err(error) => {
+            log_notification_error(&app, &error.to_string());
+            return;
+        }
+    };
+    handle.wait_for_action(move |action| {
+        if should_open_notification(action) {
+            if let Err(error) = super::open_notes_from_notification(&app, &recording_id) {
+                log_notification_error(&app, &error);
+            }
+        }
+    });
+}
+
+fn show_transcript_failed_notification(app: AppHandle, recording_id: String) {
+    configure_notification_identity(&app);
+    let result = Notification::new()
+        .summary("音频转写失败")
+        .body("点击查看音频转写任务并重试。")
+        .action("open-meeting-records", "查看任务")
         .show();
 
     let handle = match result {
@@ -60,6 +96,7 @@ fn show_transcript_ready_notification(app: AppHandle) {
                 log_notification_error(&app, &error);
             }
         }
+        let _ = recording_id;
     });
 }
 
@@ -136,7 +173,7 @@ mod tests {
     }
 
     #[test]
-    fn transcription_notification_targets_audio_records() {
+    fn failed_transcription_notification_targets_audio_records() {
         let url = meeting_url(
             Url::parse("http://localhost:3000/meeting/settings?from=notice").expect("valid URL"),
             MEETING_RECORDS_PATH,
