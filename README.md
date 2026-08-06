@@ -80,7 +80,7 @@ Snack_{version}_macos_x64.app.tar.gz.sig
 
 远端构建使用 Node.js 22。Windows 构建需要 `TAURI_UPDATER_PUBKEY` 和 `TAURI_SIGNING_PRIVATE_KEY`；macOS 构建还需要 Apple 签名与公证相关的 GitHub Secrets。工作流会为 updater 安装包生成并上传 `.sig` 签名文件。
 
-最后发布的时候，要在 平台后面的 桌面端 版本管理中 填入对应的版本号进行发布。使用桌面端的同学会收到更新提醒。
+最后发布的时候，要在 平台后台的 桌面端 版本管理中 填入对应的版本号进行发布。使用桌面端的同学会收到更新提醒。
 
 ## 许可证
 
