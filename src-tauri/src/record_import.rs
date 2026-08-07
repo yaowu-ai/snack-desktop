@@ -2,11 +2,12 @@ use std::{fs, path::PathBuf, sync::Mutex};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tauri::{AppHandle, Manager, WebviewWindow};
+use tauri::{AppHandle, Emitter, Manager, WebviewWindow};
 
 use crate::web::is_allowed_web_origin;
 
 const RECORD_METADATA_TYPE: &str = "cn.yaowutech.snack.record-handoff+json";
+const RECORD_IMPORT_READY_EVENT: &str = "snack-record-import-ready";
 const MAX_TRANSCRIPT_BYTES: usize = 5 * 1024 * 1024;
 
 #[derive(Debug, PartialEq)]
@@ -159,6 +160,24 @@ pub(crate) fn open_prefill_with_attachment(
     navigate_to_root(app)
 }
 
+/// Persist an automatic meeting-notes handoff and wake the existing webview
+/// without showing, focusing, or navigating the user's active page.
+pub(crate) fn queue_background_with_attachment(
+    app: &AppHandle,
+    prompt: String,
+    attachment_name: String,
+    attachment_text: String,
+) -> Result<(), String> {
+    let record_import = build_meeting_import(prompt, attachment_name, attachment_text, true)?;
+    app.state::<RecordImportStore>()
+        .replace(record_import.clone())?;
+    app.emit(
+        RECORD_IMPORT_READY_EVENT,
+        serde_json::json!({ "id": record_import.id }),
+    )
+    .map_err(|error| error.to_string())
+}
+
 pub(crate) fn handle_open_url(app: &AppHandle, url: &tauri::Url) {
     if let Some(target) = meeting_navigation_target(url) {
         open_meeting_target(app, target);
@@ -296,10 +315,17 @@ fn meeting_navigation_target(url: &tauri::Url) -> Option<MeetingNavigationTarget
     let action = url
         .query_pairs()
         .find_map(|(key, value)| (key == "action").then(|| value.into_owned()));
+    let ensure_latest = url
+        .query_pairs()
+        .any(|(key, value)| key == "ensureLatest" && value == "1");
     match action.as_deref() {
-        Some("apps") | Some("record") => Some(MeetingNavigationTarget {
+        Some("apps") => Some(MeetingNavigationTarget {
             path: "/apps",
-            query: None,
+            query: ensure_latest.then_some("ensureLatest=1"),
+        }),
+        Some("record") => Some(MeetingNavigationTarget {
+            path: "/meeting",
+            query: Some("quick=1"),
         }),
         Some("settings") => Some(MeetingNavigationTarget {
             path: "/meeting/settings",
@@ -520,8 +546,8 @@ mod tests {
         assert_eq!(
             meeting_navigation_target(&"snack://meeting?action=record".parse().unwrap()),
             Some(MeetingNavigationTarget {
-                path: "/apps",
-                query: None,
+                path: "/meeting",
+                query: Some("quick=1"),
             })
         );
         assert_eq!(
@@ -529,6 +555,17 @@ mod tests {
             Some(MeetingNavigationTarget {
                 path: "/apps",
                 query: None,
+            })
+        );
+        assert_eq!(
+            meeting_navigation_target(
+                &"snack://meeting?action=apps&ensureLatest=1"
+                    .parse()
+                    .unwrap()
+            ),
+            Some(MeetingNavigationTarget {
+                path: "/apps",
+                query: Some("ensureLatest=1"),
             })
         );
         assert_eq!(
@@ -582,7 +619,7 @@ mod tests {
     }
 
     #[test]
-    fn meeting_notification_handoff_can_request_automatic_submission() {
+    fn meeting_transcription_completion_handoff_requests_automatic_submission() {
         let import = build_meeting_import(
             "请生成会议纪要".to_string(),
             "Snack会议.txt".to_string(),

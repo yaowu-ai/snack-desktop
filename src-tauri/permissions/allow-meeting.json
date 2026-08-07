@@ -6,6 +6,8 @@
       "description": "Allow the Snack main webview to manage local meeting models, recording, transcription, and submission recovery.",
       "commands": {
         "allow": [
+          "acknowledge_record_import_prefilled",
+          "claim_pending_record_import",
           "meeting_cancel_install",
           "meeting_check_permissions",
           "meeting_clear_task_records",
@@ -17,6 +19,7 @@
           "meeting_import_audio",
           "meeting_open_local_file",
           "meeting_open_notes_in_chat",
+          "meeting_notify_notes_completed",
           "meeting_open_permission_settings",
           "meeting_pause_install",
           "meeting_resume_install",

@@ -205,6 +205,7 @@ pub(crate) async fn run_submission_pipeline(
                 task.ended_at = Some(now_rfc3339());
                 store.save_task_progress(&task)?;
                 emit_state(app, store);
+                super::notifications::notify_notes_ready(app);
                 return Ok(record_id);
             }
             Ok(status) if status == "failed" => {
