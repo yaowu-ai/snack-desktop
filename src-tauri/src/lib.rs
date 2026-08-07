@@ -1,5 +1,6 @@
 mod app_menu;
 mod attention;
+mod bridge;
 mod commands;
 mod constants;
 mod download;
@@ -43,6 +44,10 @@ pub fn run() {
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .invoke_handler(tauri::generate_handler![
+            bridge::bridge_call,
+            bridge::bridge_info,
+            bridge::bridge_probe,
+            bridge::bridge_update,
             commands::download_snack_file,
             commands::exit_after_force_update_cancel,
             commands::open_downloaded_file,
@@ -83,6 +88,7 @@ pub fn run() {
             record_import::acknowledge_record_import_prefilled
         ])
         .setup(|app| {
+            bridge::initialize(app.handle());
             record_import::initialize(app.handle()).map_err(std::io::Error::other)?;
             meeting::initialize(app.handle()).map_err(std::io::Error::other)?;
             logging::write_app_log(

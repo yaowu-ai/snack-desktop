@@ -144,6 +144,24 @@ pub(crate) fn emit_state(app: &AppHandle, store: &MeetingStore) {
     let _ = app.emit(STATE_EVENT, snapshot);
 }
 
+pub(crate) fn desktop_update_block_reason(app: &AppHandle) -> Option<String> {
+    let state = app.try_state::<MeetingManagerState>()?;
+    if state.recorder.lock().expect("recorder poisoned").is_some() {
+        return Some("正在录音，结束录音后才能更新桌面端".to_string());
+    }
+    if state
+        .store
+        .load_task()
+        .is_some_and(|task| task.state.is_active())
+    {
+        return Some("会议内容仍在处理中，完成后才能更新桌面端".to_string());
+    }
+    if !state.store.load_resource().state.is_idle() {
+        return Some("本地资源正在安装，完成后才能更新桌面端".to_string());
+    }
+    None
+}
+
 // ---------------------------------------------------------------------------
 // Initialization & crash recovery
 // ---------------------------------------------------------------------------

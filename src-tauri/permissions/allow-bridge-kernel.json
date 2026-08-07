@@ -1,0 +1,18 @@
+{
+  "default": null,
+  "permission": [
+    {
+      "identifier": "allow-bridge-kernel",
+      "description": "Allow the main Snack webview to use the versioned Desktop bridge kernel.",
+      "commands": {
+        "allow": [
+          "bridge_call",
+          "bridge_info",
+          "bridge_probe",
+          "bridge_update"
+        ],
+        "deny": []
+      }
+    }
+  ]
+}

@@ -82,6 +82,22 @@ Snack_{version}_macos_x64.app.tar.gz.sig
 
 最后发布的时候，要在 平台后台的 桌面端 版本管理中 填入对应的版本号进行发布。使用桌面端的同学会收到更新提醒。
 
+## Desktop Bridge 契约与发布顺序
+
+远程 Web 的新业务原生调用统一通过 `bridge_call`，并携带 `method`、
+`requiredContractRevision`、`apiVersion` 和 `payload`。Web 只声明桥协议修订，不比较 Desktop
+应用版本。新增方法或不兼容的协议变化必须提升 `BRIDGE_CONTRACT_REVISION`；修改请求或响应结构时
+必须增加 `apiVersion`，不能原地改变已发布版本的语义。
+
+桥协议发布必须遵循以下顺序：
+
+1. 先发布包含新 contract revision 的 Desktop 安装包和 updater 签名。
+2. 在平台后台为所有支持的平台和架构发布对应版本，并验证 updater manifest 可以返回该版本。
+3. 最后发布要求新 contract revision 的 Web 代码。
+
+Bridge Kernel 之前的客户端由 Web 的通用 command-not-found updater 兜底，不维护 Desktop
+应用版本兼容表。窗口、通知、事件等与业务无关的底层 Tauri 能力可以继续使用独立权限和入口。
+
 ## 许可证
 
 本项目采用 [MIT License](LICENSE)。

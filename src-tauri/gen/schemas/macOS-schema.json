@@ -345,6 +345,12 @@
       "description": "Permission identifier",
       "oneOf": [
         {
+          "description": "Allow the main Snack webview to use the versioned Desktop bridge kernel.",
+          "type": "string",
+          "const": "allow-bridge-kernel",
+          "markdownDescription": "Allow the main Snack webview to use the versioned Desktop bridge kernel."
+        },
+        {
           "description": "Allow the remote Snack web app to write and reveal Snack desktop diagnostic logs.",
           "type": "string",
           "const": "allow-desktop-diagnostics",

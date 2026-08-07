@@ -24,6 +24,7 @@
     },
     "process:allow-restart",
     "updater:default",
+    "allow-bridge-kernel",
     "allow-desktop-diagnostics",
     "allow-download-snack-file",
     "allow-meeting",
