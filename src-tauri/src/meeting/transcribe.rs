@@ -80,7 +80,8 @@ pub(crate) fn transcribe_file(
         });
     }
 
-    let python = model_dir.join("runtime/venv/bin/python");
+    let runtime_dir = model_dir.join("runtime");
+    let python = crate::meeting::python_runtime::venv_python(&runtime_dir);
     let script = model_dir.join("runtime/funasr_transcribe.py");
     let cache_dir = model_dir.join("modelscope-cache");
     if !python.exists() || !script.exists() || !cache_dir.exists() {
@@ -152,7 +153,7 @@ fn parse_modelscope_transcript(output: &[u8]) -> Result<ModelScopeTranscript, St
 /// cache instead of loading the multi-GB model a second time.
 pub(crate) fn validate_model(model_key: ModelKey, model_dir: &Path) -> Result<(), String> {
     if model_key == ModelKey::FunAsr2G
-        && model_dir.join("runtime/venv/bin/python").exists()
+        && crate::meeting::python_runtime::venv_python(&model_dir.join("runtime")).exists()
         && model_dir.join("modelscope-cache").exists()
     {
         Ok(())

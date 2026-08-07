@@ -239,6 +239,15 @@ const childEnv = {
   SNACK_FRONTEND_URL: frontendUrl,
 };
 
+const targetFlagIndex = args.findIndex((arg) => arg === "--target");
+if (targetFlagIndex >= 0 && args[targetFlagIndex + 1]) {
+  childEnv.SNACK_TARGET_TRIPLE = args[targetFlagIndex + 1];
+}
+const inlineTarget = args.find((arg) => arg.startsWith("--target="));
+if (inlineTarget) {
+  childEnv.SNACK_TARGET_TRIPLE = inlineTarget.slice("--target=".length);
+}
+
 if (macosSigningIdentity) {
   childEnv.APPLE_SIGNING_IDENTITY = macosSigningIdentity;
 }

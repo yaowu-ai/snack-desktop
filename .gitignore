@@ -2,3 +2,5 @@
 /.idea/
 .env
 node_modules/
+/src-tauri/resources/python-runtime/*
+!/src-tauri/resources/python-runtime/.gitkeep
