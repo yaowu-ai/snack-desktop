@@ -267,3 +267,57 @@ jobs:
           prerelease: ${{ steps.version.outputs.release_prerelease }}
           make_latest: ${{ steps.version.outputs.release_make_latest }}
           fail_on_unmatched_files: true
+
+  notify-wecom:
+    name: Notify WeCom
+    needs:
+      - build-macos
+      - build-windows-x64
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    permissions: {}
+    env:
+      MACOS_RESULT: ${{ needs.build-macos.result }}
+      WINDOWS_RESULT: ${{ needs.build-windows-x64.result }}
+      NOTICE_RELEASE_URL: ${{ secrets.NOTICE_RELEASE_URL }}
+      NOTICE_WECOM: ${{ secrets.NOTICE_WECOM }}
+    steps:
+      - name: Send packaging result
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ -z "$NOTICE_WECOM" ]]; then
+            echo "::error::Missing required GitHub Actions Secret: NOTICE_WECOM"
+            exit 1
+          fi
+
+          VERSION="${GITHUB_REF_NAME#v}"
+          RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+
+          if [[ "$MACOS_RESULT" == "success" && "$WINDOWS_RESULT" == "success" ]]; then
+            if [[ -z "$NOTICE_RELEASE_URL" ]]; then
+              echo "::error::Missing required GitHub Actions Secret: NOTICE_RELEASE_URL"
+              exit 1
+            fi
+            CONTENT="Snack桌面端${VERSION}已经打包成功,请去 ${NOTICE_RELEASE_URL} 进行发布."
+          else
+            FAILED_PLATFORMS=()
+            [[ "$MACOS_RESULT" == "success" ]] || FAILED_PLATFORMS+=("macOS")
+            [[ "$WINDOWS_RESULT" == "success" ]] || FAILED_PLATFORMS+=("Windows")
+            FAILED_PLATFORM_TEXT="$(IFS='、'; echo "${FAILED_PLATFORMS[*]}")"
+            CONTENT="Snack桌面端${VERSION} ${FAILED_PLATFORM_TEXT}平台打包失败, 请去 ${RUN_URL} 查看日志"
+          fi
+
+          PAYLOAD="$(jq -n --arg content "$CONTENT" '{msgtype: "text", text: {content: $content}}')"
+          RESPONSE="$(curl --silent --show-error --fail-with-body \
+            --retry 3 \
+            --retry-all-errors \
+            --header 'Content-Type: application/json' \
+            --data "$PAYLOAD" \
+            "$NOTICE_WECOM")"
+
+          if [[ "$(jq -r '.errcode // empty' <<< "$RESPONSE")" != "0" ]]; then
+            echo "::error::WeCom notification failed: $RESPONSE"
+            exit 1
+          fi
