@@ -26,6 +26,25 @@ UPDATER_SIGNATURE_PATH="${UPDATER_ARCHIVE_PATH}.sig"
 PYTHON_RUNTIME_ROOT="${APP_PATH}/Contents/Resources/python-runtime/python"
 PYTHON_RUNTIME_ENTITLEMENTS="src-tauri/PythonRuntimeEntitlements.plist"
 
+codesign_with_retry() {
+  local attempt
+  local max_attempts=3
+
+  for ((attempt = 1; attempt <= max_attempts; attempt++)); do
+    if codesign "$@"; then
+      return 0
+    fi
+
+    if [[ "${attempt}" -lt "${max_attempts}" ]]; then
+      echo "codesign failed, retrying (${attempt}/${max_attempts})." >&2
+      sleep "$((attempt * 15))"
+    fi
+  done
+
+  echo "codesign failed after ${max_attempts} attempts." >&2
+  return 1
+}
+
 sign_python_runtime() {
   if [[ ! -d "${PYTHON_RUNTIME_ROOT}" ]]; then
     echo "Managed Python runtime not found: ${PYTHON_RUNTIME_ROOT}" >&2
@@ -42,7 +61,7 @@ sign_python_runtime() {
         arguments+=(--entitlements "${PYTHON_RUNTIME_ENTITLEMENTS}")
         ;;
     esac
-    codesign "${arguments[@]}" "${candidate}"
+    codesign_with_retry "${arguments[@]}" "${candidate}"
   done < <(find "${PYTHON_RUNTIME_ROOT}" -type f -print0)
 }
 
@@ -143,7 +162,7 @@ xattr -crs "${APP_PATH}"
 
 sign_python_runtime
 
-codesign \
+codesign_with_retry \
   --force \
   --timestamp \
   --options runtime \
@@ -183,7 +202,7 @@ ln -s /Applications "${STAGING_DIR}/Applications"
 
 create_dmg
 
-codesign \
+codesign_with_retry \
   --force \
   --timestamp \
   --sign "${APPLE_SIGNING_IDENTITY}" \
