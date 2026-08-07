@@ -2,7 +2,7 @@
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
   "description": "Capabilities for the Snack desktop webview.",
-  "windows": ["main", "record_overlay"],
+  "windows": ["main", "record_overlay", "recording_reminder"],
   "remote": {
     "urls": [
       "https://snack.mechlabs.cn/*",

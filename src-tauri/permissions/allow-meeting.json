@@ -29,8 +29,10 @@
           "meeting_stop_recording",
           "meeting_uninstall_model",
           "meeting_update_settings",
+          "dismiss_recording_reminder",
           "dismiss_overlay",
-          "minimize_overlay"
+          "minimize_overlay",
+          "start_recording_from_reminder"
         ],
         "deny": []
       }

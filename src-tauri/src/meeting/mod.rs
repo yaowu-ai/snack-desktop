@@ -18,6 +18,9 @@ mod notifications;
 pub(crate) mod overlay;
 mod permissions;
 pub(crate) mod quick_access;
+mod reminder;
+#[cfg(target_os = "macos")]
+mod reminder_macos;
 mod state;
 mod transcribe;
 
@@ -46,6 +49,7 @@ pub(crate) struct MeetingManagerState {
     pub(crate) store: MeetingStore,
     pub(crate) manager: Arc<InstallManager>,
     pub(crate) recorder: Mutex<Option<Recorder>>,
+    pub(crate) reminder: reminder::RecordingReminderMonitor,
 }
 
 static RECORDING_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -102,6 +106,7 @@ fn permission_status(
 pub(crate) struct MeetingSnapshot {
     available: bool,
     supported_platform: bool,
+    recording_reminder_supported: bool,
     platform: String,
     resource: ResourceStatus,
     task: Option<MeetingTask>,
@@ -121,6 +126,7 @@ pub(crate) fn build_snapshot(store: &MeetingStore) -> MeetingSnapshot {
     MeetingSnapshot {
         available: true,
         supported_platform: cfg!(any(target_os = "macos", target_os = "windows")),
+        recording_reminder_supported: reminder::supported(),
         platform: platform_label(),
         resource,
         task: store.load_task(),
@@ -144,10 +150,13 @@ pub(crate) fn emit_state(app: &AppHandle, store: &MeetingStore) {
 pub(crate) fn initialize(app: &AppHandle) -> Result<(), String> {
     let store = MeetingStore::open(app)?;
     let manager = Arc::new(InstallManager::new());
+    let reminder_enabled = store.load_settings().recording_reminder_enabled;
+    let reminder = reminder::RecordingReminderMonitor::new(app.clone());
     app.manage(MeetingManagerState {
         store: store.clone_for_task(),
         manager: Arc::clone(&manager),
         recorder: Mutex::new(None),
+        reminder,
     });
 
     // Resource reconciliation (downloads/verification never survive a crash).
@@ -163,6 +172,9 @@ pub(crate) fn initialize(app: &AppHandle) -> Result<(), String> {
 
     // Task reconciliation.
     reconcile_tasks(app, &store);
+    app.state::<MeetingManagerState>()
+        .reminder
+        .set_enabled(reminder_enabled);
     if let Err(error) = quick_access::register_saved_shortcut(app, &store) {
         crate::logging::write_app_log(
             app,
@@ -434,6 +446,9 @@ pub(crate) fn meeting_update_settings(
     let previous = state.store.load_settings();
     state.store.prepare_settings(&settings)?;
     save_and_activate_settings(&app, &state.store, &previous, &settings)?;
+    state
+        .reminder
+        .set_enabled(settings.recording_reminder_enabled);
     emit_state(&app, &state.store);
     Ok(())
 }
@@ -729,6 +744,7 @@ fn start_recording(
 
     let audio_path = store.audio_path(&recording_id);
     let started_millis = unix_millis();
+    state.reminder.set_recording_active(true);
     match capture::start_recording(audio_path.clone(), started_millis) {
         Ok(recorder) => {
             *state.recorder.lock().expect("recorder poisoned") = Some(recorder);
@@ -745,6 +761,7 @@ fn start_recording(
             Ok(())
         }
         Err(error) => {
+            state.reminder.set_recording_active(false);
             let mut task = store.load_task().ok_or("任务丢失")?;
             task.state = if error.kind == capture::CaptureErrorKind::PermissionDenied {
                 TaskState::PermissionDenied
@@ -802,6 +819,7 @@ fn stop_recording(app: AppHandle, source: &str) -> Result<(), String> {
     }
     task.state = TaskState::Finalizing;
     store.save_task(&task)?;
+    state.reminder.set_recording_active(false);
     emit_state(&app, &store);
     overlay::hide_overlay(&app);
 
