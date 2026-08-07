@@ -13,14 +13,31 @@ pub(crate) fn notify_model_ready(app: &AppHandle) {
     tauri::async_runtime::spawn_blocking(move || show_model_ready_notification(app));
 }
 
-/// Notify after a local transcription finishes. Clicking the notification
-/// starts a new Snack conversation with the configured prompt and transcript.
+/// Fallback notification when the automatic background handoff fails.
+/// Clicking it queues another background attempt with the prompt and local transcript.
 pub(crate) fn notify_transcript_ready(app: &AppHandle, recording_id: &str) {
     let app = app.clone();
     let recording_id = recording_id.to_string();
     tauri::async_runtime::spawn_blocking(move || {
         show_transcript_ready_notification(app, recording_id)
     });
+}
+
+/// Notify after the legacy server-side meeting-notes pipeline reaches `ready`.
+/// Clicking it opens the local meeting task list where the completed record lives.
+pub(crate) fn notify_notes_ready(app: &AppHandle) {
+    let app = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        show_notes_ready_notification(app, MEETING_RECORDS_PATH.to_string())
+    });
+}
+
+/// Notify after the background meeting-notes conversation reaches completion.
+/// The native notification handle provides a reliable desktop click callback.
+pub(crate) fn notify_completed_session(app: &AppHandle, session_id: &str) {
+    let app = app.clone();
+    let target_path = format!("/sessions/{session_id}");
+    tauri::async_runtime::spawn_blocking(move || show_notes_ready_notification(app, target_path));
 }
 
 /// Notify only after the local pipeline has reached a terminal failure.
@@ -75,6 +92,30 @@ fn show_transcript_ready_notification(app: AppHandle, recording_id: String) {
     });
 }
 
+fn show_notes_ready_notification(app: AppHandle, target_path: String) {
+    configure_notification_identity(&app);
+    let result = Notification::new()
+        .summary("会议纪要已生成")
+        .body("点击查看已完成的会议纪要。")
+        .action("open-meeting-records", "查看会议纪要")
+        .show();
+
+    let handle = match result {
+        Ok(handle) => handle,
+        Err(error) => {
+            log_notification_error(&app, &error.to_string());
+            return;
+        }
+    };
+    handle.wait_for_action(move |action| {
+        if should_open_notification(action) {
+            if let Err(error) = open_meeting_path(&app, &target_path) {
+                log_notification_error(&app, &error);
+            }
+        }
+    });
+}
+
 fn show_transcript_failed_notification(app: AppHandle, recording_id: String) {
     configure_notification_identity(&app);
     let result = Notification::new()
@@ -121,7 +162,7 @@ fn log_notification_error(app: &AppHandle, error: &str) {
         app,
         "warn",
         "meeting",
-        "meeting model notification failed",
+        "meeting notification failed",
         Some(&serde_json::json!({ "error": error })),
     );
 }
@@ -179,5 +220,27 @@ mod tests {
             MEETING_RECORDS_PATH,
         );
         assert_eq!(url.as_str(), "http://localhost:3000/meeting");
+    }
+
+    #[test]
+    fn completed_notes_notification_targets_audio_records() {
+        let url = meeting_url(
+            Url::parse("http://localhost:3000/apps?from=notice").expect("valid URL"),
+            MEETING_RECORDS_PATH,
+        );
+        assert_eq!(url.as_str(), "http://localhost:3000/meeting");
+        assert!(should_open_notification("open-meeting-records"));
+    }
+
+    #[test]
+    fn completed_background_notes_notification_targets_exact_session() {
+        let url = meeting_url(
+            Url::parse("http://localhost:3000/meeting").expect("valid URL"),
+            "/sessions/343806935252082688",
+        );
+        assert_eq!(
+            url.as_str(),
+            "http://localhost:3000/sessions/343806935252082688"
+        );
     }
 }

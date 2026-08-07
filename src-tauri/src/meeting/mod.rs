@@ -996,11 +996,53 @@ pub(crate) fn meeting_open_notes_in_chat(
     open_notes_in_chat(&app, &recording_id, false)
 }
 
+#[tauri::command]
+pub(crate) fn meeting_notify_notes_completed(
+    app: AppHandle,
+    window: WebviewWindow,
+    session_id: String,
+) -> Result<(), String> {
+    require_allowed_window(&window)?;
+    if !is_valid_session_id(&session_id) {
+        return Err("无效的会话 ID".to_string());
+    }
+    notifications::notify_completed_session(&app, &session_id);
+    Ok(())
+}
+
+fn is_valid_session_id(session_id: &str) -> bool {
+    !session_id.is_empty()
+        && session_id.len() <= 20
+        && session_id.bytes().all(|byte| byte.is_ascii_digit())
+}
+
 pub(crate) fn open_notes_from_notification(
     app: &AppHandle,
     recording_id: &str,
 ) -> Result<(), String> {
     open_notes_in_chat(app, recording_id, true)
+}
+
+fn handoff_completed_transcript(app: &AppHandle, recording_id: &str) {
+    match open_notes_in_chat(app, recording_id, true) {
+        Ok(()) => crate::logging::write_app_log(
+            app,
+            "info",
+            "meeting-notes-handoff",
+            "transcript queued for background notes generation",
+            Some(&serde_json::json!({ "recordingId": recording_id })),
+        ),
+        Err(error) => {
+            crate::logging::write_app_log(
+                app,
+                "warn",
+                "meeting-notes-handoff",
+                "automatic notes handoff failed; notification fallback is available",
+                Some(&serde_json::json!({ "recordingId": recording_id, "reason": error })),
+            );
+            notifications::notify_transcript_ready(app, recording_id);
+        }
+    }
 }
 
 fn open_notes_in_chat(
@@ -1027,14 +1069,24 @@ fn open_notes_in_chat(
                 .map(|name| name.to_string_lossy().into_owned())
         })
         .unwrap_or_else(|| format!("Snack会议-{}.txt", task.recording_id));
-    crate::record_import::open_prefill_with_attachment(
-        &app,
-        settings.notes_prompt,
-        transcript_name,
-        state::transcript_text(transcript),
-        auto_submit,
-    )?;
-    overlay::hide_overlay(&app);
+    let transcript_text = state::transcript_text(transcript);
+    if auto_submit {
+        crate::record_import::queue_background_with_attachment(
+            app,
+            settings.notes_prompt,
+            transcript_name,
+            transcript_text,
+        )?;
+    } else {
+        crate::record_import::open_prefill_with_attachment(
+            app,
+            settings.notes_prompt,
+            transcript_name,
+            transcript_text,
+            false,
+        )?;
+    }
+    overlay::hide_overlay(app);
     Ok(())
 }
 
@@ -1294,7 +1346,7 @@ fn spawn_transcription(app: AppHandle, store: MeetingStore, recording_id: String
             task.updated_at = now_rfc3339();
             let _ = store.save_task_progress(&task);
             emit_state(&app, &store);
-            notifications::notify_transcript_ready(&app, &recording_id);
+            handoff_completed_transcript(&app, &recording_id);
         })
         .expect("failed to spawn transcription thread");
 }
@@ -1426,8 +1478,8 @@ fn open_permission_settings(_app: &AppHandle, permission: &str) -> Result<(), St
 mod tests {
     use super::permissions::PermissionAccess;
     use super::{
-        can_attempt_recording_without_permission_request, normalize_chat_handoff_state,
-        MeetingTask, TaskState, Transcript,
+        can_attempt_recording_without_permission_request, is_valid_session_id,
+        normalize_chat_handoff_state, MeetingTask, TaskState, Transcript,
     };
 
     #[test]
@@ -1486,5 +1538,13 @@ mod tests {
         task.state = TaskState::TranscribingLocal;
         assert!(!normalize_chat_handoff_state(&mut task));
         assert_eq!(task.state, TaskState::TranscribingLocal);
+    }
+
+    #[test]
+    fn meeting_notification_accepts_only_numeric_session_ids() {
+        assert!(is_valid_session_id("343806935252082688"));
+        assert!(!is_valid_session_id(""));
+        assert!(!is_valid_session_id("session-1"));
+        assert!(!is_valid_session_id("123456789012345678901"));
     }
 }
