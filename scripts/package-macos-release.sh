@@ -23,6 +23,28 @@ fi
 DMG_PATH="${DMG_DIR}/${APP_NAME}_${APP_VERSION}_macos_${RELEASE_ARCH_SUFFIX}.dmg"
 UPDATER_ARCHIVE_PATH="${BUNDLE_ROOT}/macos/${APP_NAME}_${APP_VERSION}_macos_${RELEASE_ARCH_SUFFIX}.app.tar.gz"
 UPDATER_SIGNATURE_PATH="${UPDATER_ARCHIVE_PATH}.sig"
+PYTHON_RUNTIME_ROOT="${APP_PATH}/Contents/Resources/python-runtime/python"
+PYTHON_RUNTIME_ENTITLEMENTS="src-tauri/PythonRuntimeEntitlements.plist"
+
+sign_python_runtime() {
+  if [[ ! -d "${PYTHON_RUNTIME_ROOT}" ]]; then
+    echo "Managed Python runtime not found: ${PYTHON_RUNTIME_ROOT}" >&2
+    return 1
+  fi
+
+  while IFS= read -r -d '' candidate; do
+    if ! file -b "${candidate}" | grep -q '^Mach-O'; then
+      continue
+    fi
+    local -a arguments=(--force --timestamp --options runtime --sign "${APPLE_SIGNING_IDENTITY}")
+    case "${candidate}" in
+      */bin/python | */bin/python3 | */bin/python3.12)
+        arguments+=(--entitlements "${PYTHON_RUNTIME_ENTITLEMENTS}")
+        ;;
+    esac
+    codesign "${arguments[@]}" "${candidate}"
+  done < <(find "${PYTHON_RUNTIME_ROOT}" -type f -print0)
+}
 
 submit_for_notarization() {
   local artifact_path="$1"
@@ -118,6 +140,8 @@ if [[ ! -d "${APP_PATH}" ]]; then
 fi
 
 xattr -crs "${APP_PATH}"
+
+sign_python_runtime
 
 codesign \
   --force \

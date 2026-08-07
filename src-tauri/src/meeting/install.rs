@@ -37,8 +37,6 @@ const INSTALL_PROGRESS_EVENT: &str = "meeting-install-progress";
 const MAX_DOWNLOAD_RETRIES: u32 = 3;
 const MODELSCOPE_DOWNLOADER: &str = include_str!("modelscope_download.py");
 const FUNASR_TRANSCRIBER: &str = include_str!("funasr_transcribe.py");
-const FUNASR_REQUIREMENTS: &str = "funasr==1.3.14\nmodelscope==1.38.1\ntorch>=2.2\ntorchaudio>=2.2\nlibrosa>=0.10\nsoundfile>=0.12\n";
-const RUNTIME_READY_FILE: &str = ".requirements-installed";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -83,6 +81,36 @@ pub(crate) struct InstallManager {
 
 struct InstallInner {
     control: DownloadControl,
+}
+
+struct ModelScopeInstall {
+    app: AppHandle,
+    store: MeetingStore,
+    model: CatalogModel,
+    progress: Arc<Mutex<DownloadProgress>>,
+    model_dir: PathBuf,
+    runtime_dir: PathBuf,
+    cache_dir: PathBuf,
+}
+
+impl ModelScopeInstall {
+    fn new(
+        app: AppHandle,
+        store: MeetingStore,
+        model: CatalogModel,
+        progress: Arc<Mutex<DownloadProgress>>,
+    ) -> Self {
+        let model_dir = store.models_dir().join(model.key.as_str());
+        Self {
+            runtime_dir: model_dir.join("runtime"),
+            cache_dir: model_dir.join("modelscope-cache"),
+            app,
+            store,
+            model,
+            progress,
+            model_dir,
+        }
+    }
 }
 
 impl InstallManager {
@@ -363,189 +391,210 @@ async fn download_modelscope_bundle(
     model: &CatalogModel,
     progress: &Arc<Mutex<DownloadProgress>>,
 ) -> Result<(), (ResourceState, String)> {
+    check_modelscope_disk(store, model)?;
+    let context = ModelScopeInstall::new(
+        app.clone(),
+        store.clone_for_task(),
+        model.clone(),
+        Arc::clone(progress),
+    );
+    tokio::task::spawn_blocking(move || run_modelscope_install(&context))
+        .await
+        .map_err(|error| (ResourceState::Failed, format!("模型安装任务异常: {error}")))?
+        .map_err(|error| (ResourceState::Failed, error))
+}
+
+fn check_modelscope_disk(
+    store: &MeetingStore,
+    model: &CatalogModel,
+) -> Result<(), (ResourceState, String)> {
     let requirement = model.install_requirement_bytes();
-    if !disk_has_room(store.root(), requirement)
-        .map_err(|error| (ResourceState::Failed, format!("无法检查磁盘空间: {error}")))?
-    {
-        return Err((
-            ResourceState::InsufficientDisk,
-            format!(
-                "磁盘空间不足：安装需要约 {}，请释放空间后重试",
-                format_bytes(requirement)
-            ),
-        ));
+    let has_room = disk_has_room(store.root(), requirement)
+        .map_err(|error| (ResourceState::Failed, format!("无法检查磁盘空间: {error}")))?;
+    if has_room {
+        return Ok(());
     }
+    Err((
+        ResourceState::InsufficientDisk,
+        format!(
+            "磁盘空间不足：安装需要约 {}，请释放空间后重试",
+            format_bytes(requirement)
+        ),
+    ))
+}
 
-    let app = app.clone();
-    let store = store.clone_for_task();
-    let model = model.clone();
-    let progress = Arc::clone(progress);
-    tokio::task::spawn_blocking(move || {
-        let model_dir = store.models_dir().join(model.key.as_str());
-        let runtime_dir = model_dir.join("runtime");
-        let cache_dir = model_dir.join("modelscope-cache");
-        fs::create_dir_all(&runtime_dir)
-            .map_err(|error| format!("无法创建本地运行环境: {error}"))?;
-        fs::write(runtime_dir.join("requirements.txt"), FUNASR_REQUIREMENTS)
-            .map_err(|error| format!("无法写入运行环境配置: {error}"))?;
-        fs::write(
-            runtime_dir.join("modelscope_download.py"),
-            MODELSCOPE_DOWNLOADER,
-        )
-        .map_err(|error| format!("无法写入下载脚本: {error}"))?;
-        fs::write(runtime_dir.join("funasr_transcribe.py"), FUNASR_TRANSCRIBER)
-            .map_err(|error| format!("无法写入转写脚本: {error}"))?;
+fn run_modelscope_install(context: &ModelScopeInstall) -> Result<(), String> {
+    prepare_modelscope_files(context)?;
+    set_install_stage(context, ResourceState::Installing);
+    let python = crate::meeting::python_runtime::ensure_ready(
+        crate::meeting::python_runtime::RuntimeSetup {
+            app: &context.app,
+            runtime_dir: &context.runtime_dir,
+        },
+    )?;
+    download_modelscope_snapshot(context, &python)?;
+    finalize_modelscope_install(context)
+}
 
-        let python = runtime_dir.join("venv/bin/python");
-        let runtime_ready = runtime_dir.join(RUNTIME_READY_FILE);
-        set_resource(&store, ResourceState::Installing, None);
-        crate::meeting::emit_state(&app, &store);
-        if !python.exists() {
-            let status = Command::new("python3")
-                .args(["-m", "venv"])
-                .arg(runtime_dir.join("venv"))
-                .status()
-                .map_err(|error| format!("无法启动 Python 3: {error}"))?;
-            if !status.success() {
-                return Err(
-                    "无法创建本地 Python 运行环境，请安装 Python 3.10 或更高版本".to_string(),
-                );
-            }
-            let _ = fs::remove_file(&runtime_ready);
-        }
-        if !runtime_ready.exists() {
-            let status = Command::new(&python)
-                .args(["-m", "pip", "install", "--disable-pip-version-check", "-r"])
-                .arg(runtime_dir.join("requirements.txt"))
-                .status()
-                .map_err(|error| format!("无法安装本地转写依赖: {error}"))?;
-            if !status.success() {
-                return Err("本地转写依赖安装失败，请检查网络后重试".to_string());
-            }
-            fs::write(&runtime_ready, now_rfc3339())
-                .map_err(|error| format!("无法记录本地运行环境状态: {error}"))?;
-        }
+fn prepare_modelscope_files(context: &ModelScopeInstall) -> Result<(), String> {
+    fs::create_dir_all(&context.runtime_dir)
+        .map_err(|error| format!("无法创建本地运行环境: {error}"))?;
+    fs::write(
+        context.runtime_dir.join("modelscope_download.py"),
+        MODELSCOPE_DOWNLOADER,
+    )
+    .map_err(|error| format!("无法写入下载脚本: {error}"))?;
+    fs::write(
+        context.runtime_dir.join("funasr_transcribe.py"),
+        FUNASR_TRANSCRIBER,
+    )
+    .map_err(|error| format!("无法写入转写脚本: {error}"))
+}
 
-        set_resource(&store, ResourceState::Downloading, None);
-        crate::meeting::emit_state(&app, &store);
-        let mut child = Command::new(&python)
-            .arg(runtime_dir.join("modelscope_download.py"))
-            .env("MODELSCOPE_CACHE", &cache_dir)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .map_err(|error| format!("无法启动 ModelScope 下载: {error}"))?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| "无法读取下载进度".to_string())?;
-        for line in BufReader::new(stdout).lines() {
-            let line = line.map_err(|error| format!("读取下载进度失败: {error}"))?;
-            let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
-                continue;
-            };
-            if value.get("type").and_then(|item| item.as_str()) != Some("progress") {
-                continue;
-            }
-            let downloaded = value
-                .get("downloadedBytes")
-                .and_then(|item| item.as_u64())
-                .unwrap_or(0);
-            let total = value
-                .get("totalBytes")
-                .and_then(|item| item.as_u64())
-                .unwrap_or(model.size_bytes);
-            let speed = value
-                .get("speedBytesPerSec")
-                .and_then(|item| item.as_u64())
-                .unwrap_or(0);
-            let percent = value
-                .get("percent")
-                .and_then(|item| item.as_u64())
-                .unwrap_or(0)
-                .min(99) as u8;
-            {
-                let mut current = progress.lock().expect("progress poisoned");
-                current.downloaded_bytes = downloaded;
-                current.total_bytes = total;
-                current.speed_bytes_per_sec = speed;
-                current.percent = percent;
-            }
-            let mut resource = store.load_resource();
-            resource.download = Some(DownloadProgress {
-                downloaded_bytes: downloaded,
-                total_bytes: total,
-                speed_bytes_per_sec: speed,
-                percent,
-            });
-            let _ = store.save_resource(&resource);
-            let _ = app.emit(
-                INSTALL_PROGRESS_EVENT,
-                InstallProgressPayload {
-                    stage: "downloading",
-                    percent,
-                    downloaded_bytes: downloaded,
-                    total_bytes: total,
-                    speed_bytes_per_sec: speed,
-                },
-            );
-            crate::meeting::emit_state(&app, &store);
-        }
-        let status = child
-            .wait()
-            .map_err(|error| format!("等待 ModelScope 下载失败: {error}"))?;
-        if !status.success() {
-            return Err("ModelScope 下载失败，请检查网络后重试".to_string());
-        }
+fn download_modelscope_snapshot(context: &ModelScopeInstall, python: &Path) -> Result<(), String> {
+    set_install_stage(context, ResourceState::Downloading);
+    let log_path = context.runtime_dir.join("modelscope-download.log");
+    let mut child = spawn_modelscope_downloader(context, python, &log_path)?;
+    consume_modelscope_progress(context, &mut child)?;
+    let status = child
+        .wait()
+        .map_err(|error| format!("等待 ModelScope 下载失败: {error}"))?;
+    if status.success() {
+        crate::meeting::python_runtime::sanitize_download_log(&log_path);
+        return Ok(());
+    }
+    Err(crate::meeting::python_runtime::model_download_failure(
+        &context.app,
+        &log_path,
+        status.code(),
+    ))
+}
 
-        set_resource(&store, ResourceState::Installing, None);
-        let marker = model_dir.join(model.filename);
-        fs::write(
-            &marker,
-            serde_json::json!({"source":"modelscope", "completedAt": now_rfc3339()}).to_string(),
-        )
-        .map_err(|error| format!("无法写入模型完成标记: {error}"))?;
-        persist_json_atomic(
-            &model_dir.join(MANIFEST_FILE),
-            &ModelManifest {
-                model_key: model.key.as_str().to_string(),
-                catalog_version: model.catalog_version,
-                filename: model.filename.to_string(),
-                size_bytes: model.size_bytes,
-                sha256: model.sha256.to_string(),
-                installed_at: now_rfc3339(),
-                artifacts: Vec::new(),
-            },
-        )
-        .map_err(|error| format!("无法写入模型清单: {error}"))?;
-        let installed = directory_size(&model_dir);
-        let mut resource = store.load_resource();
-        resource.installed_size_bytes = Some(installed);
-        resource.download = Some(DownloadProgress {
-            downloaded_bytes: installed,
-            total_bytes: installed,
-            speed_bytes_per_sec: 0,
-            percent: 100,
-        });
-        resource.error = None;
-        store
-            .save_resource(&resource)
-            .map_err(|error| format!("无法保存模型状态: {error}"))?;
-        let _ = app.emit(
-            INSTALL_PROGRESS_EVENT,
-            InstallProgressPayload {
-                stage: "installed",
-                percent: 100,
-                downloaded_bytes: installed,
-                total_bytes: installed,
-                speed_bytes_per_sec: 0,
-            },
-        );
-        Ok(())
+fn spawn_modelscope_downloader(
+    context: &ModelScopeInstall,
+    python: &Path,
+    log_path: &Path,
+) -> Result<std::process::Child, String> {
+    let stderr =
+        fs::File::create(log_path).map_err(|error| format!("无法创建模型下载日志: {error}"))?;
+    Command::new(python)
+        .arg(context.runtime_dir.join("modelscope_download.py"))
+        .env("MODELSCOPE_CACHE", &context.cache_dir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::from(stderr))
+        .spawn()
+        .map_err(|error| format!("无法启动 ModelScope 下载: {error}"))
+}
+
+fn consume_modelscope_progress(
+    context: &ModelScopeInstall,
+    child: &mut std::process::Child,
+) -> Result<(), String> {
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "无法读取下载进度".to_string())?;
+    for line in BufReader::new(stdout).lines() {
+        let line = line.map_err(|error| format!("读取下载进度失败: {error}"))?;
+        if let Some(update) = parse_modelscope_progress(&line, context.model.size_bytes) {
+            publish_modelscope_progress(context, update);
+        }
+    }
+    Ok(())
+}
+
+fn parse_modelscope_progress(line: &str, fallback_total: u64) -> Option<DownloadProgress> {
+    let value = serde_json::from_str::<serde_json::Value>(line).ok()?;
+    if value.get("type").and_then(|item| item.as_str()) != Some("progress") {
+        return None;
+    }
+    Some(DownloadProgress {
+        downloaded_bytes: json_u64(&value, "downloadedBytes", 0),
+        total_bytes: json_u64(&value, "totalBytes", fallback_total),
+        speed_bytes_per_sec: json_u64(&value, "speedBytesPerSec", 0),
+        percent: json_u64(&value, "percent", 0).min(99) as u8,
     })
-    .await
-    .map_err(|error| (ResourceState::Failed, format!("模型安装任务异常: {error}")))?
-    .map_err(|error| (ResourceState::Failed, error))
+}
+
+fn json_u64(value: &serde_json::Value, key: &str, fallback: u64) -> u64 {
+    value
+        .get(key)
+        .and_then(|item| item.as_u64())
+        .unwrap_or(fallback)
+}
+
+fn publish_modelscope_progress(context: &ModelScopeInstall, update: DownloadProgress) {
+    *context.progress.lock().expect("progress poisoned") = update.clone();
+    let mut resource = context.store.load_resource();
+    resource.download = Some(update.clone());
+    context.store.save_resource(&resource).ok();
+    emit_install_progress(&context.app, "downloading", &update);
+    crate::meeting::emit_state(&context.app, &context.store);
+}
+
+fn finalize_modelscope_install(context: &ModelScopeInstall) -> Result<(), String> {
+    set_install_stage(context, ResourceState::Installing);
+    write_modelscope_manifest(context)?;
+    let installed = directory_size(&context.model_dir);
+    let completed = DownloadProgress {
+        downloaded_bytes: installed,
+        total_bytes: installed,
+        speed_bytes_per_sec: 0,
+        percent: 100,
+    };
+    save_installed_resource(context, &completed)?;
+    emit_install_progress(&context.app, "installed", &completed);
+    Ok(())
+}
+
+fn write_modelscope_manifest(context: &ModelScopeInstall) -> Result<(), String> {
+    let marker = context.model_dir.join(context.model.filename);
+    let marker_body =
+        serde_json::json!({"source":"modelscope", "completedAt": now_rfc3339()}).to_string();
+    fs::write(marker, marker_body).map_err(|error| format!("无法写入模型完成标记: {error}"))?;
+    let manifest = ModelManifest {
+        model_key: context.model.key.as_str().to_string(),
+        catalog_version: context.model.catalog_version,
+        filename: context.model.filename.to_string(),
+        size_bytes: context.model.size_bytes,
+        sha256: context.model.sha256.to_string(),
+        installed_at: now_rfc3339(),
+        artifacts: Vec::new(),
+    };
+    persist_json_atomic(&context.model_dir.join(MANIFEST_FILE), &manifest)
+        .map_err(|error| format!("无法写入模型清单: {error}"))
+}
+
+fn save_installed_resource(
+    context: &ModelScopeInstall,
+    completed: &DownloadProgress,
+) -> Result<(), String> {
+    let mut resource = context.store.load_resource();
+    resource.installed_size_bytes = Some(completed.downloaded_bytes);
+    resource.download = Some(completed.clone());
+    resource.error = None;
+    context
+        .store
+        .save_resource(&resource)
+        .map_err(|error| format!("无法保存模型状态: {error}"))
+}
+
+fn emit_install_progress(app: &AppHandle, stage: &'static str, update: &DownloadProgress) {
+    let _ = app.emit(
+        INSTALL_PROGRESS_EVENT,
+        InstallProgressPayload {
+            stage,
+            percent: update.percent,
+            downloaded_bytes: update.downloaded_bytes,
+            total_bytes: update.total_bytes,
+            speed_bytes_per_sec: update.speed_bytes_per_sec,
+        },
+    );
+}
+
+fn set_install_stage(context: &ModelScopeInstall, state: ResourceState) {
+    set_resource(&context.store, state, None);
+    crate::meeting::emit_state(&context.app, &context.store);
 }
 
 // ---------------------------------------------------------------------------
@@ -994,7 +1043,7 @@ pub(crate) fn free_disk_bytes(store: &MeetingStore) -> Result<u64, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{format_bytes, ModelManifest, PART_EXTENSION};
+    use super::{format_bytes, parse_modelscope_progress, ModelManifest, PART_EXTENSION};
 
     #[test]
     fn format_bytes_is_readable() {
@@ -1022,5 +1071,17 @@ mod tests {
     #[test]
     fn part_extension_constant() {
         assert_eq!(PART_EXTENSION, "part");
+    }
+
+    #[test]
+    fn parses_modelscope_progress_without_exceeding_99_percent() {
+        let update = parse_modelscope_progress(
+            r#"{"type":"progress","downloadedBytes":40,"percent":100}"#,
+            80,
+        )
+        .unwrap();
+        assert_eq!(update.downloaded_bytes, 40);
+        assert_eq!(update.total_bytes, 80);
+        assert_eq!(update.percent, 99);
     }
 }

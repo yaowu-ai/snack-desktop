@@ -7,7 +7,7 @@
 //! `update_required` so the user can explicitly confirm a new download.
 //! Downloads never happen silently.
 
-pub(crate) const CATALOG_VERSION: u32 = 3;
+pub(crate) const CATALOG_VERSION: u32 = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ModelKey {

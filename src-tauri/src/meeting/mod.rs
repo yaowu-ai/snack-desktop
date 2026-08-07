@@ -17,6 +17,7 @@ mod network;
 mod notifications;
 pub(crate) mod overlay;
 mod permissions;
+mod python_runtime;
 pub(crate) mod quick_access;
 mod reminder;
 #[cfg(target_os = "macos")]

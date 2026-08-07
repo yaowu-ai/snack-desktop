@@ -1,0 +1,10 @@
+# Snack local transcription direct-dependency lock.
+# Intel macOS uses the final PyTorch line that publishes x86_64 wheels.
+funasr==1.3.14
+modelscope==1.38.1
+torch==2.2.2 ; sys_platform == "darwin" and platform_machine == "x86_64"
+torchaudio==2.2.2 ; sys_platform == "darwin" and platform_machine == "x86_64"
+torch==2.7.1 ; sys_platform != "darwin" or platform_machine != "x86_64"
+torchaudio==2.7.1 ; sys_platform != "darwin" or platform_machine != "x86_64"
+librosa==0.11.0
+soundfile==0.13.1
