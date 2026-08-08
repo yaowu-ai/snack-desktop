@@ -303,18 +303,17 @@ const OVERLAY_HTML: &str = r#"<!DOCTYPE html>
 <style>
   :root { color-scheme: light; }
   * { margin: 0; padding: 0; box-sizing: border-box; }
-  html, body { width: 100%; height: 100%; overflow: hidden; }
-  html { background: transparent; }
+  html, body { width: 100%; height: 100%; overflow: hidden; background: transparent; }
   body {
     font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif;
-    background: rgba(255, 255, 255, 0.98); border: 1px solid #fee5d0;
-    border-radius: 12px; color: #0f172a;
-    overflow: hidden;
+    color: #0f172a;
     user-select: none; -webkit-user-select: none;
   }
   .bar {
     position: relative; display: flex; align-items: center; gap: 10px;
-    height: 88px; padding: 17px 12px 8px; cursor: grab;
+    width: 100%; height: 100%; padding: 17px 12px 8px; cursor: grab;
+    overflow: hidden; border: 1px solid #fee5d0; border-radius: 12px;
+    background: rgba(255, 255, 255, 0.98);
   }
   .bar:active { cursor: grabbing; }
   .drag-hint {
@@ -468,15 +467,18 @@ const REMINDER_HTML: &str = r#"<!DOCTYPE html>
 <style>
   :root { color-scheme: light; }
   * { margin: 0; padding: 0; box-sizing: border-box; }
-  html, body { width: 100%; height: 100%; overflow: hidden; }
-  html { background: transparent; }
+  html, body { width: 100%; height: 100%; overflow: hidden; background: transparent; }
   body {
     font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif;
-    background: rgba(255, 255, 255, .98); border: 1px solid #fee5d0;
-    border-radius: 14px; color: #0f172a; overflow: hidden;
+    color: #0f172a;
     user-select: none; -webkit-user-select: none;
   }
-  .card { position: relative; display: flex; align-items: center; gap: 12px; height: 116px; padding: 18px; }
+  .card {
+    position: relative; display: flex; align-items: center; gap: 12px;
+    width: 100%; height: 100%; padding: 18px; overflow: hidden;
+    border: 1px solid #fee5d0; border-radius: 14px;
+    background: rgba(255, 255, 255, .98);
+  }
   .icon {
     display: flex; width: 38px; height: 38px; flex: 0 0 auto; align-items: center; justify-content: center;
     border-radius: 12px; background: #fff2e8; color: #fe720a; font-size: 20px;
@@ -587,8 +589,13 @@ mod tests {
         assert!(!html.contains("生成纪要"));
         assert!(!html.contains("做会议纪要"));
         assert!(html.contains("color-scheme: light"));
-        assert!(html.contains("html { background: transparent; }"));
+        assert!(html.contains(
+            "html, body { width: 100%; height: 100%; overflow: hidden; background: transparent; }"
+        ));
+        assert!(html.contains("width: 100%; height: 100%; padding: 17px 12px 8px"));
+        assert!(html.contains("overflow: hidden; border: 1px solid #fee5d0; border-radius: 12px"));
         assert!(html.contains("background: rgba(255, 255, 255, 0.98)"));
+        assert!(!html.contains("body {\n    font-family: -apple-system, BlinkMacSystemFont, \"PingFang SC\", \"Microsoft YaHei\", sans-serif;\n    background:"));
         assert!(html.contains("invoke('focus_recording_overlay')"));
         assert!(html.contains("拖动可移动"));
         assert!(!html.contains("aria-label=\"最小化\""));
@@ -625,6 +632,8 @@ mod tests {
         assert!(html.contains("dismiss_recording_reminder"));
         assert!(html.contains("15000"));
         assert!(html.contains("开始录音"));
+        assert!(html.contains("width: 100%; height: 100%; padding: 18px; overflow: hidden"));
+        assert!(html.contains("border: 1px solid #fee5d0; border-radius: 14px"));
         assert!(!html.contains("Snack Record"));
         assert!(!html.contains("http://"));
         assert!(!html.contains("https://"));
