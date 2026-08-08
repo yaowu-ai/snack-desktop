@@ -5,6 +5,7 @@
 //! even if the network drops or the main window is hidden, the user can still
 //! end the recording from the overlay.
 
+use tauri::window::Color;
 use tauri::{
     AppHandle, Emitter, LogicalSize, Manager, PhysicalPosition, WebviewUrl, WebviewWindowBuilder,
 };
@@ -136,6 +137,9 @@ pub(crate) fn show_overlay(app: &AppHandle, state: OverlayState) -> Result<(), S
     .always_on_top(true)
     .skip_taskbar(true)
     .shadow(false)
+    .transparent(true)
+    .background_color(Color(0, 0, 0, 0))
+    .accept_first_mouse(true)
     .visible(false)
     .build()
     .map_err(|error| format!("无法创建录音浮层: {error}"))?;
@@ -196,6 +200,9 @@ pub(crate) fn show_recording_reminder(
     .always_on_top(true)
     .skip_taskbar(true)
     .shadow(true)
+    .transparent(true)
+    .background_color(Color(0, 0, 0, 0))
+    .accept_first_mouse(true)
     .focused(false)
     .visible(false)
     .initialization_script(format!(
@@ -280,6 +287,14 @@ pub(crate) fn dismiss_overlay(window: tauri::WebviewWindow) -> Result<(), String
     window.hide().map_err(|error| error.to_string())
 }
 
+#[tauri::command]
+pub(crate) fn focus_recording_overlay(window: tauri::WebviewWindow) -> Result<(), String> {
+    if !is_overlay_window(&window) {
+        return Err("只有录音浮窗可以获取焦点".to_string());
+    }
+    window.set_focus().map_err(|error| error.to_string())
+}
+
 const OVERLAY_HTML: &str = r#"<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -288,11 +303,13 @@ const OVERLAY_HTML: &str = r#"<!DOCTYPE html>
 <style>
   :root { color-scheme: light; }
   * { margin: 0; padding: 0; box-sizing: border-box; }
-  html, body { height: 100%; overflow: hidden; }
+  html, body { width: 100%; height: 100%; overflow: hidden; }
+  html { background: transparent; }
   body {
     font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif;
     background: rgba(255, 255, 255, 0.98); border: 1px solid #fee5d0;
     border-radius: 12px; color: #0f172a;
+    overflow: hidden;
     user-select: none; -webkit-user-select: none;
   }
   .bar {
@@ -428,6 +445,9 @@ const OVERLAY_HTML: &str = r#"<!DOCTYPE html>
       actionEl.addEventListener('click', function () {
         stopRecording();
       });
+      document.documentElement.addEventListener('mouseenter', function () {
+        invoke('focus_recording_overlay').catch(function () {});
+      });
       render();
       try {
         var eventApi = window.__TAURI__ && window.__TAURI__.event;
@@ -449,10 +469,12 @@ const REMINDER_HTML: &str = r#"<!DOCTYPE html>
   :root { color-scheme: light; }
   * { margin: 0; padding: 0; box-sizing: border-box; }
   html, body { width: 100%; height: 100%; overflow: hidden; }
+  html { background: transparent; }
   body {
     font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif;
     background: rgba(255, 255, 255, .98); border: 1px solid #fee5d0;
-    border-radius: 14px; color: #0f172a; user-select: none; -webkit-user-select: none;
+    border-radius: 14px; color: #0f172a; overflow: hidden;
+    user-select: none; -webkit-user-select: none;
   }
   .card { position: relative; display: flex; align-items: center; gap: 12px; height: 116px; padding: 18px; }
   .icon {
@@ -565,7 +587,9 @@ mod tests {
         assert!(!html.contains("生成纪要"));
         assert!(!html.contains("做会议纪要"));
         assert!(html.contains("color-scheme: light"));
+        assert!(html.contains("html { background: transparent; }"));
         assert!(html.contains("background: rgba(255, 255, 255, 0.98)"));
+        assert!(html.contains("invoke('focus_recording_overlay')"));
         assert!(html.contains("拖动可移动"));
         assert!(!html.contains("aria-label=\"最小化\""));
         assert!(!html.contains("aria-label=\"关闭\""));

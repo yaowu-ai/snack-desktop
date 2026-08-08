@@ -1035,14 +1035,8 @@ fn is_valid_session_id(session_id: &str) -> bool {
         && session_id.bytes().all(|byte| byte.is_ascii_digit())
 }
 
-pub(crate) fn open_notes_from_notification(
-    app: &AppHandle,
-    recording_id: &str,
-) -> Result<(), String> {
-    open_notes_in_chat(app, recording_id, true)
-}
-
 fn handoff_completed_transcript(app: &AppHandle, recording_id: &str) {
+    notifications::notify_transcript_ready(app);
     match open_notes_in_chat(app, recording_id, true) {
         Ok(()) => crate::logging::write_app_log(
             app,
@@ -1056,10 +1050,9 @@ fn handoff_completed_transcript(app: &AppHandle, recording_id: &str) {
                 app,
                 "warn",
                 "meeting-notes-handoff",
-                "automatic notes handoff failed; notification fallback is available",
+                "automatic notes handoff failed; transcript remains available in meeting tasks",
                 Some(&serde_json::json!({ "recordingId": recording_id, "reason": error })),
             );
-            notifications::notify_transcript_ready(app, recording_id);
         }
     }
 }

@@ -1,6 +1,15 @@
 use notify_rust::Notification;
 use tauri::{AppHandle, Manager, Url};
 
+#[cfg(target_os = "macos")]
+use objc2::{
+    ffi,
+    runtime::{AnyClass, AnyObject, Bool, Imp, Sel},
+    sel,
+};
+#[cfg(target_os = "macos")]
+use std::sync::OnceLock;
+
 const MEETING_SETTINGS_PATH: &str = "/meeting/settings";
 const MEETING_RECORDS_PATH: &str = "/meeting";
 
@@ -13,14 +22,12 @@ pub(crate) fn notify_model_ready(app: &AppHandle) {
     tauri::async_runtime::spawn_blocking(move || show_model_ready_notification(app));
 }
 
-/// Fallback notification when the automatic background handoff fails.
-/// Clicking it queues another background attempt with the prompt and local transcript.
-pub(crate) fn notify_transcript_ready(app: &AppHandle, recording_id: &str) {
+/// Notify after a local transcript is persisted successfully.
+/// Clicking it opens the audio transcription task list without duplicating the
+/// automatic meeting-notes handoff.
+pub(crate) fn notify_transcript_ready(app: &AppHandle) {
     let app = app.clone();
-    let recording_id = recording_id.to_string();
-    tauri::async_runtime::spawn_blocking(move || {
-        show_transcript_ready_notification(app, recording_id)
-    });
+    tauri::async_runtime::spawn_blocking(move || show_transcript_ready_notification(app));
 }
 
 /// Notify after the legacy server-side meeting-notes pipeline reaches `ready`.
@@ -68,12 +75,12 @@ fn show_model_ready_notification(app: AppHandle) {
     handle.wait_for_action(move |action| handle_notification_action(&app, action));
 }
 
-fn show_transcript_ready_notification(app: AppHandle, recording_id: String) {
+fn show_transcript_ready_notification(app: AppHandle) {
     configure_notification_identity(&app);
     let result = Notification::new()
         .summary("音频转写已完成")
-        .body("点击调用 Snack，立即生成会议纪要。")
-        .action("generate-meeting-notes", "生成会议纪要")
+        .body("点击查看音频转写任务。")
+        .action("open-meeting-records", "查看任务")
         .show();
 
     let handle = match result {
@@ -85,7 +92,7 @@ fn show_transcript_ready_notification(app: AppHandle, recording_id: String) {
     };
     handle.wait_for_action(move |action| {
         if should_open_notification(action) {
-            if let Err(error) = super::open_notes_from_notification(&app, &recording_id) {
+            if let Err(error) = open_meeting_path(&app, MEETING_RECORDS_PATH) {
                 log_notification_error(&app, &error);
             }
         }
@@ -143,9 +150,56 @@ fn show_transcript_failed_notification(app: AppHandle, recording_id: String) {
 
 fn configure_notification_identity(app: &AppHandle) {
     #[cfg(target_os = "macos")]
-    let _ = notify_rust::set_application(&app.config().identifier);
+    {
+        let _ = notify_rust::set_application(&app.config().identifier);
+        if !enable_macos_foreground_notifications() {
+            log_notification_error(app, "unable to enable foreground notification presentation");
+        }
+    }
     #[cfg(not(target_os = "macos"))]
     let _ = app;
+}
+
+#[cfg(target_os = "macos")]
+fn enable_macos_foreground_notifications() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        let selector = sel!(userNotificationCenter:shouldPresentNotification:);
+        let Some(class) = AnyClass::get(c"NotificationCenterDelegate") else {
+            return false;
+        };
+        if class.instance_method(selector).is_some() {
+            return true;
+        }
+
+        let implementation = present_notification_while_foreground
+            as extern "C-unwind" fn(&AnyObject, Sel, &AnyObject, &AnyObject) -> Bool;
+        // SAFETY: Objective-C IMP is an erased function pointer. The concrete
+        // signature is validated against the selector and encoding below.
+        let implementation: Imp = unsafe { std::mem::transmute(implementation) };
+        // SAFETY: `NotificationCenterDelegate` is the notify-rust macOS delegate.
+        // The selector accepts the center and notification objects and returns
+        // Objective-C BOOL, matching the `c@:@@` runtime encoding below.
+        unsafe {
+            ffi::class_addMethod(
+                class as *const AnyClass as *mut AnyClass,
+                selector,
+                implementation,
+                c"c@:@@".as_ptr(),
+            )
+            .as_bool()
+        }
+    })
+}
+
+#[cfg(target_os = "macos")]
+extern "C-unwind" fn present_notification_while_foreground(
+    _delegate: &AnyObject,
+    _selector: Sel,
+    _center: &AnyObject,
+    _notification: &AnyObject,
+) -> Bool {
+    Bool::YES
 }
 
 fn handle_notification_action(app: &AppHandle, action: &str) {
@@ -223,6 +277,16 @@ mod tests {
     }
 
     #[test]
+    fn successful_transcription_notification_targets_audio_records() {
+        let url = meeting_url(
+            Url::parse("http://localhost:3000/apps?from=notice").expect("valid URL"),
+            MEETING_RECORDS_PATH,
+        );
+        assert_eq!(url.as_str(), "http://localhost:3000/meeting");
+        assert!(should_open_notification("open-meeting-records"));
+    }
+
+    #[test]
     fn completed_notes_notification_targets_audio_records() {
         let url = meeting_url(
             Url::parse("http://localhost:3000/apps?from=notice").expect("valid URL"),
@@ -242,5 +306,15 @@ mod tests {
             url.as_str(),
             "http://localhost:3000/sessions/343806935252082688"
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_notification_delegate_presents_while_foreground() {
+        assert!(enable_macos_foreground_notifications());
+        let class = AnyClass::get(c"NotificationCenterDelegate").expect("notify-rust delegate");
+        assert!(class
+            .instance_method(sel!(userNotificationCenter:shouldPresentNotification:))
+            .is_some());
     }
 }

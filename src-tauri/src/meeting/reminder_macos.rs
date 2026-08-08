@@ -444,8 +444,8 @@ fn select_display(displays: &[SCDisplay], window: Option<&SCWindow>) -> Option<S
 
 fn meeting_application_name(bundle: &str) -> Option<&'static str> {
     match bundle {
-        "com.tencent.wwmapp" | "com.tencent.WeWorkMac" => Some("企业微信"),
-        "com.electron.lark" | "com.bytedance.ee.lark" => Some("飞书"),
+        "com.tencent.wwmapp" | "com.tencent.WeWorkMac" => Some("企业微信会议"),
+        "com.electron.lark" | "com.bytedance.ee.lark" => Some("飞书会议"),
         "com.tencent.meeting" | "com.tencent.wemeet" => Some("腾讯会议"),
         "us.zoom.xos" => Some("Zoom"),
         _ => None,
@@ -455,11 +455,7 @@ fn meeting_application_name(bundle: &str) -> Option<&'static str> {
 fn is_dedicated_meeting_bundle(bundle: &str) -> bool {
     matches!(
         bundle,
-        "com.tencent.wwmapp"
-            | "com.tencent.WeWorkMac"
-            | "com.tencent.meeting"
-            | "com.tencent.wemeet"
-            | "us.zoom.xos"
+        "com.tencent.meeting" | "com.tencent.wemeet" | "us.zoom.xos"
     )
 }
 
@@ -492,21 +488,28 @@ mod tests {
 
     #[test]
     fn known_meeting_apps_match_the_reference_set() {
-        assert_eq!(meeting_application_name("com.electron.lark"), Some("飞书"));
+        assert_eq!(
+            meeting_application_name("com.electron.lark"),
+            Some("飞书会议")
+        );
         assert_eq!(
             meeting_application_name("com.tencent.wwmapp"),
-            Some("企业微信")
+            Some("企业微信会议")
         );
         assert_eq!(
             meeting_application_name("com.tencent.WeWorkMac"),
-            Some("企业微信")
+            Some("企业微信会议")
+        );
+        assert_eq!(
+            meeting_application_name("com.tencent.meeting"),
+            Some("腾讯会议")
         );
         assert_eq!(meeting_application_name("us.zoom.xos"), Some("Zoom"));
         assert_eq!(meeting_application_name("com.example.other"), None);
     }
 
     #[test]
-    fn feishu_requires_a_meeting_like_window_title() {
+    fn collaboration_apps_require_a_meeting_like_window_title() {
         assert!(window_values_suggest_meeting(
             "com.electron.lark",
             Some("产品会议"),
@@ -519,10 +522,26 @@ mod tests {
             900.0,
             700.0,
         ));
+        assert!(window_values_suggest_meeting(
+            "com.tencent.WeWorkMac",
+            Some("项目通话"),
+            900.0,
+            700.0,
+        ));
+        assert!(!window_values_suggest_meeting(
+            "com.tencent.WeWorkMac",
+            Some("企业微信"),
+            900.0,
+            700.0,
+        ));
     }
 
     #[test]
     fn dedicated_meeting_apps_accept_a_meaningful_window() {
+        assert!(!is_dedicated_meeting_bundle("com.tencent.WeWorkMac"));
+        assert!(!is_dedicated_meeting_bundle("com.electron.lark"));
+        assert!(is_dedicated_meeting_bundle("com.tencent.meeting"));
+        assert!(is_dedicated_meeting_bundle("us.zoom.xos"));
         assert!(window_values_suggest_meeting(
             "com.tencent.meeting",
             None,
