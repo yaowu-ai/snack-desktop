@@ -444,7 +444,7 @@ fn select_display(displays: &[SCDisplay], window: Option<&SCWindow>) -> Option<S
 
 fn meeting_application_name(bundle: &str) -> Option<&'static str> {
     match bundle {
-        "com.tencent.wwmapp" | "com.tencent.WeWorkMac" => Some("企业微信会议"),
+        "com.tencent.wwmapp" => Some("企业微信·会议"),
         "com.electron.lark" | "com.bytedance.ee.lark" => Some("飞书会议"),
         "com.tencent.meeting" | "com.tencent.wemeet" => Some("腾讯会议"),
         "us.zoom.xos" => Some("Zoom"),
@@ -455,7 +455,7 @@ fn meeting_application_name(bundle: &str) -> Option<&'static str> {
 fn is_dedicated_meeting_bundle(bundle: &str) -> bool {
     matches!(
         bundle,
-        "com.tencent.meeting" | "com.tencent.wemeet" | "us.zoom.xos"
+        "com.tencent.wwmapp" | "com.tencent.meeting" | "com.tencent.wemeet" | "us.zoom.xos"
     )
 }
 
@@ -494,12 +494,9 @@ mod tests {
         );
         assert_eq!(
             meeting_application_name("com.tencent.wwmapp"),
-            Some("企业微信会议")
+            Some("企业微信·会议")
         );
-        assert_eq!(
-            meeting_application_name("com.tencent.WeWorkMac"),
-            Some("企业微信会议")
-        );
+        assert_eq!(meeting_application_name("com.tencent.WeWorkMac"), None);
         assert_eq!(
             meeting_application_name("com.tencent.meeting"),
             Some("腾讯会议")
@@ -522,15 +519,9 @@ mod tests {
             900.0,
             700.0,
         ));
-        assert!(window_values_suggest_meeting(
-            "com.tencent.WeWorkMac",
-            Some("项目通话"),
-            900.0,
-            700.0,
-        ));
         assert!(!window_values_suggest_meeting(
             "com.tencent.WeWorkMac",
-            Some("企业微信"),
+            Some("项目会议通话"),
             900.0,
             700.0,
         ));
@@ -538,6 +529,7 @@ mod tests {
 
     #[test]
     fn dedicated_meeting_apps_accept_a_meaningful_window() {
+        assert!(is_dedicated_meeting_bundle("com.tencent.wwmapp"));
         assert!(!is_dedicated_meeting_bundle("com.tencent.WeWorkMac"));
         assert!(!is_dedicated_meeting_bundle("com.electron.lark"));
         assert!(is_dedicated_meeting_bundle("com.tencent.meeting"));
