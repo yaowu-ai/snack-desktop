@@ -8,10 +8,14 @@ use serde::Deserialize;
 use crate::meeting::catalog::ModelKey;
 use crate::meeting::state::TranscriptSegment;
 
-pub(crate) struct TranscriptionOutcome {
-    pub(crate) segments: Vec<TranscriptSegment>,
-    pub(crate) text: String,
-    pub(crate) language: String,
+#[derive(Debug)]
+pub(crate) enum TranscriptionOutcome {
+    NoAudioDetected,
+    Detected {
+        segments: Vec<TranscriptSegment>,
+        text: String,
+        language: String,
+    },
 }
 
 pub(crate) struct TranscriptionProgress {
@@ -73,11 +77,7 @@ pub(crate) fn transcribe_file(
         }) {
             return Err("本地转写已停止".to_string());
         }
-        return Ok(TranscriptionOutcome {
-            segments: Vec::new(),
-            text: String::new(),
-            language: language.to_string(),
-        });
+        return Ok(TranscriptionOutcome::NoAudioDetected);
     }
 
     let runtime_dir = model_dir.join("runtime");
@@ -102,6 +102,17 @@ pub(crate) fn transcribe_file(
     }
 
     let decoded = parse_modelscope_transcript(&output.stdout)?;
+    if !on_progress(TranscriptionProgress {
+        percent: 100,
+        current_text: decoded.text.clone(),
+        segment_count: decoded.segments.len(),
+    }) {
+        return Err("本地转写已停止".to_string());
+    }
+    Ok(transcription_outcome(decoded, language))
+}
+
+fn transcription_outcome(decoded: ModelScopeTranscript, language: &str) -> TranscriptionOutcome {
     let segments = decoded
         .segments
         .into_iter()
@@ -112,18 +123,18 @@ pub(crate) fn transcribe_file(
             speaker: segment.speaker,
         })
         .collect::<Vec<_>>();
-    if !on_progress(TranscriptionProgress {
-        percent: 100,
-        current_text: decoded.text.clone(),
-        segment_count: segments.len(),
-    }) {
-        return Err("本地转写已停止".to_string());
+    if decoded.text.trim().is_empty()
+        && segments
+            .iter()
+            .all(|segment| segment.text.trim().is_empty())
+    {
+        return TranscriptionOutcome::NoAudioDetected;
     }
-    Ok(TranscriptionOutcome {
+    TranscriptionOutcome::Detected {
         segments,
         text: decoded.text,
         language: language.to_string(),
-    })
+    }
 }
 
 /// FunASR versions may print their version or progress logs to stdout before
@@ -194,8 +205,7 @@ mod tests {
         )
         .unwrap();
 
-        assert!(outcome.text.is_empty());
-        assert!(outcome.segments.is_empty());
+        assert!(matches!(outcome, TranscriptionOutcome::NoAudioDetected));
         assert_eq!(*observed.lock().unwrap(), vec![2, 100]);
         fs::remove_file(&wav_path).ok();
     }
@@ -221,5 +231,18 @@ mod tests {
             parse_modelscope_transcript(b"funasr version: 1.2.7\nloading model\n").unwrap_err();
 
         assert!(error.starts_with("本地转写结果无效:"));
+    }
+
+    #[test]
+    fn empty_model_output_is_a_no_audio_result() {
+        let outcome = transcription_outcome(
+            ModelScopeTranscript {
+                text: String::new(),
+                segments: Vec::new(),
+            },
+            "zh",
+        );
+
+        assert!(matches!(outcome, TranscriptionOutcome::NoAudioDetected));
     }
 }

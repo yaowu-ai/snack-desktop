@@ -1035,14 +1035,8 @@ fn is_valid_session_id(session_id: &str) -> bool {
         && session_id.bytes().all(|byte| byte.is_ascii_digit())
 }
 
-pub(crate) fn open_notes_from_notification(
-    app: &AppHandle,
-    recording_id: &str,
-) -> Result<(), String> {
-    open_notes_in_chat(app, recording_id, true)
-}
-
 fn handoff_completed_transcript(app: &AppHandle, recording_id: &str) {
+    notifications::notify_transcript_ready(app);
     match open_notes_in_chat(app, recording_id, true) {
         Ok(()) => crate::logging::write_app_log(
             app,
@@ -1056,10 +1050,9 @@ fn handoff_completed_transcript(app: &AppHandle, recording_id: &str) {
                 app,
                 "warn",
                 "meeting-notes-handoff",
-                "automatic notes handoff failed; notification fallback is available",
+                "automatic notes handoff failed; transcript remains available in meeting tasks",
                 Some(&serde_json::json!({ "recordingId": recording_id, "reason": error })),
             );
-            notifications::notify_transcript_ready(app, recording_id);
         }
     }
 }
@@ -1313,10 +1306,18 @@ fn spawn_transcription(app: AppHandle, store: MeetingStore, recording_id: String
             );
 
             let transcript = match outcome {
-                Ok(outcome) => Transcript {
-                    text: outcome.text,
-                    language: outcome.language,
-                    segments: outcome.segments,
+                Ok(transcribe::TranscriptionOutcome::NoAudioDetected) => {
+                    finish_without_audio(&app, &store, &recording_id);
+                    return;
+                }
+                Ok(transcribe::TranscriptionOutcome::Detected {
+                    segments,
+                    text,
+                    language,
+                }) => Transcript {
+                    text,
+                    language,
+                    segments,
                     model_key: model_key.as_str().to_string(),
                     engine: format!("FunASR ModelScope {}", env!("CARGO_PKG_VERSION")),
                     generated_at: now_rfc3339(),
@@ -1368,6 +1369,35 @@ fn spawn_transcription(app: AppHandle, store: MeetingStore, recording_id: String
             handoff_completed_transcript(&app, &recording_id);
         })
         .expect("failed to spawn transcription thread");
+}
+
+fn finish_without_audio(app: &AppHandle, store: &MeetingStore, recording_id: &str) {
+    let Some(mut task) = store.load_task_record(recording_id) else {
+        return;
+    };
+    task.state = TaskState::NoAudioDetected;
+    task.transcript = None;
+    task.transcript_path = None;
+    task.error = None;
+    task.updated_at = now_rfc3339();
+    if let Err(message) = store.save_task_progress(&task) {
+        crate::logging::write_app_log(
+            app,
+            "error",
+            "meeting-transcribe",
+            "no-audio state could not be persisted; notification skipped",
+            Some(&serde_json::json!({ "recordingId": recording_id, "reason": message })),
+        );
+        return;
+    }
+    emit_state(app, store);
+    crate::logging::write_app_log(
+        app,
+        "info",
+        "meeting-transcribe",
+        "no audio detected; transcription notification skipped",
+        Some(&serde_json::json!({ "recordingId": recording_id })),
+    );
 }
 
 fn generate_notes(app: AppHandle, store: MeetingStore, recording_id: String) -> Result<(), String> {

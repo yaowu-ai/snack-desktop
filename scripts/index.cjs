@@ -228,7 +228,7 @@ const tauriConfig = {
 // passed through the CLI config layer rather than TAURI_CONFIG. The bundle id
 // stays unchanged to preserve local models and app data.
 const localBuildConfig = operation.localSigning
-  ? JSON.stringify({ ...tauriConfig, productName: "Snack Local" })
+  ? JSON.stringify({ ...tauriConfig, productName: "Snack local" })
   : null;
 
 const childEnv = {

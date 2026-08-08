@@ -164,6 +164,7 @@ pub(crate) enum TaskState {
     Recording,
     Finalizing,
     TranscribingLocal,
+    NoAudioDetected,
     TranscriptReady,
     WaitingForNetwork,
     GeneratingNotes,
@@ -850,11 +851,18 @@ mod tests {
         assert_eq!(task.state, TaskState::Idle);
         assert!(TaskState::TranscriptionFailed.is_terminal_error());
         assert!(!TaskState::TranscribingLocal.is_terminal_error());
+        assert!(!TaskState::NoAudioDetected.is_terminal_error());
+        assert!(!TaskState::NoAudioDetected.is_active());
         assert!(!TaskState::Idle.blocks_recording());
+        assert!(!TaskState::NoAudioDetected.blocks_recording());
         assert!(!TaskState::TranscriptReady.blocks_recording());
         assert!(!TaskState::Ready.blocks_recording());
         assert!(TaskState::Recording.blocks_recording());
         assert!(!TaskState::TranscribingLocal.blocks_recording());
+        assert_eq!(
+            serde_json::to_value(TaskState::NoAudioDetected).unwrap(),
+            "no_audio_detected"
+        );
     }
 
     #[test]

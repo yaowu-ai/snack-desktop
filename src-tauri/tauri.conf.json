@@ -9,6 +9,7 @@
     "beforeBuildCommand": "node scripts/prepare-python-runtime.cjs"
   },
   "app": {
+    "macOSPrivateApi": true,
     "withGlobalTauri": true,
     "windows": [
       {
