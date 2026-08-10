@@ -800,6 +800,9 @@ pub(crate) fn validate_meeting_settings(settings: &MeetingSettings) -> Result<()
 }
 
 pub(crate) fn persist_json_atomic<T: Serialize>(path: &PathBuf, value: &T) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
     let temporary = path.with_extension("json.tmp");
     let bytes = serde_json::to_vec(value).map_err(|error| error.to_string())?;
     fs::write(&temporary, bytes).map_err(|error| error.to_string())?;
@@ -969,6 +972,21 @@ mod tests {
             store.transcript_text_path(&task).parent(),
             Some(expected.as_path())
         );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn transcript_json_directory_is_created_on_first_persistence() {
+        let root = std::env::temp_dir().join(format!(
+            "snack-meeting-transcript-json-{}",
+            super::unix_millis()
+        ));
+        let transcript_path = root.join(super::TRANSCRIPTS_DIR_NAME).join("rec-1.json");
+
+        assert!(!transcript_path.parent().unwrap().exists());
+        super::persist_json_atomic(&transcript_path, &serde_json::json!({ "text": "ok" })).unwrap();
+        assert!(transcript_path.is_file());
 
         fs::remove_dir_all(root).unwrap();
     }
