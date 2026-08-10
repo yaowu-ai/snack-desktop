@@ -287,14 +287,6 @@ pub(crate) fn dismiss_overlay(window: tauri::WebviewWindow) -> Result<(), String
     window.hide().map_err(|error| error.to_string())
 }
 
-#[tauri::command]
-pub(crate) fn focus_recording_overlay(window: tauri::WebviewWindow) -> Result<(), String> {
-    if !is_overlay_window(&window) {
-        return Err("只有录音浮窗可以获取焦点".to_string());
-    }
-    window.set_focus().map_err(|error| error.to_string())
-}
-
 const OVERLAY_HTML: &str = r#"<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -305,17 +297,21 @@ const OVERLAY_HTML: &str = r#"<!DOCTYPE html>
   * { margin: 0; padding: 0; box-sizing: border-box; }
   html, body { width: 100%; height: 100%; overflow: hidden; background: transparent; }
   body {
+    padding: 1px;
     font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif;
     color: #0f172a;
     user-select: none; -webkit-user-select: none;
   }
   .bar {
     position: relative; display: flex; align-items: center; gap: 10px;
-    width: 100%; height: 100%; padding: 17px 12px 8px; cursor: grab;
+    width: 100%; height: 100%; padding: 17px 12px 8px;
     overflow: hidden; border: 1px solid #fee5d0; border-radius: 12px;
-    background: rgba(255, 255, 255, 0.98);
+    background: rgba(255, 255, 255, 0.98); background-clip: padding-box;
   }
-  .bar:active { cursor: grabbing; }
+  .drag-region {
+    position: absolute; z-index: 1; inset: 0 0 auto; height: 17px; cursor: grab;
+  }
+  .drag-region:active { cursor: grabbing; }
   .drag-hint {
     position: absolute; left: 50%; top: 3px; transform: translateX(-50%);
     color: #cbd5e1; font-size: 9px; line-height: 12px; pointer-events: none; white-space: nowrap;
@@ -340,15 +336,15 @@ const OVERLAY_HTML: &str = r#"<!DOCTYPE html>
 </style>
 </head>
 <body data-phase="recording">
-  <div class="bar" data-tauri-drag-region>
-    <div class="drag-hint">拖动可移动</div>
+  <div class="bar">
+    <div class="drag-region" data-tauri-drag-region><div class="drag-hint">拖动可移动</div></div>
     <div class="status-icon recording" id="status-icon">●</div>
     <div class="info">
       <div class="title" id="title">正在录音</div>
       <div class="metric" id="metric">00:00</div>
       <div class="detail" id="detail"></div>
     </div>
-    <button class="primary-action" id="primary-action">结束</button>
+    <button class="primary-action" id="primary-action" type="button">结束</button>
   </div>
   <script>
     (function () {
@@ -441,11 +437,10 @@ const OVERLAY_HTML: &str = r#"<!DOCTYPE html>
           .catch(showStopError);
       }
 
-      actionEl.addEventListener('click', function () {
+      actionEl.addEventListener('click', function (event) {
+        event.preventDefault();
+        event.stopPropagation();
         stopRecording();
-      });
-      document.documentElement.addEventListener('mouseenter', function () {
-        invoke('focus_recording_overlay').catch(function () {});
       });
       render();
       try {
@@ -596,7 +591,10 @@ mod tests {
         assert!(html.contains("overflow: hidden; border: 1px solid #fee5d0; border-radius: 12px"));
         assert!(html.contains("background: rgba(255, 255, 255, 0.98)"));
         assert!(!html.contains("body {\n    font-family: -apple-system, BlinkMacSystemFont, \"PingFang SC\", \"Microsoft YaHei\", sans-serif;\n    background:"));
-        assert!(html.contains("invoke('focus_recording_overlay')"));
+        assert!(!html.contains("focus_recording_overlay"));
+        assert!(!html.contains("class=\"bar\" data-tauri-drag-region"));
+        assert!(html.contains("class=\"drag-region\" data-tauri-drag-region"));
+        assert!(html.contains("event.stopPropagation();"));
         assert!(html.contains("拖动可移动"));
         assert!(!html.contains("aria-label=\"最小化\""));
         assert!(!html.contains("aria-label=\"关闭\""));
@@ -615,6 +613,21 @@ mod tests {
         let response = serve_overlay_request(request);
 
         assert_eq!(response.status(), 404);
+    }
+
+    #[test]
+    fn rounded_overlay_is_inset_from_the_transparent_window_edge() {
+        let request = tauri::http::Request::builder()
+            .uri("snack-overlay://localhost/index.html")
+            .body(Vec::new())
+            .unwrap();
+
+        let html = String::from_utf8(serve_overlay_request(request).into_body()).unwrap();
+
+        assert!(html.contains("body {\n    padding: 1px;"));
+        assert!(html.contains("background: transparent;"));
+        assert!(html.contains("background-clip: padding-box;"));
+        assert!(html.contains("border-radius: 12px;"));
     }
 
     #[test]

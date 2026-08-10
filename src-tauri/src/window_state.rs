@@ -17,7 +17,7 @@ use tauri::{
 use crate::logging;
 
 const STATE_FILE_NAME: &str = "window-state.json";
-const STATE_VERSION: u8 = 1;
+const STATE_VERSION: u8 = 2;
 const WRITE_DEBOUNCE: Duration = Duration::from_millis(300);
 const MONITOR_DETECTION_TIMEOUT: Duration = Duration::from_millis(150);
 const DEFAULT_WINDOW_MARGIN: u32 = 48;
@@ -28,6 +28,8 @@ const MAX_COORDINATE: i32 = 1_000_000;
 const MIN_REACHABLE_TITLE_WIDTH: i64 = 120;
 const MIN_REACHABLE_TITLE_HEIGHT: i64 = 24;
 const TITLE_BAR_HEIGHT: u32 = 48;
+const MIN_SCALE_FACTOR: f64 = 0.5;
+const MAX_SCALE_FACTOR: f64 = 8.0;
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -39,9 +41,18 @@ struct WindowBounds {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct PersistedWindowState {
     version: u8,
     bounds: WindowBounds,
+    #[serde(default)]
+    scale_factor: f64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TrackedWindowState {
+    bounds: WindowBounds,
+    scale_factor: f64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -50,13 +61,13 @@ struct WorkArea {
     y: i32,
     width: u32,
     height: u32,
+    scale_factor: f64,
 }
 
 #[derive(Debug)]
 struct MonitorSnapshot {
     work_areas: Vec<WorkArea>,
     primary: Option<WorkArea>,
-    scale_factor: f64,
 }
 
 impl From<&Monitor> for WorkArea {
@@ -67,6 +78,7 @@ impl From<&Monitor> for WorkArea {
             y: area.position.y,
             width: area.size.width,
             height: area.size.height,
+            scale_factor: monitor.scale_factor(),
         }
     }
 }
@@ -79,8 +91,8 @@ enum PersistSignal {
 pub(crate) fn restore_track_and_show(app: &AppHandle, window: &WebviewWindow) {
     let path = state_path(app);
 
-    let saved_bounds = match load(&path) {
-        Ok(Some(saved)) if saved.version == STATE_VERSION => Some(saved.bounds),
+    let saved_state = match load(&path) {
+        Ok(Some(saved)) if saved.version == STATE_VERSION => Some(saved),
         Ok(Some(_)) => {
             logging::write_app_log(
                 app,
@@ -114,7 +126,7 @@ pub(crate) fn restore_track_and_show(app: &AppHandle, window: &WebviewWindow) {
     thread::spawn(move || {
         match detection_receiver.recv_timeout(MONITOR_DETECTION_TIMEOUT) {
             Ok(Ok(snapshot)) => {
-                apply_initial_bounds(&worker_app, &worker_window, saved_bounds, snapshot);
+                apply_initial_bounds(&worker_app, &worker_window, saved_state, snapshot);
             }
             Err(RecvTimeoutError::Timeout) => logging::write_app_log(
                 &worker_app,
@@ -178,19 +190,22 @@ pub(crate) fn recover_if_unreachable(window: &WebviewWindow) {
 fn apply_initial_bounds(
     app: &AppHandle,
     window: &WebviewWindow,
-    saved: Option<WindowBounds>,
+    saved: Option<PersistedWindowState>,
     snapshot: MonitorSnapshot,
 ) {
     let bounds = match saved {
         Some(saved) => {
-            let Some(bounds) = safe_restored_bounds(saved, &snapshot.work_areas, snapshot.primary)
+            let Some(bounds) = restored_bounds(&saved, &snapshot.work_areas, snapshot.primary)
             else {
                 logging::write_app_log(
                     app,
                     "warn",
                     "window-state",
                     "Ignoring implausible saved window bounds",
-                    Some(&serde_json::json!({ "bounds": saved })),
+                    Some(&serde_json::json!({
+                        "bounds": saved.bounds,
+                        "scaleFactor": saved.scale_factor,
+                    })),
                 );
                 return apply_default_bounds(window, snapshot);
             };
@@ -205,11 +220,9 @@ fn apply_initial_bounds(
 fn detect_monitors(window: &WebviewWindow) -> tauri::Result<MonitorSnapshot> {
     let monitors = window.available_monitors()?;
     let primary = window.primary_monitor()?;
-    let scale_factor = window.scale_factor()?;
     Ok(MonitorSnapshot {
         work_areas: monitors.iter().map(WorkArea::from).collect(),
         primary: primary.as_ref().map(WorkArea::from),
-        scale_factor,
     })
 }
 
@@ -217,7 +230,7 @@ fn apply_default_bounds(window: &WebviewWindow, snapshot: MonitorSnapshot) {
     let (Ok(size), Some(primary)) = (window.inner_size(), snapshot.primary) else {
         return;
     };
-    let margin = (f64::from(DEFAULT_WINDOW_MARGIN) * snapshot.scale_factor).round() as u32;
+    let margin = (f64::from(DEFAULT_WINDOW_MARGIN) * primary.scale_factor).round() as u32;
     let bounds = default_bounds(size, primary, margin);
     let _ = window.set_size(PhysicalSize::new(bounds.width, bounds.height));
     let _ = window.set_position(PhysicalPosition::new(bounds.x, bounds.y));
@@ -245,17 +258,24 @@ fn set_bounds(app: &AppHandle, window: &WebviewWindow, bounds: WindowBounds, act
 }
 
 fn track(app: &AppHandle, window: &WebviewWindow, path: PathBuf) {
-    let (Ok(position), Ok(size)) = (window.outer_position(), window.inner_size()) else {
+    let (Ok(position), Ok(size), Ok(scale_factor)) = (
+        window.outer_position(),
+        window.inner_size(),
+        window.scale_factor(),
+    ) else {
         return;
     };
-    let bounds = Arc::new(Mutex::new(WindowBounds {
-        x: position.x,
-        y: position.y,
-        width: size.width,
-        height: size.height,
+    let state = Arc::new(Mutex::new(TrackedWindowState {
+        bounds: WindowBounds {
+            x: position.x,
+            y: position.y,
+            width: size.width,
+            height: size.height,
+        },
+        scale_factor,
     }));
     let (sender, receiver) = mpsc::sync_channel(1);
-    let worker_bounds = Arc::clone(&bounds);
+    let worker_state = Arc::clone(&state);
     let worker_app = app.clone();
 
     thread::spawn(move || loop {
@@ -264,17 +284,17 @@ fn track(app: &AppHandle, window: &WebviewWindow, path: PathBuf) {
                 match receiver.recv_timeout(WRITE_DEBOUNCE) {
                     Ok(PersistSignal::Changed) => {}
                     Ok(PersistSignal::Shutdown) | Err(RecvTimeoutError::Disconnected) => {
-                        persist_latest(&worker_app, &path, &worker_bounds);
+                        persist_latest(&worker_app, &path, &worker_state);
                         return;
                     }
                     Err(RecvTimeoutError::Timeout) => {
-                        persist_latest(&worker_app, &path, &worker_bounds);
+                        persist_latest(&worker_app, &path, &worker_state);
                         break;
                     }
                 }
             },
             Ok(PersistSignal::Shutdown) | Err(_) => {
-                persist_latest(&worker_app, &path, &worker_bounds);
+                persist_latest(&worker_app, &path, &worker_state);
                 return;
             }
         }
@@ -283,17 +303,19 @@ fn track(app: &AppHandle, window: &WebviewWindow, path: PathBuf) {
     let event_window = window.clone();
     window.on_window_event(move |event| match event {
         WindowEvent::Resized(size) if is_normal_window(&event_window) => {
-            update_size(&bounds, *size);
+            update_size(&state, *size);
             signal_change(&sender);
         }
         WindowEvent::Moved(position) if is_normal_window(&event_window) => {
-            update_position(&bounds, *position);
+            update_position(&state, *position);
             signal_change(&sender);
         }
-        WindowEvent::ScaleFactorChanged { new_inner_size, .. }
-            if is_normal_window(&event_window) =>
-        {
-            update_size(&bounds, *new_inner_size);
+        WindowEvent::ScaleFactorChanged {
+            scale_factor,
+            new_inner_size,
+            ..
+        } if is_normal_window(&event_window) => {
+            update_scale(&state, *new_inner_size, *scale_factor);
             signal_change(&sender);
         }
         WindowEvent::Destroyed => {
@@ -309,16 +331,23 @@ fn is_normal_window(window: &WebviewWindow) -> bool {
         && matches!(window.is_fullscreen(), Ok(false))
 }
 
-fn update_position(bounds: &Mutex<WindowBounds>, position: PhysicalPosition<i32>) {
-    let mut bounds = bounds.lock().unwrap_or_else(|error| error.into_inner());
-    bounds.x = position.x;
-    bounds.y = position.y;
+fn update_position(state: &Mutex<TrackedWindowState>, position: PhysicalPosition<i32>) {
+    let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
+    state.bounds.x = position.x;
+    state.bounds.y = position.y;
 }
 
-fn update_size(bounds: &Mutex<WindowBounds>, size: PhysicalSize<u32>) {
-    let mut bounds = bounds.lock().unwrap_or_else(|error| error.into_inner());
-    bounds.width = size.width;
-    bounds.height = size.height;
+fn update_size(state: &Mutex<TrackedWindowState>, size: PhysicalSize<u32>) {
+    let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
+    state.bounds.width = size.width;
+    state.bounds.height = size.height;
+}
+
+fn update_scale(state: &Mutex<TrackedWindowState>, size: PhysicalSize<u32>, scale_factor: f64) {
+    let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
+    state.bounds.width = size.width;
+    state.bounds.height = size.height;
+    state.scale_factor = scale_factor;
 }
 
 fn signal_change(sender: &SyncSender<PersistSignal>) {
@@ -327,14 +356,15 @@ fn signal_change(sender: &SyncSender<PersistSignal>) {
     }
 }
 
-fn persist_latest(app: &AppHandle, path: &Path, bounds: &Mutex<WindowBounds>) {
-    let bounds = *bounds.lock().unwrap_or_else(|error| error.into_inner());
-    if !is_plausible(bounds) {
+fn persist_latest(app: &AppHandle, path: &Path, state: &Mutex<TrackedWindowState>) {
+    let state = *state.lock().unwrap_or_else(|error| error.into_inner());
+    if !is_plausible(state.bounds) || !is_valid_scale_factor(state.scale_factor) {
         return;
     }
     let state = PersistedWindowState {
         version: STATE_VERSION,
-        bounds,
+        bounds: state.bounds,
+        scale_factor: state.scale_factor,
     };
     if let Err(error) = persist(path, &state) {
         logging::write_app_log(
@@ -390,6 +420,41 @@ fn safe_restored_bounds(
     }
 
     primary.map(|area| centered_bounds(saved, area))
+}
+
+fn restored_bounds(
+    saved: &PersistedWindowState,
+    work_areas: &[WorkArea],
+    primary: Option<WorkArea>,
+) -> Option<WindowBounds> {
+    if !is_valid_scale_factor(saved.scale_factor) {
+        return None;
+    }
+    let target = work_areas
+        .iter()
+        .copied()
+        .find(|area| has_reachable_title_bar(saved.bounds, &[*area]))
+        .or(primary)?;
+    let bounds = rescale_size(saved.bounds, saved.scale_factor, target.scale_factor)?;
+    safe_restored_bounds(bounds, work_areas, primary)
+}
+
+fn rescale_size(
+    mut bounds: WindowBounds,
+    saved_scale_factor: f64,
+    target_scale_factor: f64,
+) -> Option<WindowBounds> {
+    if !is_valid_scale_factor(saved_scale_factor) || !is_valid_scale_factor(target_scale_factor) {
+        return None;
+    }
+    let ratio = target_scale_factor / saved_scale_factor;
+    bounds.width = (f64::from(bounds.width) * ratio).round() as u32;
+    bounds.height = (f64::from(bounds.height) * ratio).round() as u32;
+    Some(bounds)
+}
+
+fn is_valid_scale_factor(scale_factor: f64) -> bool {
+    scale_factor.is_finite() && (MIN_SCALE_FACTOR..=MAX_SCALE_FACTOR).contains(&scale_factor)
 }
 
 fn is_plausible(bounds: WindowBounds) -> bool {
@@ -466,8 +531,9 @@ mod tests {
     use tauri::PhysicalSize;
 
     use super::{
-        default_bounds, has_reachable_title_bar, load, persist, safe_restored_bounds,
-        PersistedWindowState, WindowBounds, WorkArea, MIN_HEIGHT, MIN_WIDTH, STATE_VERSION,
+        default_bounds, has_reachable_title_bar, load, persist, restored_bounds,
+        safe_restored_bounds, PersistedWindowState, WindowBounds, WorkArea, MIN_HEIGHT, MIN_WIDTH,
+        STATE_VERSION,
     };
 
     static TEMP_FILE_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
@@ -477,6 +543,7 @@ mod tests {
         y: 0,
         width: 1920,
         height: 1080,
+        scale_factor: 1.0,
     };
 
     #[test]
@@ -521,6 +588,7 @@ mod tests {
             y: 0,
             width: 1920,
             height: 1080,
+            scale_factor: 1.0,
         };
         let saved = WindowBounds {
             x: -1700,
@@ -542,6 +610,7 @@ mod tests {
             y: 20,
             width: 1366,
             height: 748,
+            scale_factor: 1.0,
         };
 
         assert_eq!(
@@ -581,6 +650,77 @@ mod tests {
     }
 
     #[test]
+    fn rescales_saved_size_for_the_current_display() {
+        let saved = PersistedWindowState {
+            version: STATE_VERSION,
+            bounds: WindowBounds {
+                x: 100,
+                y: 80,
+                width: 2560,
+                height: 1720,
+            },
+            scale_factor: 2.0,
+        };
+
+        assert_eq!(
+            restored_bounds(&saved, &[PRIMARY], Some(PRIMARY)),
+            Some(WindowBounds {
+                x: 100,
+                y: 80,
+                width: 1280,
+                height: 860,
+            })
+        );
+    }
+
+    #[test]
+    fn uses_the_saved_windows_target_display_scale() {
+        let secondary = WorkArea {
+            x: 1920,
+            y: 0,
+            width: 3840,
+            height: 2160,
+            scale_factor: 2.0,
+        };
+        let saved = PersistedWindowState {
+            version: STATE_VERSION,
+            bounds: WindowBounds {
+                x: 2100,
+                y: 100,
+                width: 1280,
+                height: 800,
+            },
+            scale_factor: 1.0,
+        };
+
+        assert_eq!(
+            restored_bounds(&saved, &[PRIMARY, secondary], Some(PRIMARY)),
+            Some(WindowBounds {
+                x: 2100,
+                y: 100,
+                width: 2560,
+                height: 1600,
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_an_invalid_saved_scale_factor() {
+        let saved = PersistedWindowState {
+            version: STATE_VERSION,
+            bounds: WindowBounds {
+                x: 100,
+                y: 80,
+                width: 1280,
+                height: 800,
+            },
+            scale_factor: 0.0,
+        };
+
+        assert_eq!(restored_bounds(&saved, &[PRIMARY], Some(PRIMARY)), None);
+    }
+
+    #[test]
     fn title_bar_must_be_reachable_not_just_the_window_body() {
         let bounds = WindowBounds {
             x: 200,
@@ -611,6 +751,7 @@ mod tests {
             &PersistedWindowState {
                 version: STATE_VERSION,
                 bounds: expected,
+                scale_factor: 1.25,
             },
         )
         .unwrap();
@@ -619,6 +760,7 @@ mod tests {
 
         assert_eq!(loaded.version, STATE_VERSION);
         assert_eq!(loaded.bounds, expected);
+        assert_eq!(loaded.scale_factor, 1.25);
     }
 
     #[test]
