@@ -149,6 +149,9 @@ impl Recorder {
         if let Some(session) = self.session.take() {
             let _ = session.join();
         }
+        if !self.audio_path.is_file() {
+            return Err("录音文件在录音期间被删除，无法完成收尾".to_string());
+        }
         crate::meeting::audio::repair_wav_header(&self.audio_path)
     }
 }
@@ -262,7 +265,10 @@ pub(crate) fn mix_chunks(mic: &[f32], system: &[f32]) -> Vec<i16> {
 
 #[cfg(test)]
 mod tests {
-    use super::{downmix_f32, pcm_bytes_to_f32_mono, prepare_audio_output, resample_to_target};
+    use super::{
+        downmix_f32, pcm_bytes_to_f32_mono, prepare_audio_output, resample_to_target,
+        CaptureShared, Recorder,
+    };
 
     #[test]
     fn pcm_i16_bytes_decode() {
@@ -321,5 +327,23 @@ mod tests {
 
         assert!(prepare_audio_output(&audio_path).is_err());
         assert!(!root.exists());
+    }
+
+    #[test]
+    fn recorder_reports_when_audio_is_deleted_during_capture() {
+        let audio_path = std::env::temp_dir().join(format!(
+            "snack-deleted-recording-{}.wav",
+            crate::meeting::state::unix_millis()
+        ));
+        let recorder = Recorder {
+            shared: CaptureShared::new(0),
+            session: None,
+            audio_path,
+        };
+
+        assert_eq!(
+            recorder.stop().unwrap_err(),
+            "录音文件在录音期间被删除，无法完成收尾"
+        );
     }
 }

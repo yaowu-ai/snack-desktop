@@ -82,7 +82,6 @@ pub fn run() {
             meeting::meeting_uninstall_model,
             meeting::overlay::dismiss_recording_reminder,
             meeting::overlay::dismiss_overlay,
-            meeting::overlay::focus_recording_overlay,
             meeting::overlay::minimize_overlay,
             meeting::overlay::start_recording_from_reminder,
             record_import::claim_pending_record_import,

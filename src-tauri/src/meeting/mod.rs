@@ -357,12 +357,20 @@ pub(crate) fn meeting_clear_task_records(
         .store
         .load_task()
         .is_some_and(|task| task.state.is_active());
-    state.store.prune_recording_audio(10)?;
-    state.store.clear_task_records()?;
+    let cleared = state.store.clear_task_records()?;
     if !current_task_active {
         overlay::hide_overlay(&app);
     }
     emit_state(&app, &state.store);
+    crate::logging::write_app_log(
+        &app,
+        "info",
+        "meeting-records",
+        "completed meeting task records cleared without deleting local files",
+        Some(
+            &serde_json::json!({ "cleared": cleared, "activeTaskPreserved": current_task_active }),
+        ),
+    );
     Ok(())
 }
 
@@ -389,7 +397,19 @@ pub(crate) async fn meeting_import_audio(
     if store.load_resource().state != ResourceState::Ready {
         return Err("请先在录音设置中下载并安装本地模型".to_string());
     }
-    let Some(file) = rfd::AsyncFileDialog::new()
+    let Some(source) = pick_import_audio().await else {
+        return Ok(None);
+    };
+    let task = imported_audio_task(&source)?;
+    let recording_id = task.recording_id.clone();
+    store.save_task_record(&task)?;
+    emit_state(&app, &store);
+    spawn_transcription(app, store, recording_id.clone());
+    Ok(Some(recording_id))
+}
+
+async fn pick_import_audio() -> Option<PathBuf> {
+    rfd::AsyncFileDialog::new()
         .set_title("选择需要本地转写的音频")
         .add_filter(
             "音频文件",
@@ -397,61 +417,45 @@ pub(crate) async fn meeting_import_audio(
         )
         .pick_file()
         .await
-    else {
-        return Ok(None);
-    };
-    let source = file.path();
-    let extension = source
+        .map(|file| file.path().to_path_buf())
+}
+
+fn imported_audio_task(source: &std::path::Path) -> Result<MeetingTask, String> {
+    let source = source
+        .canonicalize()
+        .map_err(|error| format!("无法读取所选音频: {error}"))?;
+    let source_bytes = validate_imported_audio(&source)?;
+    let recording_id = generate_recording_id();
+    let now = now_rfc3339();
+    let mut task = MeetingTask::new(recording_id, "zh".to_string());
+    task.display_name = imported_display_name(&source);
+    task.state = TaskState::TranscribingLocal;
+    task.started_at = Some(now.clone());
+    task.ended_at = Some(now);
+    task.audio_path = Some(source.to_string_lossy().into_owned());
+    task.audio_bytes = Some(source_bytes);
+    task.audio_file_owned = false;
+    Ok(task)
+}
+
+fn validate_imported_audio(source: &std::path::Path) -> Result<u64, String> {
+    source
         .extension()
         .and_then(|value| value.to_str())
         .map(str::to_ascii_lowercase)
         .filter(|value| state::is_supported_audio_extension(value))
         .ok_or_else(|| "请选择 WAV、MP3、M4A、AAC、FLAC、OGG、OPUS 或 WMA 音频文件".to_string())?;
-    let source_bytes = fs::metadata(source)
-        .map_err(|error| format!("无法读取所选音频: {error}"))?
-        .len();
-    match install::free_disk_bytes(&store) {
-        Ok(free) if free < source_bytes.saturating_add(MIN_RECORDING_DISK_BYTES) => {
-            return Err("磁盘空间不足，无法导入音频".to_string());
-        }
-        Err(message) => return Err(format!("无法检查磁盘空间: {message}")),
-        _ => {}
+    let metadata = fs::metadata(source).map_err(|error| format!("无法读取所选音频: {error}"))?;
+    if !metadata.is_file() {
+        return Err("请选择有效的音频文件".to_string());
     }
+    Ok(metadata.len())
+}
 
-    let audio_directory_created = store.ensure_audio_directory()?;
-    let recording_id = generate_recording_id();
-    let destination = store.imported_audio_path(&recording_id, &extension);
-    if let Err(error) = fs::copy(source, &destination) {
-        cleanup_failed_audio_import(&store, &destination, audio_directory_created);
-        return Err(format!("无法导入所选音频: {error}"));
-    }
-
-    let now = now_rfc3339();
-    let mut task = MeetingTask::new(recording_id.clone(), "zh".to_string());
-    task.display_name = source
+fn imported_display_name(source: &std::path::Path) -> Option<String> {
+    source
         .file_stem()
-        .and_then(|name| normalize_transcript_file_name(&name.to_string_lossy()).ok());
-    task.state = TaskState::TranscribingLocal;
-    task.started_at = Some(now.clone());
-    task.ended_at = Some(now);
-    task.audio_path = Some(destination.to_string_lossy().into_owned());
-    task.audio_bytes = Some(source_bytes);
-    if let Err(error) = store.save_task_record(&task) {
-        cleanup_failed_audio_import(&store, &destination, audio_directory_created);
-        return Err(error);
-    }
-    if let Err(error) = store.prune_recording_audio(10) {
-        crate::logging::write_app_log(
-            &app,
-            "warn",
-            "meeting-import",
-            "old meeting audio could not be pruned",
-            Some(&serde_json::json!({ "error": error })),
-        );
-    }
-    emit_state(&app, &store);
-    spawn_transcription(app, store, recording_id.clone());
-    Ok(Some(recording_id))
+        .and_then(|name| normalize_transcript_file_name(&name.to_string_lossy()).ok())
 }
 
 #[tauri::command]
@@ -916,14 +920,27 @@ fn finalize_recording(app: AppHandle, store: MeetingStore, recorder: Recorder) {
 }
 
 fn fail_finalize(app: &AppHandle, store: &MeetingStore, message: String) {
-    if let Some(mut task) = store.load_task() {
-        let recording_id = task.recording_id.clone();
-        task.state = TaskState::FinalizeFailed;
-        task.error = Some(message.clone());
-        let _ = store.save_task(&task);
-        emit_state(app, store);
-        notifications::notify_transcript_failed(app, &recording_id);
-    }
+    let Some(mut task) = store.load_task() else {
+        crate::logging::write_app_log(app, "error", "meeting-finalize", &message, None);
+        return;
+    };
+    let recording_id = task.recording_id.clone();
+    crate::logging::write_app_log(
+        app,
+        "error",
+        "meeting-finalize",
+        "recording finalization failed",
+        Some(&serde_json::json!({
+            "recordingId": recording_id,
+            "audioFileExists": task.audio_path.as_deref().is_some_and(|path| PathBuf::from(path).is_file()),
+            "reason": message,
+        })),
+    );
+    task.state = TaskState::FinalizeFailed;
+    task.error = Some(message);
+    let _ = store.save_task(&task);
+    emit_state(app, store);
+    notifications::notify_transcript_failed(app, &recording_id);
 }
 
 #[tauri::command]
@@ -1283,16 +1300,19 @@ fn spawn_transcription(app: AppHandle, store: MeetingStore, recording_id: String
             let store_for_progress = store.clone_for_task();
             let recording_id_for_progress = recording_id.clone();
             let outcome = transcribe::transcribe_file(
-                model_key,
-                &model_dir,
-                &wav_path,
-                &language,
+                transcribe::TranscriptionRequest {
+                    model_key,
+                    model_dir: &model_dir,
+                    wav_path: &wav_path,
+                    language: &language,
+                },
                 move |progress| {
                     let _ = app_for_progress.emit(
                         TRANSCRIPTION_PROGRESS_EVENT,
                         serde_json::json!({
                             "recordingId": recording_id_for_progress,
                             "percent": progress.percent,
+                            "remainingSeconds": progress.remaining_seconds,
                             "currentText": progress.current_text,
                             "segmentCount": progress.segment_count,
                         }),
@@ -1488,17 +1508,6 @@ fn generate_recording_id() -> String {
     format!("rec-{}-{}-{}", unix_millis(), process, counter)
 }
 
-fn cleanup_failed_audio_import(
-    store: &MeetingStore,
-    destination: &std::path::Path,
-    audio_directory_created: bool,
-) {
-    let _ = fs::remove_file(destination);
-    if audio_directory_created {
-        let _ = fs::remove_dir(store.audio_directory());
-    }
-}
-
 fn open_permission_settings(_app: &AppHandle, permission: &str) -> Result<(), String> {
     let url = match permission {
         "microphone" => {
@@ -1527,9 +1536,10 @@ fn open_permission_settings(_app: &AppHandle, permission: &str) -> Result<(), St
 mod tests {
     use super::permissions::PermissionAccess;
     use super::{
-        can_attempt_recording_without_permission_request, is_valid_session_id,
+        can_attempt_recording_without_permission_request, imported_audio_task, is_valid_session_id,
         normalize_chat_handoff_state, MeetingTask, TaskState, Transcript,
     };
+    use std::fs;
 
     #[test]
     fn quick_recording_requests_any_permission_that_is_not_preflight_granted() {
@@ -1587,6 +1597,30 @@ mod tests {
         task.state = TaskState::TranscribingLocal;
         assert!(!normalize_chat_handoff_state(&mut task));
         assert_eq!(task.state, TaskState::TranscribingLocal);
+    }
+
+    #[test]
+    fn imported_audio_task_references_the_selected_file_without_copying_it() {
+        let root = std::env::temp_dir().join(format!(
+            "snack-meeting-reference-import-{}",
+            super::unix_millis()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let source = root.join("产品周会.mp3");
+        fs::write(&source, b"audio-data").unwrap();
+
+        let task = imported_audio_task(&source).unwrap();
+        let files = fs::read_dir(&root).unwrap().collect::<Vec<_>>();
+
+        assert_eq!(
+            task.audio_path.as_deref(),
+            source.canonicalize().unwrap().to_str()
+        );
+        assert_eq!(task.audio_bytes, Some(10));
+        assert!(!task.audio_file_owned);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].as_ref().unwrap().path(), source);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
