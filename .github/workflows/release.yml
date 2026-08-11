@@ -171,6 +171,13 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
+      - name: Run Windows native tests
+        run: cargo test --locked --manifest-path src-tauri/Cargo.toml
+        env:
+          # sherpa-onnx's Windows static archive uses the /MT runtime.
+          CMAKE_POLICY_DEFAULT_CMP0091: NEW
+          CMAKE_MSVC_RUNTIME_LIBRARY: MultiThreaded
+
       - name: Prepare release context
         id: version
         uses: ./.github/actions/prepare-release-context
