@@ -12,6 +12,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread;
+use std::time::Duration;
 
 use crossbeam_channel::{bounded, Receiver, Sender};
 use windows::core::GUID;
@@ -34,6 +35,9 @@ use crate::meeting::capture::{
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
 const CHANNEL_CAPACITY: usize = 256;
+const SESSION_START_TIMEOUT: Duration = Duration::from_secs(30);
+const LOOPBACK_START_TIMEOUT: Duration = Duration::from_secs(20);
+const MICROPHONE_CALLBACK_TIMEOUT: Duration = Duration::from_secs(5);
 const WAVE_FORMAT_IEEE_FLOAT: u16 = 0x0003;
 const WAVE_FORMAT_EXTENSIBLE: u16 = 0xFFFE;
 const AUDCLNT_BUFFERFLAGS_SILENT: u32 = 0x2;
@@ -65,21 +69,31 @@ pub(crate) fn start_windows_capture(
     let (mic_tx, mic_rx) = bounded::<Vec<f32>>(CHANNEL_CAPACITY);
     let (sys_tx, sys_rx) = bounded::<Vec<f32>>(CHANNEL_CAPACITY);
     let (started_tx, started_rx) = std::sync::mpsc::channel::<Result<(), String>>();
+    let (mic_ready_tx, mic_ready_rx) = std::sync::mpsc::sync_channel::<()>(1);
 
     let audio_for_thread = audio_path.clone();
     let shared_for_thread = Arc::clone(&shared);
     let session = thread::Builder::new()
         .name("snack-capture-session".to_string())
         .spawn(move || {
-            let start_result = (|| -> Result<(), CaptureError> {
-                let mic_stream = start_windows_mic(mic_tx.clone(), &shared_for_thread)?;
+            let start_result = (|| -> Result<WindowsCaptureSession, CaptureError> {
+                let mic_stream =
+                    start_windows_mic(mic_tx.clone(), mic_ready_tx, &shared_for_thread)?;
                 let loopback_thread = start_windows_loopback(sys_tx.clone(), &shared_for_thread)?;
                 prepare_audio_output(&audio_for_thread)?;
-                // Hold the mic stream on this thread; the loopback thread
-                // stops via the shared stop flag when the session exits.
-                let _mic_stream = mic_stream;
-                let _loopback_thread = loopback_thread;
-                Ok(())
+                let writer = WavWriter::create(&audio_for_thread).map_err(|error| {
+                    CaptureError::start_failed(format!("无法创建录音文件: {error}"))
+                })?;
+                mic_ready_rx
+                    .recv_timeout(MICROPHONE_CALLBACK_TIMEOUT)
+                    .map_err(|_| {
+                        CaptureError::start_failed("麦克风未返回音频数据，请检查设备和隐私权限")
+                    })?;
+                Ok(WindowsCaptureSession {
+                    mic_stream,
+                    loopback_thread,
+                    writer,
+                })
             })();
             let _ = started_tx.send(
                 start_result
@@ -88,7 +102,17 @@ pub(crate) fn start_windows_capture(
                     .map(|_| ()),
             );
             match start_result {
-                Ok(()) => run_writer(audio_for_thread, &shared_for_thread, mic_rx, sys_rx),
+                Ok(WindowsCaptureSession {
+                    mic_stream: _mic_stream,
+                    loopback_thread,
+                    mut writer,
+                }) => {
+                    // Keep the cpal stream alive until the writer has drained
+                    // every callback. Dropping it terminates WASAPI capture.
+                    run_writer(&mut writer, &shared_for_thread, mic_rx, sys_rx);
+                    shared_for_thread.request_stop();
+                    let _ = loopback_thread.join();
+                }
                 Err(error) => {
                     eprintln!("snack meeting capture start failed: {error}");
                 }
@@ -96,7 +120,7 @@ pub(crate) fn start_windows_capture(
         })
         .map_err(|error| CaptureError::start_failed(format!("无法创建采集线程: {error}")))?;
 
-    match started_rx.recv_timeout(std::time::Duration::from_secs(20)) {
+    match started_rx.recv_timeout(SESSION_START_TIMEOUT) {
         Ok(Ok(())) => {}
         Ok(Err(message)) => {
             shared.request_stop();
@@ -117,8 +141,15 @@ pub(crate) fn start_windows_capture(
     })
 }
 
+struct WindowsCaptureSession {
+    mic_stream: cpal::Stream,
+    loopback_thread: thread::JoinHandle<()>,
+    writer: WavWriter,
+}
+
 fn start_windows_mic(
     tx: Sender<Vec<f32>>,
+    ready: std::sync::mpsc::SyncSender<()>,
     shared: &Arc<CaptureShared>,
 ) -> Result<cpal::Stream, CaptureError> {
     let host = cpal::default_host();
@@ -135,56 +166,68 @@ fn start_windows_mic(
     let tx_for_callback = tx.clone();
     let shared_for_callback = Arc::clone(shared);
     let build_result = match config.sample_format() {
-        cpal::SampleFormat::F32 => device.build_input_stream(
-            &stream_config,
-            move |data: &[f32], _| {
-                push_mic_chunk(
-                    data,
-                    channels,
-                    sample_rate,
-                    &tx_for_callback,
-                    &shared_for_callback,
-                )
-            },
-            move |error| eprintln!("snack meeting mic error: {error}"),
-            None,
-        ),
-        cpal::SampleFormat::I16 => device.build_input_stream(
-            &stream_config,
-            move |data: &[i16], _| {
-                let converted: Vec<f32> = data
-                    .iter()
-                    .map(|sample| f32::from(*sample) / 32768.0)
-                    .collect();
-                push_mic_chunk(
-                    &converted,
-                    channels,
-                    sample_rate,
-                    &tx_for_callback,
-                    &shared_for_callback,
-                )
-            },
-            move |error| eprintln!("snack meeting mic error: {error}"),
-            None,
-        ),
-        cpal::SampleFormat::U16 => device.build_input_stream(
-            &stream_config,
-            move |data: &[u16], _| {
-                let converted: Vec<f32> = data
-                    .iter()
-                    .map(|sample| (f32::from(*sample) / 32767.0) * 2.0 - 1.0)
-                    .collect();
-                push_mic_chunk(
-                    &converted,
-                    channels,
-                    sample_rate,
-                    &tx_for_callback,
-                    &shared_for_callback,
-                )
-            },
-            move |error| eprintln!("snack meeting mic error: {error}"),
-            None,
-        ),
+        cpal::SampleFormat::F32 => {
+            let ready = ready.clone();
+            device.build_input_stream(
+                &stream_config,
+                move |data: &[f32], _| {
+                    push_mic_chunk(
+                        data,
+                        channels,
+                        sample_rate,
+                        &tx_for_callback,
+                        &ready,
+                        &shared_for_callback,
+                    )
+                },
+                move |error| eprintln!("snack meeting mic error: {error}"),
+                None,
+            )
+        }
+        cpal::SampleFormat::I16 => {
+            let ready = ready.clone();
+            device.build_input_stream(
+                &stream_config,
+                move |data: &[i16], _| {
+                    let converted: Vec<f32> = data
+                        .iter()
+                        .map(|sample| f32::from(*sample) / 32768.0)
+                        .collect();
+                    push_mic_chunk(
+                        &converted,
+                        channels,
+                        sample_rate,
+                        &tx_for_callback,
+                        &ready,
+                        &shared_for_callback,
+                    )
+                },
+                move |error| eprintln!("snack meeting mic error: {error}"),
+                None,
+            )
+        }
+        cpal::SampleFormat::U16 => {
+            let ready = ready.clone();
+            device.build_input_stream(
+                &stream_config,
+                move |data: &[u16], _| {
+                    let converted: Vec<f32> = data
+                        .iter()
+                        .map(|sample| (f32::from(*sample) / 32767.0) * 2.0 - 1.0)
+                        .collect();
+                    push_mic_chunk(
+                        &converted,
+                        channels,
+                        sample_rate,
+                        &tx_for_callback,
+                        &ready,
+                        &shared_for_callback,
+                    )
+                },
+                move |error| eprintln!("snack meeting mic error: {error}"),
+                None,
+            )
+        }
         other => {
             return Err(CaptureError::start_failed(format!(
                 "不支持的麦克风采样格式: {other:?}"
@@ -205,6 +248,7 @@ fn push_mic_chunk(
     channels: usize,
     sample_rate: u32,
     tx: &Sender<Vec<f32>>,
+    ready: &std::sync::mpsc::SyncSender<()>,
     shared: &CaptureShared,
 ) {
     if data.is_empty() {
@@ -215,6 +259,7 @@ fn push_mic_chunk(
     shared
         .mic_live
         .store(true, std::sync::atomic::Ordering::SeqCst);
+    let _ = ready.try_send(());
     let _ = tx.try_send(resampled);
 }
 
@@ -282,6 +327,10 @@ fn convert_loopback_buffer(data: &[u8], info: &WaveFormatInfo) -> Vec<f32> {
     resample_to_target(&mono, info.sample_rate)
 }
 
+fn convert_loopback_silence(frames: u32, sample_rate: u32) -> Vec<f32> {
+    resample_to_target(&vec![0.0; frames as usize], sample_rate)
+}
+
 /// WASAPI loopback capture thread for system audio. Returns the thread handle;
 /// the thread exits when the session's shared stop flag is set.
 fn start_windows_loopback(
@@ -289,27 +338,51 @@ fn start_windows_loopback(
     shared: &Arc<CaptureShared>,
 ) -> Result<thread::JoinHandle<()>, CaptureError> {
     let shared_for_thread = Arc::clone(shared);
-    thread::Builder::new()
+    let shared_for_failure = Arc::clone(shared);
+    let (started_tx, started_rx) = std::sync::mpsc::channel::<Result<(), String>>();
+    let loopback_thread = thread::Builder::new()
         .name("snack-loopback".to_string())
         .spawn(move || {
             // SAFETY: single-threaded COM use inside this thread.
-            let com_hr = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
-            if com_hr.is_err() {
-                eprintln!("snack meeting CoInitializeEx failed: {com_hr:?}");
+            let com_result = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }.ok();
+            if let Err(error) = com_result {
+                let message = format!("无法初始化系统音频线程: {error}");
+                let _ = started_tx.send(Err(message.clone()));
+                eprintln!("snack meeting CoInitializeEx failed: {message}");
+                return;
             }
 
-            let result = run_loopback_capture(&tx, &shared_for_thread);
+            let result = run_loopback_capture(&tx, &shared_for_thread, &started_tx);
             if let Err(error) = result {
+                let _ = started_tx.send(Err(error.message.clone()));
                 eprintln!("snack meeting loopback failed: {error}");
             }
             unsafe {
                 let _ = CoUninitialize();
             }
         })
-        .map_err(|error| CaptureError::start_failed(format!("无法创建系统音频线程: {error}")))
+        .map_err(|error| CaptureError::start_failed(format!("无法创建系统音频线程: {error}")))?;
+
+    match started_rx.recv_timeout(LOOPBACK_START_TIMEOUT) {
+        Ok(Ok(())) => Ok(loopback_thread),
+        Ok(Err(message)) => {
+            shared_for_failure.request_stop();
+            let _ = loopback_thread.join();
+            Err(CaptureError::start_failed(message))
+        }
+        Err(_) => {
+            shared_for_failure.request_stop();
+            drop(loopback_thread);
+            Err(CaptureError::start_failed("系统音频启动超时"))
+        }
+    }
 }
 
-fn run_loopback_capture(tx: &Sender<Vec<f32>>, shared: &CaptureShared) -> Result<(), CaptureError> {
+fn run_loopback_capture(
+    tx: &Sender<Vec<f32>>,
+    shared: &CaptureShared,
+    started: &std::sync::mpsc::Sender<Result<(), String>>,
+) -> Result<(), CaptureError> {
     // SAFETY: raw COM usage with checked HRESULTs.
     unsafe {
         let enumerator: IMMDeviceEnumerator =
@@ -360,6 +433,7 @@ fn run_loopback_capture(tx: &Sender<Vec<f32>>, shared: &CaptureShared) -> Result
         client.Start().map_err(|error| {
             CaptureError::start_failed(format!("无法启动系统音频采集: {error}"))
         })?;
+        let _ = started.send(Ok(()));
 
         let result = (|| -> Result<(), CaptureError> {
             while !shared.should_stop() {
@@ -376,19 +450,25 @@ fn run_loopback_capture(tx: &Sender<Vec<f32>>, shared: &CaptureShared) -> Result
                         .map_err(|error| {
                             CaptureError::start_failed(format!("系统音频读取失败: {error}"))
                         })?;
-                    if frames > 0 && !data.is_null() && flags & AUDCLNT_BUFFERFLAGS_SILENT == 0 {
+                    let samples = if frames == 0 {
+                        Vec::new()
+                    } else if flags & AUDCLNT_BUFFERFLAGS_SILENT != 0 {
+                        convert_loopback_silence(frames, format_info.sample_rate)
+                    } else if !data.is_null() {
                         let bytes = std::slice::from_raw_parts(
                             data,
                             frames as usize * format_info.bits_per_sample / 8
                                 * format_info.channels,
                         );
-                        let samples = convert_loopback_buffer(bytes, &format_info);
-                        if !samples.is_empty() {
-                            shared
-                                .system_live
-                                .store(true, std::sync::atomic::Ordering::SeqCst);
-                            let _ = tx.try_send(samples);
-                        }
+                        convert_loopback_buffer(bytes, &format_info)
+                    } else {
+                        Vec::new()
+                    };
+                    if !samples.is_empty() {
+                        shared
+                            .system_live
+                            .store(true, std::sync::atomic::Ordering::SeqCst);
+                        let _ = tx.try_send(samples);
                     }
                     capture.ReleaseBuffer(frames).map_err(|error| {
                         CaptureError::start_failed(format!("系统音频释放失败: {error}"))
@@ -409,18 +489,11 @@ fn run_loopback_capture(tx: &Sender<Vec<f32>>, shared: &CaptureShared) -> Result
 
 /// Writer loop: drain mic + system chunks, mix, append to WAV until stopped.
 fn run_writer(
-    audio_path: PathBuf,
+    writer: &mut WavWriter,
     shared: &CaptureShared,
     mic_rx: Receiver<Vec<f32>>,
     sys_rx: Receiver<Vec<f32>>,
 ) {
-    let mut writer = match WavWriter::create(&audio_path) {
-        Ok(writer) => writer,
-        Err(error) => {
-            eprintln!("snack meeting failed to create wav: {error}");
-            return;
-        }
-    };
     let mut mic_buffer: Vec<f32> = Vec::new();
     let mut sys_buffer: Vec<f32> = Vec::new();
 
@@ -455,7 +528,7 @@ fn run_writer(
             thread::sleep(std::time::Duration::from_millis(5));
             continue;
         }
-        if !drain_and_mix(&mut mic_buffer, &mut sys_buffer, &mut writer) {
+        if !drain_and_mix(&mut mic_buffer, &mut sys_buffer, writer) {
             return;
         }
     }
@@ -476,12 +549,21 @@ fn run_writer(
             break;
         }
     }
-    let _ = writer.finalize();
+    if let Err(error) = writer.finalize() {
+        eprintln!("snack meeting failed to finalize wav: {error}");
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{convert_loopback_buffer, WaveFormatInfo, KSDATAFORMAT_SUBTYPE_IEEE_FLOAT};
+    use super::{
+        convert_loopback_buffer, convert_loopback_silence, run_writer, WaveFormatInfo,
+        KSDATAFORMAT_SUBTYPE_IEEE_FLOAT,
+    };
+    use crate::meeting::audio::{read_wav_i16, WavWriter};
+    use crate::meeting::capture::CaptureShared;
+    use crossbeam_channel::bounded;
+    use std::fs;
 
     #[test]
     fn loopback_float_stereo_converts_to_mono() {
@@ -517,6 +599,36 @@ mod tests {
         assert_eq!(out.len(), 2);
         assert!((out[0] - 0.5).abs() < 0.01);
         assert!((out[1] + 0.5).abs() < 0.01);
+    }
+
+    #[test]
+    fn silent_loopback_packet_preserves_duration() {
+        let out = convert_loopback_silence(4_800, 48_000);
+        assert_eq!(out.len(), 1_600);
+        assert!(out.iter().all(|sample| *sample == 0.0));
+    }
+
+    #[test]
+    fn writer_persists_mic_only_audio_duration() {
+        let path = std::env::temp_dir().join(format!(
+            "snack-windows-mic-only-{}-{}.wav",
+            std::process::id(),
+            crate::meeting::state::unix_millis()
+        ));
+        let mut writer = WavWriter::create(&path).unwrap();
+        let shared = CaptureShared::new(0);
+        let (mic_tx, mic_rx) = bounded(2);
+        let (_sys_tx, sys_rx) = bounded(2);
+        mic_tx.send(vec![0.25; 16_000]).unwrap();
+        shared.request_stop();
+
+        run_writer(&mut writer, &shared, mic_rx, sys_rx);
+        drop(writer);
+
+        let (samples, duration_ms) = read_wav_i16(&path).unwrap();
+        assert_eq!(samples.len(), 16_000);
+        assert_eq!(duration_ms, 1_000);
+        fs::remove_file(path).unwrap();
     }
 
     #[test]

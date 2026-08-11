@@ -62,11 +62,12 @@ pub(crate) struct ModelArtifactManifest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct InstallProgressPayload {
-    pub(crate) stage: &'static str,
+    pub(crate) stage: String,
     pub(crate) percent: u8,
     pub(crate) downloaded_bytes: u64,
     pub(crate) total_bytes: u64,
     pub(crate) speed_bytes_per_sec: u64,
+    pub(crate) remaining_seconds: Option<u64>,
 }
 
 /// Control channel for an in-flight download.
@@ -169,9 +170,15 @@ pub(crate) fn start_install(
         );
     }
 
+    let initial_progress = DownloadProgress {
+        stage: Some("checking".to_string()),
+        total_bytes: model.size_bytes,
+        ..Default::default()
+    };
     resource = ResourceStatus::default().with_state(ResourceState::Checking);
     resource.model_key = Some(model.key.as_str().to_string());
     resource.model_size_bytes = Some(model.size_bytes);
+    resource.download = Some(initial_progress.clone());
     store.save_resource(&resource)?;
     crate::meeting::emit_state(&app, &store);
 
@@ -179,10 +186,7 @@ pub(crate) fn start_install(
         Arc::new(AtomicBool::new(false)),
         Arc::new(AtomicBool::new(false)),
     );
-    let progress = Arc::new(Mutex::new(DownloadProgress {
-        total_bytes: model.size_bytes,
-        ..Default::default()
-    }));
+    let progress = Arc::new(Mutex::new(initial_progress));
     manager.register(DownloadControl {
         pause: Arc::clone(&pause),
         cancel: Arc::clone(&cancel),
@@ -424,12 +428,14 @@ fn check_modelscope_disk(
 }
 
 fn run_modelscope_install(context: &ModelScopeInstall) -> Result<(), String> {
+    publish_install_stage(context, ResourceState::Installing, "preparing_runtime", 0);
     prepare_modelscope_files(context)?;
-    set_install_stage(context, ResourceState::Installing);
+    let on_runtime_stage = |stage| publish_runtime_stage(context, stage);
     let python = crate::meeting::python_runtime::ensure_ready(
         crate::meeting::python_runtime::RuntimeSetup {
             app: &context.app,
             runtime_dir: &context.runtime_dir,
+            on_stage: &on_runtime_stage,
         },
     )?;
     download_modelscope_snapshot(context, &python)?;
@@ -452,7 +458,7 @@ fn prepare_modelscope_files(context: &ModelScopeInstall) -> Result<(), String> {
 }
 
 fn download_modelscope_snapshot(context: &ModelScopeInstall, python: &Path) -> Result<(), String> {
-    set_install_stage(context, ResourceState::Downloading);
+    publish_install_stage(context, ResourceState::Downloading, "downloading_model", 0);
     let log_path = context.runtime_dir.join("modelscope-download.log");
     let mut child = spawn_modelscope_downloader(context, python, &log_path)?;
     consume_modelscope_progress(context, &mut child)?;
@@ -508,11 +514,20 @@ fn parse_modelscope_progress(line: &str, fallback_total: u64) -> Option<Download
     if value.get("type").and_then(|item| item.as_str()) != Some("progress") {
         return None;
     }
+    let downloaded_bytes = json_u64(&value, "downloadedBytes", 0);
+    let total_bytes = json_u64(&value, "totalBytes", fallback_total);
+    let speed_bytes_per_sec = json_u64(&value, "speedBytesPerSec", 0);
+    let remaining_seconds = value
+        .get("remainingSeconds")
+        .and_then(|item| item.as_u64())
+        .or_else(|| estimate_remaining_seconds(downloaded_bytes, total_bytes, speed_bytes_per_sec));
     Some(DownloadProgress {
-        downloaded_bytes: json_u64(&value, "downloadedBytes", 0),
-        total_bytes: json_u64(&value, "totalBytes", fallback_total),
-        speed_bytes_per_sec: json_u64(&value, "speedBytesPerSec", 0),
+        stage: Some("downloading_model".to_string()),
+        downloaded_bytes,
+        total_bytes,
+        speed_bytes_per_sec,
         percent: json_u64(&value, "percent", 0).min(99) as u8,
+        remaining_seconds,
     })
 }
 
@@ -523,27 +538,39 @@ fn json_u64(value: &serde_json::Value, key: &str, fallback: u64) -> u64 {
         .unwrap_or(fallback)
 }
 
+fn estimate_remaining_seconds(
+    downloaded_bytes: u64,
+    total_bytes: u64,
+    speed_bytes_per_sec: u64,
+) -> Option<u64> {
+    if speed_bytes_per_sec == 0 || total_bytes == 0 {
+        return None;
+    }
+    let remaining_bytes = total_bytes.saturating_sub(downloaded_bytes);
+    Some(remaining_bytes.saturating_add(speed_bytes_per_sec - 1) / speed_bytes_per_sec)
+}
+
 fn publish_modelscope_progress(context: &ModelScopeInstall, update: DownloadProgress) {
     *context.progress.lock().expect("progress poisoned") = update.clone();
-    let mut resource = context.store.load_resource();
-    resource.download = Some(update.clone());
-    context.store.save_resource(&resource).ok();
-    emit_install_progress(&context.app, "downloading", &update);
+    save_install_progress(context, ResourceState::Downloading, &update);
+    emit_install_progress(&context.app, &update);
     crate::meeting::emit_state(&context.app, &context.store);
 }
 
 fn finalize_modelscope_install(context: &ModelScopeInstall) -> Result<(), String> {
-    set_install_stage(context, ResourceState::Installing);
+    publish_install_stage(context, ResourceState::Installing, "finalizing", 99);
     write_modelscope_manifest(context)?;
     let installed = directory_size(&context.model_dir);
     let completed = DownloadProgress {
+        stage: Some("installed".to_string()),
         downloaded_bytes: installed,
         total_bytes: installed,
         speed_bytes_per_sec: 0,
         percent: 100,
+        remaining_seconds: Some(0),
     };
     save_installed_resource(context, &completed)?;
-    emit_install_progress(&context.app, "installed", &completed);
+    emit_install_progress(&context.app, &completed);
     Ok(())
 }
 
@@ -579,22 +606,65 @@ fn save_installed_resource(
         .map_err(|error| format!("无法保存模型状态: {error}"))
 }
 
-fn emit_install_progress(app: &AppHandle, stage: &'static str, update: &DownloadProgress) {
+fn emit_install_progress(app: &AppHandle, update: &DownloadProgress) {
     let _ = app.emit(
         INSTALL_PROGRESS_EVENT,
         InstallProgressPayload {
-            stage,
+            stage: update
+                .stage
+                .clone()
+                .unwrap_or_else(|| "processing".to_string()),
             percent: update.percent,
             downloaded_bytes: update.downloaded_bytes,
             total_bytes: update.total_bytes,
             speed_bytes_per_sec: update.speed_bytes_per_sec,
+            remaining_seconds: update.remaining_seconds,
         },
     );
 }
 
-fn set_install_stage(context: &ModelScopeInstall, state: ResourceState) {
-    set_resource(&context.store, state, None);
+fn publish_runtime_stage(
+    context: &ModelScopeInstall,
+    stage: crate::meeting::python_runtime::RuntimeSetupStage,
+) {
+    use crate::meeting::python_runtime::RuntimeSetupStage;
+    let (label, percent) = match stage {
+        RuntimeSetupStage::Checking => ("checking_runtime", 2),
+        RuntimeSetupStage::CreatingEnvironment => ("creating_environment", 4),
+        RuntimeSetupStage::InstallingDependencies => ("installing_dependencies", 8),
+        RuntimeSetupStage::Ready => ("runtime_ready", 10),
+    };
+    publish_install_stage(context, ResourceState::Installing, label, percent);
+}
+
+fn publish_install_stage(
+    context: &ModelScopeInstall,
+    state: ResourceState,
+    stage: &'static str,
+    percent: u8,
+) {
+    let update = {
+        let mut progress = context.progress.lock().expect("progress poisoned");
+        progress.stage = Some(stage.to_string());
+        progress.percent = percent;
+        progress.speed_bytes_per_sec = 0;
+        progress.remaining_seconds = None;
+        progress.clone()
+    };
+    save_install_progress(context, state, &update);
+    emit_install_progress(&context.app, &update);
     crate::meeting::emit_state(&context.app, &context.store);
+}
+
+fn save_install_progress(
+    context: &ModelScopeInstall,
+    state: ResourceState,
+    update: &DownloadProgress,
+) {
+    let mut resource = context.store.load_resource().with_state(state);
+    resource.download = Some(update.clone());
+    resource.error = None;
+    context.store.save_resource(&resource).ok();
 }
 
 // ---------------------------------------------------------------------------
@@ -713,18 +783,24 @@ async fn download_model(
                 };
                 {
                     let mut progress = progress.lock().expect("progress poisoned");
+                    progress.stage = Some("downloading_model".to_string());
                     progress.downloaded_bytes = package_downloaded;
                     progress.speed_bytes_per_sec = speed;
                     progress.percent = percent;
+                    progress.remaining_seconds =
+                        estimate_remaining_seconds(package_downloaded, package_size_bytes, speed);
                 }
+                let remaining_seconds =
+                    estimate_remaining_seconds(package_downloaded, package_size_bytes, speed);
                 let _ = app.emit(
                     INSTALL_PROGRESS_EVENT,
                     InstallProgressPayload {
-                        stage: "downloading",
+                        stage: "downloading_model".to_string(),
                         percent,
                         downloaded_bytes: package_downloaded,
                         total_bytes: package_size_bytes,
                         speed_bytes_per_sec: speed,
+                        remaining_seconds,
                     },
                 );
                 last_emit = Instant::now();
@@ -737,12 +813,15 @@ async fn download_model(
                 {
                     let mut progress = progress.lock().expect("progress poisoned");
                     let package_downloaded = package_downloaded_before + downloaded_bytes;
+                    progress.stage = Some("paused".to_string());
                     progress.downloaded_bytes = package_downloaded;
                     progress.percent = if package_size_bytes > 0 {
                         ((package_downloaded * 100 / package_size_bytes).min(100)) as u8
                     } else {
                         0
                     };
+                    progress.speed_bytes_per_sec = 0;
+                    progress.remaining_seconds = None;
                 }
                 set_resource(store, ResourceState::Paused, None);
                 wait_while_paused(pause, cancel).await?;
@@ -1043,7 +1122,10 @@ pub(crate) fn free_disk_bytes(store: &MeetingStore) -> Result<u64, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{format_bytes, parse_modelscope_progress, ModelManifest, PART_EXTENSION};
+    use super::{
+        estimate_remaining_seconds, format_bytes, parse_modelscope_progress, ModelManifest,
+        PART_EXTENSION,
+    };
 
     #[test]
     fn format_bytes_is_readable() {
@@ -1076,12 +1158,20 @@ mod tests {
     #[test]
     fn parses_modelscope_progress_without_exceeding_99_percent() {
         let update = parse_modelscope_progress(
-            r#"{"type":"progress","downloadedBytes":40,"percent":100}"#,
+            r#"{"type":"progress","downloadedBytes":40,"speedBytesPerSec":10,"percent":100}"#,
             80,
         )
         .unwrap();
+        assert_eq!(update.stage.as_deref(), Some("downloading_model"));
         assert_eq!(update.downloaded_bytes, 40);
         assert_eq!(update.total_bytes, 80);
         assert_eq!(update.percent, 99);
+        assert_eq!(update.remaining_seconds, Some(4));
+    }
+
+    #[test]
+    fn remaining_time_rounds_up_and_waits_for_a_speed_sample() {
+        assert_eq!(estimate_remaining_seconds(25, 100, 10), Some(8));
+        assert_eq!(estimate_remaining_seconds(25, 100, 0), None);
     }
 }

@@ -53,6 +53,15 @@ const NETWORK_PATTERNS: &[&str] = &[
 pub(crate) struct RuntimeSetup<'a> {
     pub(crate) app: &'a AppHandle,
     pub(crate) runtime_dir: &'a Path,
+    pub(crate) on_stage: &'a dyn Fn(RuntimeSetupStage),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RuntimeSetupStage {
+    Checking,
+    CreatingEnvironment,
+    InstallingDependencies,
+    Ready,
 }
 
 #[derive(Debug)]
@@ -160,6 +169,7 @@ pub(crate) fn ensure_ready(params: RuntimeSetup<'_>) -> Result<PathBuf, String> 
 }
 
 fn ensure_ready_inner(params: &RuntimeSetup<'_>) -> Result<PathBuf, RuntimeFailure> {
+    (params.on_stage)(RuntimeSetupStage::Checking);
     fs::create_dir_all(params.runtime_dir)
         .map_err(|error| failure_from_io("create runtime directory", error))?;
     fs::write(
@@ -172,10 +182,13 @@ fn ensure_ready_inner(params: &RuntimeSetup<'_>) -> Result<PathBuf, RuntimeFailu
     let managed = locate_managed_python(params.app)?;
     let expected = expected_state(&managed);
     if !environment_is_current(params.runtime_dir, &expected) {
+        (params.on_stage)(RuntimeSetupStage::CreatingEnvironment);
         rebuild_environment(params.runtime_dir, &managed)?;
+        (params.on_stage)(RuntimeSetupStage::InstallingDependencies);
         install_dependencies(params.runtime_dir)?;
         write_state(params.runtime_dir, &expected)?;
     }
+    (params.on_stage)(RuntimeSetupStage::Ready);
     Ok(venv_python(params.runtime_dir))
 }
 
