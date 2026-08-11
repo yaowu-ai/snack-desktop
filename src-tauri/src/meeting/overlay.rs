@@ -158,7 +158,17 @@ pub(crate) fn show_overlay(app: &AppHandle, state: OverlayState) -> Result<(), S
 }
 
 pub(crate) fn update_overlay(window: &tauri::WebviewWindow, state: OverlayState) {
+    keep_recording_overlay_visible(window);
     let _ = window.emit(OVERLAY_STATE_EVENT, state);
+}
+
+/// Reassert the recording card after notifications or focused windows change
+/// the native stacking order. `show` does not steal keyboard focus here.
+fn keep_recording_overlay_visible(window: &tauri::WebviewWindow) {
+    let _ = window.set_always_on_top(true);
+    if matches!(window.is_visible(), Ok(false)) {
+        let _ = window.show();
+    }
 }
 
 pub(crate) fn hide_overlay(app: &AppHandle) {
