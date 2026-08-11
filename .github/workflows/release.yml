@@ -172,7 +172,9 @@ jobs:
         run: npm ci
 
       - name: Run Windows native tests
-        run: cargo test --locked --manifest-path src-tauri/Cargo.toml
+        # Tauri's common-controls-v6 feature imports TaskDialogIndirect, but
+        # cargo test does not use the packaged application's Windows manifest.
+        run: cargo test --locked --manifest-path src-tauri/Cargo.toml --no-default-features
         env:
           # sherpa-onnx's Windows static archive uses the /MT runtime.
           CMAKE_POLICY_DEFAULT_CMP0091: NEW

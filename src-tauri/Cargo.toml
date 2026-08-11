@@ -13,6 +13,13 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 name = "Snack"
 path = "src/main.rs"
 
+[features]
+# Production builds keep Tauri's default Common Controls v6 integration.
+# Windows tests disable default features so their unbundled test executable
+# does not import TaskDialogIndirect without Tauri's application manifest.
+default = ["common-controls-v6"]
+common-controls-v6 = ["tauri/common-controls-v6"]
+
 [build-dependencies]
 tauri-build = { version = "2.5.3", features = [] }
 
@@ -28,7 +35,7 @@ rfd = "0.15"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
-tauri = { version = "2.11.3", features = ["macos-private-api", "tray-icon"] }
+tauri = { version = "2.11.3", default-features = false, features = ["compression", "dbus", "dynamic-acl", "macos-private-api", "tray-icon", "wry", "x11"] }
 tauri-plugin-deep-link = "2.4.9"
 tauri-plugin-global-shortcut = "2.3.2"
 tauri-plugin-notification = "2.3.3"
