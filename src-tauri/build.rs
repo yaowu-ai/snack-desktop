@@ -47,22 +47,6 @@ fn main() {
     println!("cargo:rustc-env=SNACK_DESKTOP_PLATFORM={platform}");
     println!("cargo:rustc-env=SNACK_DESKTOP_ARCH={arch}");
 
-    if platform == "windows" {
-        // `cargo test` does not use Tauri's packaged application manifest.
-        // The test runner still links `tao`, which requires common-controls
-        // v6; without this manifest Windows aborts it before tests run with
-        // 0xc0000139 (STATUS_ENTRYPOINT_NOT_FOUND).
-        let manifest = std::env::current_dir()
-            .expect("failed to locate the Tauri manifest directory")
-            .join("windows-test-manifest.xml");
-        println!("cargo:rerun-if-changed={}", manifest.display());
-        println!("cargo:rustc-link-arg-tests=/MANIFEST:EMBED");
-        println!(
-            "cargo:rustc-link-arg-tests=/MANIFESTINPUT:{}",
-            manifest.display()
-        );
-    }
-
     // The screencapturekit Swift bridge links libswift_Concurrency.dylib,
     // which macOS resolves from the dyld shared cache at /usr/lib/swift.
     #[cfg(target_os = "macos")]
