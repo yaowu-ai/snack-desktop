@@ -28,6 +28,8 @@ const PYTHON_INFO_SCRIPT: &str = concat!(
     "print(json.dumps({'major':sys.version_info.major,'minor':sys.version_info.minor,",
     "'patch':sys.version_info.micro,'machine':platform.machine()}))"
 );
+const DEPENDENCY_CHECK_SCRIPT: &str =
+    "import funasr,librosa,modelscope,numpy,soundfile,torch,torchaudio; torch.zeros(1).numpy()";
 const DISK_PATTERNS: &[&str] = &["no space left", "errno 28", "disk full"];
 const PERMISSION_PATTERNS: &[&str] = &["permission denied", "access is denied", "errno 13"];
 const COMPATIBILITY_PATTERNS: &[&str] = &[
@@ -283,11 +285,7 @@ fn environment_is_current(runtime_dir: &Path, expected: &RuntimeState) -> bool {
 
 fn dependencies_import(runtime_dir: &Path) -> bool {
     Command::new(venv_python(runtime_dir))
-        .args([
-            "-I",
-            "-c",
-            "import funasr,librosa,modelscope,soundfile,torch,torchaudio",
-        ])
+        .args(["-I", "-c", DEPENDENCY_CHECK_SCRIPT])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
@@ -690,6 +688,14 @@ mod tests {
         };
         assert_eq!(state.runtime_id, "cpython-3.12.13+20260718");
         assert_eq!(state.requirements_sha256.len(), 64);
+    }
+
+    #[test]
+    fn pins_intel_numpy_and_checks_torch_bridge() {
+        assert!(REQUIREMENTS.contains(
+            "numpy==1.26.4 ; sys_platform == \"darwin\" and platform_machine == \"x86_64\""
+        ));
+        assert!(DEPENDENCY_CHECK_SCRIPT.contains("torch.zeros(1).numpy()"));
     }
 
     #[test]
