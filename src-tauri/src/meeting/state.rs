@@ -101,19 +101,25 @@ impl ResourceState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct DownloadProgress {
+    #[serde(default)]
+    pub(crate) stage: Option<String>,
     pub(crate) downloaded_bytes: u64,
     pub(crate) total_bytes: u64,
     pub(crate) speed_bytes_per_sec: u64,
     pub(crate) percent: u8,
+    #[serde(default)]
+    pub(crate) remaining_seconds: Option<u64>,
 }
 
 impl Default for DownloadProgress {
     fn default() -> Self {
         Self {
+            stage: None,
             downloaded_bytes: 0,
             total_bytes: 0,
             speed_bytes_per_sec: 0,
             percent: 0,
+            remaining_seconds: None,
         }
     }
 }
@@ -864,9 +870,9 @@ fn meeting_task_local_date(task: &MeetingTask) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        now_rfc3339, parse_rfc3339_millis, validate_meeting_settings, MeetingSettings,
-        MeetingStore, MeetingTask, ResourceState, ResourceStatus, ServerSubmission, TaskState,
-        DEFAULT_MEETING_NOTES_PROMPT,
+        now_rfc3339, parse_rfc3339_millis, validate_meeting_settings, DownloadProgress,
+        MeetingSettings, MeetingStore, MeetingTask, ResourceState, ResourceStatus,
+        ServerSubmission, TaskState, DEFAULT_MEETING_NOTES_PROMPT,
     };
     use std::fs;
 
@@ -875,6 +881,16 @@ mod tests {
         let status = ResourceStatus::default();
         assert_eq!(status.state, ResourceState::NotInstalled);
         assert!(status.error.is_none());
+    }
+
+    #[test]
+    fn legacy_download_progress_defaults_new_feedback_fields() {
+        let progress: DownloadProgress = serde_json::from_str(
+            r#"{"downloadedBytes":10,"totalBytes":100,"speedBytesPerSec":5,"percent":10}"#,
+        )
+        .unwrap();
+        assert_eq!(progress.stage, None);
+        assert_eq!(progress.remaining_seconds, None);
     }
 
     #[test]

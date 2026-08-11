@@ -6,9 +6,11 @@ derived from the bytes already committed to the ModelScope cache, rather than
 from a guessed timer, so the UI remains truthful across resumed downloads.
 """
 import json
+import math
 import os
 import threading
 import time
+from collections import deque
 from pathlib import Path
 
 from modelscope import snapshot_download
@@ -35,26 +37,32 @@ def cache_size(path: Path) -> int:
     return total
 
 
-def emit(cache: Path, previous: list[float]) -> None:
+def emit(cache: Path, samples: deque[tuple[float, int]]) -> None:
     downloaded = cache_size(cache)
     now = time.monotonic()
-    elapsed = max(now - previous[1], 0.1)
-    speed = max(0, int((downloaded - previous[0]) / elapsed))
-    previous[:] = [downloaded, now]
-    percent = min(99, int(downloaded * 100 / max(ESTIMATED_BYTES, downloaded)))
+    samples.append((now, downloaded))
+    while len(samples) > 2 and now - samples[0][0] > 10:
+        samples.popleft()
+    elapsed = max(now - samples[0][0], 0.1)
+    speed = max(0, int((downloaded - samples[0][1]) / elapsed))
+    total = max(ESTIMATED_BYTES, downloaded)
+    remaining = max(0, total - downloaded)
+    remaining_seconds = math.ceil(remaining / speed) if remaining and speed else None
+    percent = min(99, int(downloaded * 100 / total))
     print(json.dumps({
         "type": "progress",
         "downloadedBytes": downloaded,
-        "totalBytes": max(ESTIMATED_BYTES, downloaded),
+        "totalBytes": total,
         "speedBytesPerSec": speed,
         "percent": percent,
+        "remainingSeconds": remaining_seconds,
     }), flush=True)
 
 
 def main() -> None:
     cache = Path(os.environ["MODELSCOPE_CACHE"]).expanduser()
     cache.mkdir(parents=True, exist_ok=True)
-    previous = [cache_size(cache), time.monotonic()]
+    samples = deque([(time.monotonic(), cache_size(cache))])
     failure: list[Exception] = []
 
     def download() -> None:
@@ -67,11 +75,11 @@ def main() -> None:
     worker = threading.Thread(target=download, daemon=True)
     worker.start()
     while worker.is_alive():
-        emit(cache, previous)
+        emit(cache, samples)
         worker.join(0.5)
     if failure:
         raise failure[0]
-    emit(cache, previous)
+    emit(cache, samples)
     print(json.dumps({"type": "completed", "downloadedBytes": cache_size(cache)}), flush=True)
 
 
