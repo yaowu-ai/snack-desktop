@@ -2,6 +2,8 @@
 # Intel macOS uses the final PyTorch line that publishes x86_64 wheels.
 funasr==1.3.14
 modelscope==1.38.1
+# PyTorch 2.2.2 x86_64 wheels require the NumPy 1.x ABI.
+numpy==1.26.4 ; sys_platform == "darwin" and platform_machine == "x86_64"
 torch==2.2.2 ; sys_platform == "darwin" and platform_machine == "x86_64"
 torchaudio==2.2.2 ; sys_platform == "darwin" and platform_machine == "x86_64"
 torch==2.7.1 ; sys_platform != "darwin" or platform_machine != "x86_64"
