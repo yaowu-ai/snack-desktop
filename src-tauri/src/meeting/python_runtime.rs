@@ -4,6 +4,7 @@ use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -17,10 +18,13 @@ const REQUIREMENTS: &str = include_str!("requirements.lock.txt");
 const STATE_FILE: &str = ".runtime-state.json";
 const LEGACY_READY_FILE: &str = ".requirements-installed";
 const PIP_LOG_FILE: &str = "pip-install.log";
+const DEPENDENCY_CHECK_LOG_FILE: &str = "dependency-check.log";
+const PYTORCH_CPU_INDEX: &str = "https://download.pytorch.org/whl/cpu";
 const PIP_ATTEMPTS: u8 = 2;
 const COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const VENV_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const PIP_TIMEOUT: Duration = Duration::from_secs(45 * 60);
+const DEPENDENCY_CHECK_TIMEOUT: Duration = Duration::from_secs(2 * 60);
 const MAX_DIAGNOSTIC_LINES: usize = 120;
 const MAX_DIAGNOSTIC_BYTES: usize = 16 * 1024;
 const PYTHON_INFO_SCRIPT: &str = concat!(
@@ -30,6 +34,7 @@ const PYTHON_INFO_SCRIPT: &str = concat!(
 );
 const DEPENDENCY_CHECK_SCRIPT: &str =
     "import funasr,librosa,modelscope,numpy,soundfile,torch,torchaudio; torch.zeros(1).numpy()";
+static RUNTIME_SETUP_LOCK: Mutex<()> = Mutex::new(());
 const DISK_PATTERNS: &[&str] = &["no space left", "errno 28", "disk full"];
 const PERMISSION_PATTERNS: &[&str] = &["permission denied", "access is denied", "errno 13"];
 const COMPATIBILITY_PATTERNS: &[&str] = &[
@@ -169,6 +174,9 @@ pub(crate) fn ensure_ready(params: RuntimeSetup<'_>) -> Result<PathBuf, String> 
 }
 
 fn ensure_ready_inner(params: &RuntimeSetup<'_>) -> Result<PathBuf, RuntimeFailure> {
+    let _guard = RUNTIME_SETUP_LOCK
+        .lock()
+        .map_err(|_| RuntimeFailure::package("local runtime setup lock poisoned"))?;
     (params.on_stage)(RuntimeSetupStage::Checking);
     fs::create_dir_all(params.runtime_dir)
         .map_err(|error| failure_from_io("create runtime directory", error))?;
@@ -186,6 +194,7 @@ fn ensure_ready_inner(params: &RuntimeSetup<'_>) -> Result<PathBuf, RuntimeFailu
         rebuild_environment(params.runtime_dir, &managed)?;
         (params.on_stage)(RuntimeSetupStage::InstallingDependencies);
         install_dependencies(params.runtime_dir)?;
+        verify_dependencies(params.runtime_dir)?;
         write_state(params.runtime_dir, &expected)?;
     }
     (params.on_stage)(RuntimeSetupStage::Ready);
@@ -341,6 +350,11 @@ fn install_dependencies(runtime_dir: &Path) -> Result<(), RuntimeFailure> {
 }
 
 fn run_pip(runtime_dir: &Path) -> Result<CommandOutcome, RuntimeFailure> {
+    let mut command = pip_install_command(runtime_dir);
+    run_logged_command(&mut command, &runtime_dir.join(PIP_LOG_FILE), PIP_TIMEOUT)
+}
+
+fn pip_install_command(runtime_dir: &Path) -> Command {
     let mut command = Command::new(venv_python(runtime_dir));
     command.args([
         "-I",
@@ -351,13 +365,35 @@ fn run_pip(runtime_dir: &Path) -> Result<CommandOutcome, RuntimeFailure> {
         "--prefer-binary",
         "--timeout=60",
         "--retries=3",
-        "--requirement",
     ]);
-    command.arg(runtime_dir.join("requirements.lock.txt"));
+    if let Some(index) = pytorch_index_for(std::env::consts::OS) {
+        command.args(["--extra-index-url", index]);
+    }
+    command
+        .arg("--requirement")
+        .arg(runtime_dir.join("requirements.lock.txt"));
     command.env("PIP_NO_INPUT", "1");
     command.env("PIP_CACHE_DIR", runtime_dir.join("pip-cache"));
     command.env("PYTHONUTF8", "1");
-    run_logged_command(&mut command, &runtime_dir.join(PIP_LOG_FILE), PIP_TIMEOUT)
+    command
+}
+
+fn pytorch_index_for(target_os: &str) -> Option<&'static str> {
+    (target_os == "windows").then_some(PYTORCH_CPU_INDEX)
+}
+
+fn verify_dependencies(runtime_dir: &Path) -> Result<(), RuntimeFailure> {
+    let mut command = Command::new(venv_python(runtime_dir));
+    command.args(["-I", "-c", DEPENDENCY_CHECK_SCRIPT]);
+    let outcome = run_logged_command(
+        &mut command,
+        &runtime_dir.join(DEPENDENCY_CHECK_LOG_FILE),
+        DEPENDENCY_CHECK_TIMEOUT,
+    )?;
+    if outcome.success {
+        return Ok(());
+    }
+    Err(failure_from_outcome(outcome, 1))
 }
 
 fn run_logged_command(
@@ -709,6 +745,22 @@ mod tests {
             "numpy==1.26.4 ; sys_platform == \"darwin\" and platform_machine == \"x86_64\""
         ));
         assert!(DEPENDENCY_CHECK_SCRIPT.contains("torch.zeros(1).numpy()"));
+    }
+
+    #[test]
+    fn uses_the_official_cpu_wheel_index_on_windows() {
+        assert_eq!(pytorch_index_for("windows"), Some(PYTORCH_CPU_INDEX));
+        assert_eq!(pytorch_index_for("macos"), None);
+        let command = pip_install_command(Path::new("runtime"));
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        if cfg!(target_os = "windows") {
+            assert!(args.iter().any(|arg| arg == PYTORCH_CPU_INDEX));
+        } else {
+            assert!(!args.iter().any(|arg| arg == PYTORCH_CPU_INDEX));
+        }
     }
 
     #[test]

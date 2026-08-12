@@ -73,6 +73,7 @@ enum ModelScopeMessage {
 /// Transcribe one local audio file and stream task-scoped progress updates.
 pub(crate) fn transcribe_file(
     request: TranscriptionRequest<'_>,
+    ensure_runtime: impl FnOnce() -> Result<(), String>,
     mut on_progress: impl FnMut(TranscriptionProgress) -> bool + 'static,
 ) -> Result<TranscriptionOutcome, String> {
     validate_request(&request)?;
@@ -85,6 +86,7 @@ pub(crate) fn transcribe_file(
         }
         return Ok(TranscriptionOutcome::NoAudioDetected);
     }
+    ensure_runtime()?;
     let decoded = run_modelscope(&request, &mut on_progress)?;
     if !on_progress(completion_update(&decoded)) {
         return Err("本地转写已停止".to_string());
@@ -147,6 +149,7 @@ fn spawn_transcriber(
     }
     let script = ensure_transcriber_script(&runtime_dir)?;
     let mut child = Command::new(python)
+        .args(["-I", "-X", "utf8"])
         .arg(script)
         .arg(request.wav_path)
         .env("MODELSCOPE_CACHE", cache_dir)
@@ -323,6 +326,7 @@ mod tests {
                 wav_path: &wav_path,
                 language: "zh",
             },
+            || panic!("silent audio must not initialize the Python runtime"),
             move |progress| {
                 observed_for_callback
                     .lock()
@@ -369,9 +373,7 @@ mod tests {
     #[test]
     fn protocol_reader_tolerates_non_utf8_windows_logs() {
         let mut output = b"loading model: \xC4\xE3\xBA\xC3\n".to_vec();
-        output.extend_from_slice(
-            r#"{"type":"result","text":"会议内容","segments":[]}"#.as_bytes(),
-        );
+        output.extend_from_slice(r#"{"type":"result","text":"会议内容","segments":[]}"#.as_bytes());
         output.extend_from_slice(b"\r\n");
         let mut reader = BufReader::new(output.as_slice());
 
