@@ -9,6 +9,7 @@ mod meeting;
 mod navigation;
 mod platform;
 mod record_import;
+mod site;
 mod web;
 mod window_state;
 
@@ -77,6 +78,7 @@ pub fn run() {
             meeting::meeting_retry_submit,
             meeting::meeting_retranscribe,
             meeting::meeting_start_recording,
+            meeting::meeting_set_notes_activity,
             meeting::meeting_stop_recording,
             meeting::meeting_update_settings,
             meeting::meeting_uninstall_model,
@@ -119,21 +121,31 @@ pub fn run() {
                 .windows
                 .first()
                 .expect("missing main window config");
+            let selected_site = site::selected_site(app.handle(), &window_config.url);
+            let mut window_config = window_config.clone();
+            window_config.url = site::initial_webview_url(app.handle(), &window_config.url);
 
             let user_agent = desktop_user_agent();
             let app_handle = app.handle().clone();
             let page_load_app_handle = app.handle().clone();
 
-            let window = WebviewWindowBuilder::from_config(app, window_config)?
+            let window = WebviewWindowBuilder::from_config(app, &window_config)?
                 .visible(false)
                 .user_agent(&user_agent)
                 .on_new_window(move |url, _features| handle_new_window_request(&app_handle, url))
                 .on_page_load(move |window, payload| {
                     if payload.event() == PageLoadEvent::Finished {
+                        #[cfg(any(target_os = "macos", windows))]
+                        app_menu::sync_site_after_load(
+                            &page_load_app_handle,
+                            &window,
+                            payload.url(),
+                        );
                         record_import::handle_page_load(&page_load_app_handle, &window);
                     }
                 })
                 .build()?;
+            window.set_title(selected_site.window_title())?;
 
             logging::write_app_log(
                 app.handle(),

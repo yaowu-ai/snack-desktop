@@ -22,7 +22,7 @@ MIN_REMAINING_SECONDS = 15.0
 MODEL_WARMUP_SECONDS = 20.0
 ESTIMATED_REALTIME_FACTOR = 0.65
 PCM_BYTES_PER_SECOND = 32_000
-PROTOCOL_OUTPUT = sys.stdout
+PROTOCOL_OUTPUT = sys.stdout.buffer
 PROTOCOL_LOCK = threading.Lock()
 
 
@@ -35,7 +35,8 @@ def model_dir(cache: Path, name: str) -> Path:
 
 def emit(payload: dict) -> None:
     with PROTOCOL_LOCK:
-        PROTOCOL_OUTPUT.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        message = (json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8")
+        PROTOCOL_OUTPUT.write(message)
         PROTOCOL_OUTPUT.flush()
 
 

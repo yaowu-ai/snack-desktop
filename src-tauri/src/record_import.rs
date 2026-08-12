@@ -98,6 +98,14 @@ impl RecordImportStore {
             .cloned()
     }
 
+    fn has_pending_automatic_notes(&self) -> bool {
+        self.pending
+            .lock()
+            .expect("record import store poisoned")
+            .as_ref()
+            .is_some_and(|record_import| record_import.auto_submit)
+    }
+
     fn mark_delivered(&self, id: &str) -> Result<bool, String> {
         let mut pending = self.pending.lock().expect("record import store poisoned");
         let Some(item) = pending.as_mut().filter(|item| item.id == id) else {
@@ -133,6 +141,11 @@ impl RecordImportStore {
             },
         }
     }
+}
+
+pub(crate) fn has_pending_automatic_notes(app: &AppHandle) -> bool {
+    app.try_state::<RecordImportStore>()
+        .is_some_and(|store| store.has_pending_automatic_notes())
 }
 
 pub(crate) fn initialize(app: &AppHandle) -> Result<(), String> {

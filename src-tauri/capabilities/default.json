@@ -6,6 +6,8 @@
   "remote": {
     "urls": [
       "https://snack.mechlabs.cn/*",
+      "https://snack.globalnexus-co.com/*",
+      "https://snack.mechandlink.com/*",
       "https://qasnack.mechlabs.cn/*",
       "http://localhost:3000/*",
       "http://127.0.0.1:3000/*"
