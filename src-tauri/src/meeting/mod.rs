@@ -1369,6 +1369,16 @@ fn spawn_transcription(app: AppHandle, store: MeetingStore, recording_id: String
             let app_for_progress = app.clone();
             let store_for_progress = store.clone_for_task();
             let recording_id_for_progress = recording_id.clone();
+            let runtime_dir = model_dir.join("runtime");
+            let ensure_runtime = || {
+                let on_stage = |_| {};
+                python_runtime::ensure_ready(python_runtime::RuntimeSetup {
+                    app: &app,
+                    runtime_dir: &runtime_dir,
+                    on_stage: &on_stage,
+                })
+                .map(drop)
+            };
             let outcome = transcribe::transcribe_file(
                 transcribe::TranscriptionRequest {
                     model_key,
@@ -1376,6 +1386,7 @@ fn spawn_transcription(app: AppHandle, store: MeetingStore, recording_id: String
                     wav_path: &wav_path,
                     language: &language,
                 },
+                ensure_runtime,
                 move |progress| {
                     let _ = app_for_progress.emit(
                         TRANSCRIPTION_PROGRESS_EVENT,
