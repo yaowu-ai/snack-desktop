@@ -150,6 +150,8 @@ fn spawn_transcriber(
         .arg(script)
         .arg(request.wav_path)
         .env("MODELSCOPE_CACHE", cache_dir)
+        .env("PYTHONIOENCODING", "utf-8")
+        .env("PYTHONUTF8", "1")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -189,13 +191,12 @@ fn ensure_transcriber_script(runtime_dir: &Path) -> Result<std::path::PathBuf, S
 
 fn consume_protocol(
     child: &mut Child,
-    reader: impl BufRead,
+    mut reader: impl BufRead,
     on_progress: &mut impl FnMut(TranscriptionProgress) -> bool,
 ) -> Result<Option<ModelScopeTranscript>, String> {
     let mut transcript = None;
-    for line in reader.lines() {
-        let line = line.map_err(|error| format!("读取本地转写进度失败: {error}"))?;
-        match decode_message(&line) {
+    while let Some(line) = read_protocol_line(&mut reader)? {
+        match decode_message_bytes(&line) {
             Some(ModelScopeMessage::Progress {
                 percent,
                 remaining_seconds,
@@ -212,16 +213,27 @@ fn consume_protocol(
     Ok(transcript)
 }
 
+fn read_protocol_line(reader: &mut impl BufRead) -> Result<Option<Vec<u8>>, String> {
+    let mut bytes = Vec::new();
+    let count = reader
+        .read_until(b'\n', &mut bytes)
+        .map_err(|error| format!("读取本地转写进度失败: {error}"))?;
+    if count == 0 {
+        return Ok(None);
+    }
+    Ok(Some(bytes))
+}
+
 fn drain_stderr(mut stderr: ChildStderr) -> JoinHandle<String> {
     std::thread::spawn(move || {
-        let mut output = String::new();
-        stderr.read_to_string(&mut output).ok();
-        output
+        let mut output = Vec::new();
+        stderr.read_to_end(&mut output).ok();
+        String::from_utf8_lossy(&output).into_owned()
     })
 }
 
-fn decode_message(line: &str) -> Option<ModelScopeMessage> {
-    serde_json::from_str(line).ok()
+fn decode_message_bytes(line: &[u8]) -> Option<ModelScopeMessage> {
+    serde_json::from_slice(line).ok()
 }
 
 fn diagnostic(stderr: &str) -> String {
@@ -328,8 +340,10 @@ mod tests {
 
     #[test]
     fn progress_protocol_decodes_remaining_seconds() {
-        let message =
-            decode_message(r#"{"type":"progress","percent":36,"remainingSeconds":125}"#).unwrap();
+        let message = decode_message_bytes(
+            r#"{"type":"progress","percent":36,"remainingSeconds":125}"#.as_bytes(),
+        )
+        .unwrap();
 
         assert!(matches!(
             message,
@@ -342,14 +356,32 @@ mod tests {
 
     #[test]
     fn result_protocol_ignores_unrelated_log_lines() {
-        assert!(decode_message("funasr version: 1.3.14").is_none());
-        let message = decode_message(concat!(
+        assert!(decode_message_bytes(b"funasr version: 1.3.14").is_none());
+        let payload = concat!(
             r#"{"type":"result","text":"会议内容","segments":[{"startMs":0,"#,
             r#""endMs":1200,"text":"会议内容","speaker":"说话人 1"}]}"#
-        ))
-        .unwrap();
+        );
+        let message = decode_message_bytes(payload.as_bytes()).unwrap();
 
         assert!(matches!(message, ModelScopeMessage::Result { text, .. } if text == "会议内容"));
+    }
+
+    #[test]
+    fn protocol_reader_tolerates_non_utf8_windows_logs() {
+        let mut output = b"loading model: \xC4\xE3\xBA\xC3\n".to_vec();
+        output.extend_from_slice(
+            r#"{"type":"result","text":"会议内容","segments":[]}"#.as_bytes(),
+        );
+        output.extend_from_slice(b"\r\n");
+        let mut reader = BufReader::new(output.as_slice());
+
+        let log = read_protocol_line(&mut reader).unwrap().unwrap();
+        assert!(decode_message_bytes(&log).is_none());
+        let result = read_protocol_line(&mut reader).unwrap().unwrap();
+        assert!(matches!(
+            decode_message_bytes(&result),
+            Some(ModelScopeMessage::Result { text, .. }) if text == "会议内容"
+        ));
     }
 
     #[test]
