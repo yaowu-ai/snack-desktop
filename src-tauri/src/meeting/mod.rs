@@ -27,6 +27,7 @@ mod transcribe;
 
 use std::fs;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -51,6 +52,7 @@ pub(crate) struct MeetingManagerState {
     pub(crate) manager: Arc<InstallManager>,
     pub(crate) recorder: Mutex<Option<Recorder>>,
     pub(crate) reminder: reminder::RecordingReminderMonitor,
+    background_notes_active: AtomicBool,
 }
 
 static RECORDING_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -162,6 +164,41 @@ pub(crate) fn desktop_update_block_reason(app: &AppHandle) -> Option<String> {
     None
 }
 
+pub(crate) fn site_switch_block_reason(app: &AppHandle) -> Option<String> {
+    let state = app.try_state::<MeetingManagerState>()?;
+    if state.recorder.lock().expect("recorder poisoned").is_some() {
+        return Some("正在录音，结束录音后再切换站点".to_string());
+    }
+    if has_site_switch_blocking_task(&state.store) {
+        return Some("会议内容仍在处理中，完成后再切换站点".to_string());
+    }
+    if state.background_notes_active.load(Ordering::Relaxed) {
+        return Some("会议纪要正在生成，完成后再切换站点".to_string());
+    }
+    None
+}
+
+fn has_site_switch_blocking_task(store: &MeetingStore) -> bool {
+    has_site_switch_blocking_state(store.load_task(), store.load_task_records())
+}
+
+fn has_site_switch_blocking_state(current: Option<MeetingTask>, records: Vec<MeetingTask>) -> bool {
+    records
+        .into_iter()
+        .any(|task| task.state.blocks_site_switch())
+        || current.is_some_and(|task| task.state.blocks_site_switch())
+}
+
+#[cfg(test)]
+fn task_with_state(state: TaskState) -> MeetingTask {
+    MeetingTask::new("site-switch-test".to_string(), "zh".to_string()).with_state(state)
+}
+
+#[cfg(test)]
+fn site_switch_is_blocked_by_state(state: TaskState) -> bool {
+    has_site_switch_blocking_state(None, vec![task_with_state(state)])
+}
+
 // ---------------------------------------------------------------------------
 // Initialization & crash recovery
 // ---------------------------------------------------------------------------
@@ -176,6 +213,7 @@ pub(crate) fn initialize(app: &AppHandle) -> Result<(), String> {
         manager: Arc::clone(&manager),
         recorder: Mutex::new(None),
         reminder,
+        background_notes_active: AtomicBool::new(false),
     });
 
     // Resource reconciliation (downloads/verification never survive a crash).
@@ -1046,6 +1084,19 @@ pub(crate) fn meeting_notify_notes_completed(
     Ok(())
 }
 
+#[tauri::command]
+pub(crate) fn meeting_set_notes_activity(
+    app: AppHandle,
+    window: WebviewWindow,
+    active: bool,
+) -> Result<(), String> {
+    require_allowed_window(&window)?;
+    app.state::<MeetingManagerState>()
+        .background_notes_active
+        .store(active, Ordering::Relaxed);
+    Ok(())
+}
+
 fn is_valid_session_id(session_id: &str) -> bool {
     !session_id.is_empty()
         && session_id.len() <= 20
@@ -1054,6 +1105,11 @@ fn is_valid_session_id(session_id: &str) -> bool {
 
 fn handoff_completed_transcript(app: &AppHandle, recording_id: &str) {
     notifications::notify_transcript_ready(app);
+    let settings = app.state::<MeetingManagerState>().store.load_settings();
+    if !should_automatically_generate_notes(&settings) {
+        log_automatic_notes_skipped(app, recording_id);
+        return;
+    }
     match open_notes_in_chat(app, recording_id, true) {
         Ok(()) => crate::logging::write_app_log(
             app,
@@ -1072,6 +1128,20 @@ fn handoff_completed_transcript(app: &AppHandle, recording_id: &str) {
             );
         }
     }
+}
+
+fn should_automatically_generate_notes(settings: &MeetingSettings) -> bool {
+    settings.auto_generate_notes_enabled
+}
+
+fn log_automatic_notes_skipped(app: &AppHandle, recording_id: &str) {
+    crate::logging::write_app_log(
+        app,
+        "info",
+        "meeting-notes-handoff",
+        "automatic notes handoff skipped by user preference",
+        Some(&serde_json::json!({ "recordingId": recording_id })),
+    );
 }
 
 fn open_notes_in_chat(
@@ -1537,7 +1607,8 @@ mod tests {
     use super::permissions::PermissionAccess;
     use super::{
         can_attempt_recording_without_permission_request, imported_audio_task, is_valid_session_id,
-        normalize_chat_handoff_state, MeetingTask, TaskState, Transcript,
+        normalize_chat_handoff_state, should_automatically_generate_notes,
+        site_switch_is_blocked_by_state, MeetingSettings, MeetingTask, TaskState, Transcript,
     };
     use std::fs;
 
@@ -1597,6 +1668,32 @@ mod tests {
         task.state = TaskState::TranscribingLocal;
         assert!(!normalize_chat_handoff_state(&mut task));
         assert_eq!(task.state, TaskState::TranscribingLocal);
+    }
+
+    #[test]
+    fn automatic_notes_handoff_respects_the_saved_preference() {
+        let mut settings = MeetingSettings::default();
+        assert!(!should_automatically_generate_notes(&settings));
+
+        settings.auto_generate_notes_enabled = true;
+        assert!(should_automatically_generate_notes(&settings));
+    }
+
+    #[test]
+    fn site_switch_guard_allows_local_transcription_but_blocks_recording_and_notes() {
+        for state in [
+            TaskState::Checking,
+            TaskState::Recording,
+            TaskState::Finalizing,
+            TaskState::GeneratingNotes,
+        ] {
+            assert!(site_switch_is_blocked_by_state(state));
+        }
+        assert!(!site_switch_is_blocked_by_state(
+            TaskState::TranscribingLocal
+        ));
+        assert!(!site_switch_is_blocked_by_state(TaskState::TranscriptReady));
+        assert!(!site_switch_is_blocked_by_state(TaskState::Ready));
     }
 
     #[test]

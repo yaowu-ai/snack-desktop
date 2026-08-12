@@ -29,6 +29,7 @@
           "meeting_retry_submit",
           "meeting_retranscribe",
           "meeting_start_recording",
+          "meeting_set_notes_activity",
           "meeting_stop_recording",
           "meeting_uninstall_model",
           "meeting_update_settings",

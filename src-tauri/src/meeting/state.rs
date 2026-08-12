@@ -40,6 +40,8 @@ pub(crate) struct MeetingSettings {
     #[serde(default)]
     pub(crate) recording_reminder_enabled: bool,
     #[serde(default)]
+    pub(crate) auto_generate_notes_enabled: bool,
+    #[serde(default)]
     pub(crate) organize_transcripts_by_date: bool,
     #[serde(default = "default_meeting_notes_prompt")]
     pub(crate) notes_prompt: String,
@@ -52,6 +54,7 @@ impl Default for MeetingSettings {
             shortcut: "CommandOrControl+R".to_string(),
             retain_audio: true,
             recording_reminder_enabled: false,
+            auto_generate_notes_enabled: false,
             organize_transcripts_by_date: false,
             notes_prompt: default_meeting_notes_prompt(),
         }
@@ -209,6 +212,16 @@ impl TaskState {
         matches!(
             self,
             TaskState::Checking | TaskState::Recording | TaskState::Finalizing
+        )
+    }
+
+    pub(crate) fn blocks_site_switch(self) -> bool {
+        matches!(
+            self,
+            TaskState::Checking
+                | TaskState::Recording
+                | TaskState::Finalizing
+                | TaskState::GeneratingNotes
         )
     }
 }
@@ -939,6 +952,7 @@ mod tests {
         let settings = MeetingSettings::default();
         assert!(settings.retain_audio);
         assert!(!settings.recording_reminder_enabled);
+        assert!(!settings.auto_generate_notes_enabled);
         assert!(!settings.organize_transcripts_by_date);
         assert_eq!(settings.shortcut, "CommandOrControl+R");
         assert_eq!(settings.notes_prompt, DEFAULT_MEETING_NOTES_PROMPT);
@@ -956,7 +970,34 @@ mod tests {
 
         assert_eq!(settings.notes_prompt, DEFAULT_MEETING_NOTES_PROMPT);
         assert!(!settings.recording_reminder_enabled);
+        assert!(!settings.auto_generate_notes_enabled);
         assert!(!settings.organize_transcripts_by_date);
+    }
+
+    #[test]
+    fn settings_preserve_an_explicitly_enabled_recording_reminder() {
+        let settings: MeetingSettings = serde_json::from_value(serde_json::json!({
+            "storageDirectory": "/tmp/meeting",
+            "shortcut": "CommandOrControl+R",
+            "retainAudio": true,
+            "recordingReminderEnabled": true
+        }))
+        .unwrap();
+
+        assert!(settings.recording_reminder_enabled);
+    }
+
+    #[test]
+    fn settings_preserve_an_explicitly_enabled_automatic_notes_preference() {
+        let settings: MeetingSettings = serde_json::from_value(serde_json::json!({
+            "storageDirectory": "/tmp/meeting",
+            "shortcut": "CommandOrControl+R",
+            "retainAudio": true,
+            "autoGenerateNotesEnabled": true
+        }))
+        .unwrap();
+
+        assert!(settings.auto_generate_notes_enabled);
     }
 
     #[test]

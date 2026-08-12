@@ -2,6 +2,8 @@ use tauri::Url;
 
 const ALLOWED_WEB_ORIGINS: &[&str] = &[
     "https://snack.mechlabs.cn",
+    "https://snack.globalnexus-co.com",
+    "https://snack.mechandlink.com",
     "https://qasnack.mechlabs.cn",
     "http://localhost:3000",
     "http://127.0.0.1:3000",
@@ -27,4 +29,25 @@ pub(crate) fn desktop_user_agent() -> String {
         env!("SNACK_DESKTOP_ARCH"),
         env!("SNACK_DESKTOP_VERSION")
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn allows_only_configured_snack_origins() {
+        for origin in [
+            "https://snack.mechlabs.cn",
+            "https://snack.globalnexus-co.com",
+            "https://snack.mechandlink.com",
+            "https://qasnack.mechlabs.cn",
+            "http://localhost:3000",
+        ] {
+            assert!(is_allowed_web_origin(&Url::parse(origin).unwrap()));
+        }
+        assert!(!is_allowed_web_origin(
+            &Url::parse("https://snack.mechandlink.com.evil.example").unwrap()
+        ));
+    }
 }
