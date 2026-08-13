@@ -254,7 +254,7 @@ pub(crate) fn persist_transcript(
         &store.transcript_path(&task.recording_id),
         &transcript,
     )?;
-    let text_path = store.transcript_text_path(task);
+    let text_path = store.available_transcript_text_path(task);
     if let Some(parent) = text_path.parent() {
         fs::create_dir_all(parent).map_err(|error| error.to_string())?;
     }

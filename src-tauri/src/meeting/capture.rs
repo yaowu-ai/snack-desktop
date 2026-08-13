@@ -12,7 +12,7 @@
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 use serde::{Deserialize, Serialize};
@@ -87,18 +87,24 @@ impl CaptureError {
 #[derive(Debug)]
 pub(crate) struct CaptureShared {
     pub(crate) stop: AtomicBool,
+    pub(crate) paused: AtomicBool,
     pub(crate) mic_live: AtomicBool,
     pub(crate) system_live: AtomicBool,
-    pub(crate) started_millis: AtomicU64,
+    pub(crate) recorded_samples: AtomicU64,
+    discard_pending: AtomicBool,
+    write_gate: Mutex<()>,
 }
 
 impl CaptureShared {
-    pub(crate) fn new(started_millis: u64) -> Arc<Self> {
+    pub(crate) fn new(_started_millis: u64) -> Arc<Self> {
         Arc::new(Self {
             stop: AtomicBool::new(false),
+            paused: AtomicBool::new(false),
             mic_live: AtomicBool::new(false),
             system_live: AtomicBool::new(false),
-            started_millis: AtomicU64::new(started_millis),
+            recorded_samples: AtomicU64::new(0),
+            discard_pending: AtomicBool::new(false),
+            write_gate: Mutex::new(()),
         })
     }
 
@@ -110,8 +116,49 @@ impl CaptureShared {
         self.stop.load(Ordering::SeqCst)
     }
 
-    pub(crate) fn elapsed_millis(&self, now: u64) -> u64 {
-        now.saturating_sub(self.started_millis.load(Ordering::SeqCst))
+    pub(crate) fn set_paused(&self, paused: bool) {
+        if !paused {
+            // Let the writer discard every pre-pause buffered chunk before
+            // callbacks are admitted again. This also makes rapid
+            // pause/resume clicks deterministic.
+            for _ in 0..100 {
+                if !self.discard_pending.load(Ordering::SeqCst) || self.should_stop() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
+        // Serialize the state transition with WAV writes so no in-flight
+        // chunk can extend the recording after pause() returns.
+        let _write_guard = self.write_gate.lock().expect("capture write gate poisoned");
+        self.paused.store(paused, Ordering::SeqCst);
+        if paused {
+            self.discard_pending.store(true, Ordering::SeqCst);
+            self.mic_live.store(false, Ordering::SeqCst);
+            self.system_live.store(false, Ordering::SeqCst);
+        }
+    }
+
+    pub(crate) fn is_paused(&self) -> bool {
+        self.paused.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn accepts_audio(&self) -> bool {
+        !self.should_stop() && !self.is_paused()
+    }
+
+    pub(crate) fn take_discard_pending(&self) -> bool {
+        self.discard_pending.swap(false, Ordering::SeqCst)
+    }
+
+    pub(crate) fn record_samples(&self, count: usize) {
+        self.recorded_samples
+            .fetch_add(count as u64, Ordering::SeqCst);
+    }
+
+    pub(crate) fn elapsed_millis(&self) -> u64 {
+        self.recorded_samples.load(Ordering::SeqCst) * 1_000
+            / u64::from(crate::meeting::audio::TARGET_SAMPLE_RATE)
     }
 }
 
@@ -121,14 +168,16 @@ pub(crate) struct LiveCaptureStatus {
     pub(crate) mic_active: bool,
     pub(crate) system_audio_active: bool,
     pub(crate) elapsed_ms: u64,
+    pub(crate) paused: bool,
 }
 
 impl LiveCaptureStatus {
-    pub(crate) fn from_shared(shared: &CaptureShared, now: u64) -> Self {
+    pub(crate) fn from_shared(shared: &CaptureShared) -> Self {
         Self {
             mic_active: shared.mic_live.load(Ordering::SeqCst),
             system_audio_active: shared.system_live.load(Ordering::SeqCst),
-            elapsed_ms: shared.elapsed_millis(now),
+            elapsed_ms: shared.elapsed_millis(),
+            paused: shared.is_paused(),
         }
     }
 }
@@ -142,6 +191,14 @@ pub(crate) struct Recorder {
 }
 
 impl Recorder {
+    pub(crate) fn pause(&self) {
+        self.shared.set_paused(true);
+    }
+
+    pub(crate) fn resume(&self) {
+        self.shared.set_paused(false);
+    }
+
     /// Stop capture, drain remaining samples, finalize the WAV file.
     /// Returns the finalized sample count.
     pub(crate) fn stop(mut self) -> Result<u64, String> {
@@ -263,6 +320,23 @@ pub(crate) fn mix_chunks(mic: &[f32], system: &[f32]) -> Vec<i16> {
     mix_samples(mic, system)
 }
 
+pub(crate) fn write_mixed_samples(
+    shared: &CaptureShared,
+    writer: &mut crate::meeting::audio::WavWriter,
+    samples: &[i16],
+) -> Result<(), String> {
+    let _write_guard = shared
+        .write_gate
+        .lock()
+        .expect("capture write gate poisoned");
+    if shared.is_paused() {
+        return Ok(());
+    }
+    writer.write_samples(samples)?;
+    shared.record_samples(samples.len());
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -283,6 +357,19 @@ mod tests {
         let stereo = vec![1.0f32, 0.0, 0.5, 0.5];
         let mono = downmix_f32(&stereo, 2);
         assert_eq!(mono, vec![0.5, 0.5]);
+    }
+
+    #[test]
+    fn elapsed_time_counts_only_recorded_samples() {
+        let shared = CaptureShared::new(123);
+        shared.record_samples(16_000);
+        assert_eq!(shared.elapsed_millis(), 1_000);
+        shared.set_paused(true);
+        assert!(shared.is_paused());
+        assert!(!shared.accepts_audio());
+        assert!(shared.take_discard_pending());
+        assert!(!shared.take_discard_pending());
+        assert_eq!(shared.elapsed_millis(), 1_000);
     }
 
     #[test]

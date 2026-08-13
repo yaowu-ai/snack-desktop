@@ -285,6 +285,12 @@ pub(crate) struct MeetingTask {
     pub(crate) recording_id: String,
     #[serde(default)]
     pub(crate) display_name: Option<String>,
+    #[serde(default)]
+    pub(crate) auto_generate_notes_enabled: Option<bool>,
+    #[serde(default)]
+    pub(crate) notes_project_id: Option<String>,
+    #[serde(default)]
+    pub(crate) notes_project_name: Option<String>,
     pub(crate) state: TaskState,
     pub(crate) started_at: Option<String>,
     pub(crate) ended_at: Option<String>,
@@ -311,6 +317,9 @@ impl MeetingTask {
         Self {
             recording_id,
             display_name: None,
+            auto_generate_notes_enabled: None,
+            notes_project_id: None,
+            notes_project_name: None,
             state: TaskState::Idle,
             started_at: None,
             ended_at: None,
@@ -422,6 +431,34 @@ impl MeetingStore {
                 format!("Snack会议-{created_at}.txt")
             });
         self.transcript_text_root(task).join(file_name)
+    }
+
+    pub(crate) fn transcript_display_stem(&self, task: &MeetingTask) -> String {
+        self.transcript_text_path(task)
+            .file_stem()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "Snack会议".to_string())
+    }
+
+    /// Resolve a non-destructive transcript path. User-owned files in the
+    /// selected directory are never overwritten by a new recording.
+    pub(crate) fn available_transcript_text_path(&self, task: &MeetingTask) -> PathBuf {
+        let requested = self.transcript_text_path(task);
+        if !requested.exists() {
+            return requested;
+        }
+        let parent = requested.parent().map(PathBuf::from).unwrap_or_default();
+        let stem = requested
+            .file_stem()
+            .map(|value| value.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "Snack会议".to_string());
+        for index in 2..=10_000 {
+            let candidate = parent.join(format!("{stem} ({index}).txt"));
+            if !candidate.exists() {
+                return candidate;
+            }
+        }
+        parent.join(format!("{stem}-{}.txt", unix_millis()))
     }
 
     pub(crate) fn ensure_transcript_output_directory(
@@ -616,7 +653,7 @@ impl MeetingStore {
         let Some(transcript) = task.transcript.as_ref() else {
             return;
         };
-        let path = self.transcript_text_path(task);
+        let path = self.available_transcript_text_path(task);
         if let Some(parent) = path.parent() {
             let _ = fs::create_dir_all(parent);
         }
@@ -780,12 +817,8 @@ pub(crate) fn normalize_transcript_file_name(value: &str) -> Result<String, Stri
     if name.is_empty() {
         return Err("文件名不能为空".to_string());
     }
-    if name
-        .chars()
-        .any(|character| matches!(character, '/' | '\\' | '\0'))
-        || matches!(name, "." | "..")
-    {
-        return Err("文件名不能包含路径字符".to_string());
+    if name.chars().any(is_invalid_file_name_character) || matches!(name, "." | "..") {
+        return Err("文件名包含系统不支持的字符".to_string());
     }
     let without_txt = name
         .strip_suffix(".txt")
@@ -801,7 +834,33 @@ pub(crate) fn normalize_transcript_file_name(value: &str) -> Result<String, Stri
     if stem.is_empty() || matches!(stem, "." | "..") {
         return Err("文件名不能为空".to_string());
     }
+    let stem = stem.trim_end_matches([' ', '.']);
+    if stem.is_empty() || is_windows_reserved_file_name(stem) {
+        return Err("文件名不可用，请换一个名称".to_string());
+    }
+    if stem.len() > 200 {
+        return Err("文件名过长，请缩短后重试".to_string());
+    }
     Ok(format!("{stem}.txt"))
+}
+
+fn is_invalid_file_name_character(character: char) -> bool {
+    character.is_control()
+        || matches!(
+            character,
+            '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*'
+        )
+}
+
+fn is_windows_reserved_file_name(stem: &str) -> bool {
+    let upper = stem.split('.').next().unwrap_or(stem).to_ascii_uppercase();
+    matches!(upper.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || upper
+            .strip_prefix("COM")
+            .or_else(|| upper.strip_prefix("LPT"))
+            .is_some_and(|suffix| {
+                matches!(suffix, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9")
+            })
 }
 
 pub(crate) fn validate_meeting_settings(settings: &MeetingSettings) -> Result<(), String> {
@@ -1087,6 +1146,38 @@ mod tests {
             "产品周会.txt"
         );
         assert!(super::normalize_transcript_file_name("../产品周会").is_err());
+        assert!(super::normalize_transcript_file_name("CON").is_err());
+        assert!(super::normalize_transcript_file_name("周会:复盘").is_err());
+        assert!(super::normalize_transcript_file_name(&"会".repeat(100)).is_err());
+    }
+
+    #[test]
+    fn transcript_path_never_overwrites_an_existing_user_file() {
+        let root = std::env::temp_dir().join(format!(
+            "snack-meeting-unique-transcript-{}",
+            super::unix_millis()
+        ));
+        let state_root = root.join("state");
+        let recordings_root = root.join("selected");
+        fs::create_dir_all(&state_root).unwrap();
+        fs::create_dir_all(&recordings_root).unwrap();
+        let store = MeetingStore {
+            root: state_root,
+            default_recordings_root: recordings_root.clone(),
+        };
+        let mut settings = MeetingSettings::default();
+        settings.storage_directory = Some(recordings_root.to_string_lossy().into_owned());
+        store.save_settings(&settings).unwrap();
+        let mut task = MeetingTask::new("rec-unique".to_string(), "zh".to_string());
+        task.display_name = Some("产品周会.txt".to_string());
+        fs::write(recordings_root.join("产品周会.txt"), "已有内容").unwrap();
+
+        assert_eq!(
+            store.available_transcript_text_path(&task),
+            recordings_root.join("产品周会 (2).txt")
+        );
+
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

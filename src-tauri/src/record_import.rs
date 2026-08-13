@@ -39,6 +39,10 @@ pub(crate) struct PendingRecordImport {
     pub created_at: String,
     #[serde(default)]
     pub auto_submit: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_name: Option<String>,
     #[serde(default)]
     delivery_state: RecordImportDeliveryState,
 }
@@ -160,9 +164,17 @@ pub(crate) fn open_prefill_with_attachment(
     attachment_name: String,
     attachment_text: String,
     auto_submit: bool,
+    project_id: Option<String>,
+    project_name: Option<String>,
 ) -> Result<(), String> {
-    let record_import =
-        build_meeting_import(prompt, attachment_name, attachment_text, auto_submit)?;
+    let record_import = build_meeting_import(
+        prompt,
+        attachment_name,
+        attachment_text,
+        auto_submit,
+        project_id,
+        project_name,
+    )?;
     app.state::<RecordImportStore>()
         .replace(record_import.clone())?;
     show_main_window(app);
@@ -170,7 +182,7 @@ pub(crate) fn open_prefill_with_attachment(
         .get_webview_window("main")
         .ok_or_else(|| "main webview is unavailable".to_string())?;
     prefill_root_input(&window, &record_import)?;
-    navigate_to_root(app)
+    navigate_to_import_root(app, &record_import)
 }
 
 /// Persist an automatic meeting-notes handoff and wake the existing webview
@@ -180,8 +192,17 @@ pub(crate) fn queue_background_with_attachment(
     prompt: String,
     attachment_name: String,
     attachment_text: String,
+    project_id: Option<String>,
+    project_name: Option<String>,
 ) -> Result<(), String> {
-    let record_import = build_meeting_import(prompt, attachment_name, attachment_text, true)?;
+    let record_import = build_meeting_import(
+        prompt,
+        attachment_name,
+        attachment_text,
+        true,
+        project_id,
+        project_name,
+    )?;
     app.state::<RecordImportStore>()
         .replace(record_import.clone())?;
     app.emit(
@@ -352,7 +373,7 @@ fn meeting_navigation_target(url: &tauri::Url) -> Option<MeetingNavigationTarget
     }
 }
 
-fn show_main_window(app: &AppHandle) {
+pub(crate) fn show_main_window(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.show();
         let _ = window.set_focus();
@@ -361,6 +382,14 @@ fn show_main_window(app: &AppHandle) {
 
 fn navigate_to_root(app: &AppHandle) -> Result<(), String> {
     navigate_to_web_path(app, "/", None)
+}
+
+fn navigate_to_import_root(app: &AppHandle, import: &PendingRecordImport) -> Result<(), String> {
+    let query = import
+        .project_id
+        .as_deref()
+        .map(|project_id| format!("projectId={project_id}"));
+    navigate_to_web_path(app, "/", query.as_deref())
 }
 
 fn navigate_to_web_path(app: &AppHandle, path: &str, query: Option<&str>) -> Result<(), String> {
@@ -380,6 +409,8 @@ fn build_meeting_import(
     attachment_name: String,
     attachment_text: String,
     auto_submit: bool,
+    project_id: Option<String>,
+    project_name: Option<String>,
 ) -> Result<PendingRecordImport, String> {
     if prompt.trim().is_empty() || prompt.len() > MAX_TRANSCRIPT_BYTES {
         return Err("会议纪要 Prompt 为空或超过 5 MB".to_string());
@@ -387,9 +418,21 @@ fn build_meeting_import(
     if attachment_name.trim().is_empty() || attachment_text.len() > MAX_TRANSCRIPT_BYTES {
         return Err("会议转写文件无效或超过 5 MB".to_string());
     }
+    if project_id
+        .as_deref()
+        .is_some_and(|value| value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()))
+    {
+        return Err("会议纪要项目无效".to_string());
+    }
     let checksum = format!(
         "{:x}",
-        Sha256::digest(format!("{prompt}\0{attachment_name}\0{attachment_text}").as_bytes())
+        Sha256::digest(
+            format!(
+                "{prompt}\0{attachment_name}\0{attachment_text}\0{}",
+                project_id.as_deref().unwrap_or_default()
+            )
+            .as_bytes()
+        )
     );
     Ok(PendingRecordImport {
         id: format!("meeting-v2-{checksum}"),
@@ -398,6 +441,8 @@ fn build_meeting_import(
         attachment_text: Some(attachment_text),
         created_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
         auto_submit,
+        project_id,
+        project_name,
         delivery_state: RecordImportDeliveryState::Pending,
     })
 }
@@ -405,9 +450,11 @@ fn build_meeting_import(
 fn prefill_root_input(window: &WebviewWindow, import: &PendingRecordImport) -> Result<(), String> {
     require_allowed_origin(window)?;
     let text = serde_json::to_string(&import.text).map_err(|error| error.to_string())?;
-    let script = format!(
-        "window.sessionStorage.setItem('prefill_message', {text});window.sessionStorage.removeItem('prefill_message_options');"
-    );
+    let project_id =
+        serde_json::to_string(&import.project_id).map_err(|error| error.to_string())?;
+    let project_name =
+        serde_json::to_string(&import.project_name).map_err(|error| error.to_string())?;
+    let script = format!("window.sessionStorage.setItem('prefill_message', {text});window.sessionStorage.removeItem('prefill_message_options');if({project_id}){{window.sessionStorage.setItem('task-hub:pending-project-id',{project_id});window.sessionStorage.setItem('task-hub:pending-project-name',{project_name}||'项目');}}else{{window.sessionStorage.removeItem('task-hub:pending-project-id');window.sessionStorage.removeItem('task-hub:pending-project-name');}}");
     window.eval(&script).map_err(|error| error.to_string())
 }
 
@@ -453,6 +500,8 @@ fn read_clipboard_import() -> Result<PendingRecordImport, String> {
         attachment_text: None,
         created_at: metadata.created_at,
         auto_submit: false,
+        project_id: None,
+        project_name: None,
         delivery_state: RecordImportDeliveryState::Pending,
     })
 }
@@ -494,6 +543,8 @@ fn read_clipboard_import() -> Result<PendingRecordImport, String> {
                 attachment_text: None,
                 created_at: metadata.created_at,
                 auto_submit: false,
+                project_id: None,
+                project_name: None,
                 delivery_state: RecordImportDeliveryState::Pending,
             })
         })();
@@ -618,6 +669,8 @@ mod tests {
             "Snack会议-2026-08-06.txt".to_string(),
             "会议转写正文".to_string(),
             false,
+            Some("101".to_string()),
+            Some("产品项目".to_string()),
         )
         .unwrap();
 
@@ -628,6 +681,8 @@ mod tests {
         );
         assert_eq!(import.attachment_text.as_deref(), Some("会议转写正文"));
         assert!(!import.auto_submit);
+        assert_eq!(import.project_id.as_deref(), Some("101"));
+        assert_eq!(import.project_name.as_deref(), Some("产品项目"));
         assert!(import.id.starts_with("meeting-v2-"));
     }
 
@@ -638,6 +693,8 @@ mod tests {
             "Snack会议.txt".to_string(),
             "会议转写正文".to_string(),
             true,
+            None,
+            None,
         )
         .unwrap();
 
