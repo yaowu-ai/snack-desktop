@@ -51,6 +51,8 @@ pub(crate) struct MeetingManagerState {
     pub(crate) store: MeetingStore,
     pub(crate) manager: Arc<InstallManager>,
     pub(crate) recorder: Mutex<Option<Recorder>>,
+    recording_task_update: Mutex<()>,
+    recording_projects: Mutex<Vec<overlay::RecordingProjectOption>>,
     pub(crate) reminder: reminder::RecordingReminderMonitor,
     background_notes_active: AtomicBool,
 }
@@ -212,6 +214,8 @@ pub(crate) fn initialize(app: &AppHandle) -> Result<(), String> {
         store: store.clone_for_task(),
         manager: Arc::clone(&manager),
         recorder: Mutex::new(None),
+        recording_task_update: Mutex::new(()),
+        recording_projects: Mutex::new(Vec::new()),
         reminder,
         background_notes_active: AtomicBool::new(false),
     });
@@ -800,6 +804,7 @@ fn start_recording(
     let mut task = MeetingTask::new(recording_id.clone(), language);
     task.state = TaskState::Checking;
     task.started_at = Some(now_rfc3339());
+    task.auto_generate_notes_enabled = Some(store.load_settings().auto_generate_notes_enabled);
     store.save_task(&task)?;
     emit_state(&app, store);
 
@@ -814,10 +819,8 @@ fn start_recording(
             task.audio_path = Some(audio_path.to_string_lossy().to_string());
             store.save_task(&task)?;
             emit_state(&app, store);
-            overlay::show_overlay(
-                &app,
-                overlay::OverlayState::recording(recording_id.clone(), 0, false, false),
-            )?;
+            let status = current_live_capture_status(&state)?;
+            overlay::show_overlay(&app, build_overlay_state(&state, &task, status))?;
             spawn_overlay_updater(app.clone(), recording_id);
             Ok(())
         }
@@ -840,6 +843,268 @@ fn start_recording(
             Err(error.message)
         }
     }
+}
+
+fn current_live_capture_status(state: &MeetingManagerState) -> Result<LiveCaptureStatus, String> {
+    state
+        .recorder
+        .lock()
+        .expect("recorder poisoned")
+        .as_ref()
+        .map(|recorder| LiveCaptureStatus::from_shared(&recorder.shared))
+        .ok_or_else(|| "录音状态异常".to_string())
+}
+
+fn build_overlay_state(
+    state: &MeetingManagerState,
+    task: &MeetingTask,
+    status: LiveCaptureStatus,
+) -> overlay::OverlayState {
+    overlay::OverlayState::recording(overlay::RecordingOverlayState {
+        recording_id: task.recording_id.clone(),
+        elapsed_ms: status.elapsed_ms,
+        mic_active: status.mic_active,
+        system_audio_active: status.system_audio_active,
+        paused: status.paused,
+        display_name: state.store.transcript_display_stem(task),
+        auto_generate_notes_enabled: task.auto_generate_notes_enabled.unwrap_or(false),
+        notes_project_id: task.notes_project_id.clone(),
+        notes_project_name: task.notes_project_name.clone(),
+        projects: state
+            .recording_projects
+            .lock()
+            .expect("recording projects poisoned")
+            .clone(),
+    })
+}
+
+#[tauri::command]
+pub(crate) fn meeting_set_recording_paused(
+    app: AppHandle,
+    window: WebviewWindow,
+    paused: bool,
+) -> Result<(), String> {
+    if !overlay::is_overlay_window(&window) {
+        require_allowed_window(&window)?;
+    }
+    let state = app.state::<MeetingManagerState>();
+    let guard = state.recorder.lock().expect("recorder poisoned");
+    let recorder = guard.as_ref().ok_or("当前没有进行中的录音")?;
+    if paused {
+        recorder.pause();
+    } else {
+        recorder.resume();
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub(crate) fn meeting_set_recording_file_name(
+    app: AppHandle,
+    window: WebviewWindow,
+    display_name: String,
+) -> Result<(), String> {
+    require_recording_overlay(&window)?;
+    update_current_recording_task(&app, |task| {
+        task.display_name = normalize_recording_display_name(&display_name)?;
+        Ok(())
+    })
+}
+
+#[tauri::command]
+pub(crate) fn meeting_set_recording_auto_notes(
+    app: AppHandle,
+    window: WebviewWindow,
+    enabled: bool,
+) -> Result<(), String> {
+    require_recording_overlay(&window)?;
+    update_current_recording_task(&app, |task| {
+        task.auto_generate_notes_enabled = Some(enabled);
+        Ok(())
+    })
+}
+
+#[tauri::command]
+pub(crate) fn meeting_request_recording_project(
+    app: AppHandle,
+    window: WebviewWindow,
+) -> Result<(), String> {
+    require_recording_overlay(&window)?;
+    let recording_id = current_recording_task(&app)?.recording_id;
+    app.emit(
+        "meeting-recording-project-requested",
+        serde_json::json!({ "recordingId": recording_id }),
+    )
+    .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub(crate) fn meeting_set_recording_projects(
+    app: AppHandle,
+    window: WebviewWindow,
+    projects: Vec<overlay::RecordingProjectOption>,
+) -> Result<(), String> {
+    require_allowed_window(&window)?;
+    let state = app.state::<MeetingManagerState>();
+    let projects = normalize_recording_projects(projects)?;
+    *state
+        .recording_projects
+        .lock()
+        .expect("recording projects poisoned") = projects;
+    clear_missing_recording_project(&app)?;
+    refresh_recording_overlay(&app);
+    Ok(())
+}
+
+#[tauri::command]
+pub(crate) fn meeting_set_recording_project(
+    app: AppHandle,
+    window: WebviewWindow,
+    recording_id: String,
+    project_id: Option<String>,
+    project_name: Option<String>,
+) -> Result<(), String> {
+    if !overlay::is_overlay_window(&window) {
+        require_allowed_window(&window)?;
+    }
+    update_current_recording_task(&app, |task| {
+        if task.recording_id != recording_id {
+            return Err("录音任务已发生变化，请重新选择".to_string());
+        }
+        let project_id = project_id
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        if project_id
+            .as_deref()
+            .is_some_and(|value| !value.chars().all(|character| character.is_ascii_digit()))
+        {
+            return Err("项目 ID 无效".to_string());
+        }
+        task.notes_project_name = project_id.as_ref().and_then(|_| {
+            project_name
+                .map(|value| value.trim().chars().take(100).collect::<String>())
+                .filter(|value| !value.is_empty())
+        });
+        task.notes_project_id = project_id;
+        Ok(())
+    })
+}
+
+fn require_recording_overlay(window: &WebviewWindow) -> Result<(), String> {
+    if overlay::is_overlay_window(window) {
+        Ok(())
+    } else {
+        Err("只有录音浮窗可以执行此操作".to_string())
+    }
+}
+
+fn normalize_recording_display_name(value: &str) -> Result<Option<String>, String> {
+    if value.trim().is_empty() {
+        return Ok(None);
+    }
+    normalize_transcript_file_name(value).map(Some)
+}
+
+fn normalize_recording_projects(
+    projects: Vec<overlay::RecordingProjectOption>,
+) -> Result<Vec<overlay::RecordingProjectOption>, String> {
+    let mut normalized = Vec::with_capacity(projects.len());
+    for project in projects {
+        let project = normalize_recording_project(project)?;
+        if normalized
+            .iter()
+            .any(|item: &overlay::RecordingProjectOption| item.project_id == project.project_id)
+        {
+            continue;
+        }
+        normalized.push(project);
+    }
+    Ok(normalized)
+}
+
+fn normalize_recording_project(
+    project: overlay::RecordingProjectOption,
+) -> Result<overlay::RecordingProjectOption, String> {
+    let project_id = project.project_id.trim().to_string();
+    let project_name = project
+        .project_name
+        .trim()
+        .chars()
+        .take(100)
+        .collect::<String>();
+    if project_id.is_empty() || !project_id.chars().all(|value| value.is_ascii_digit()) {
+        return Err("项目 ID 无效".to_string());
+    }
+    if project_name.is_empty() {
+        return Err("项目名称不能为空".to_string());
+    }
+    Ok(overlay::RecordingProjectOption {
+        project_id,
+        project_name,
+    })
+}
+
+fn clear_missing_recording_project(app: &AppHandle) -> Result<(), String> {
+    let state = app.state::<MeetingManagerState>();
+    let Some(task) = state.store.load_task() else {
+        return Ok(());
+    };
+    let Some(project_id) = task.notes_project_id.as_deref() else {
+        return Ok(());
+    };
+    let project_exists = state
+        .recording_projects
+        .lock()
+        .expect("recording projects poisoned")
+        .iter()
+        .any(|project| project.project_id == project_id);
+    if project_exists || task.state != TaskState::Recording {
+        return Ok(());
+    }
+    update_current_recording_task(app, |task| {
+        task.notes_project_id = None;
+        task.notes_project_name = None;
+        Ok(())
+    })
+}
+
+fn refresh_recording_overlay(app: &AppHandle) {
+    let Some(window) = app.get_webview_window(overlay::OVERLAY_LABEL) else {
+        return;
+    };
+    let state = app.state::<MeetingManagerState>();
+    let Some(task) = state.store.load_task() else {
+        return;
+    };
+    let Ok(status) = current_live_capture_status(&state) else {
+        return;
+    };
+    overlay::update_overlay(&window, build_overlay_state(&state, &task, status));
+}
+
+fn current_recording_task(app: &AppHandle) -> Result<MeetingTask, String> {
+    app.state::<MeetingManagerState>()
+        .store
+        .load_task()
+        .filter(|task| task.state == TaskState::Recording)
+        .ok_or_else(|| "当前没有进行中的录音".to_string())
+}
+
+fn update_current_recording_task(
+    app: &AppHandle,
+    update: impl FnOnce(&mut MeetingTask) -> Result<(), String>,
+) -> Result<(), String> {
+    let state = app.state::<MeetingManagerState>();
+    let _update_guard = state
+        .recording_task_update
+        .lock()
+        .expect("recording task update poisoned");
+    let mut task = current_recording_task(app)?;
+    update(&mut task)?;
+    task.updated_at = now_rfc3339();
+    state.store.save_task(&task)?;
+    emit_state(app, &state.store);
+    Ok(())
 }
 
 #[tauri::command]
@@ -993,7 +1258,19 @@ pub(crate) fn meeting_get_recording_status(
     let guard = state.recorder.lock().expect("recorder poisoned");
     Ok(guard
         .as_ref()
-        .map(|recorder| LiveCaptureStatus::from_shared(&recorder.shared, unix_millis())))
+        .map(|recorder| LiveCaptureStatus::from_shared(&recorder.shared)))
+}
+
+#[tauri::command]
+pub(crate) fn meeting_get_recording_overlay_state(
+    app: AppHandle,
+    window: WebviewWindow,
+) -> Result<overlay::OverlayState, String> {
+    require_recording_overlay(&window)?;
+    let state = app.state::<MeetingManagerState>();
+    let task = current_recording_task(&app)?;
+    let status = current_live_capture_status(&state)?;
+    Ok(build_overlay_state(&state, &task, status))
 }
 
 /// Retry the local pipeline after a finalize/transcription failure.
@@ -1105,8 +1382,14 @@ fn is_valid_session_id(session_id: &str) -> bool {
 
 fn handoff_completed_transcript(app: &AppHandle, recording_id: &str) {
     notifications::notify_transcript_ready(app);
-    let settings = app.state::<MeetingManagerState>().store.load_settings();
-    if !should_automatically_generate_notes(&settings) {
+    let manager = app.state::<MeetingManagerState>();
+    let settings = manager.store.load_settings();
+    let task = manager.store.load_task_record(recording_id);
+    let enabled = task
+        .as_ref()
+        .and_then(|task| task.auto_generate_notes_enabled)
+        .unwrap_or_else(|| should_automatically_generate_notes(&settings));
+    if !enabled {
         log_automatic_notes_skipped(app, recording_id);
         return;
     }
@@ -1175,6 +1458,8 @@ fn open_notes_in_chat(
             settings.notes_prompt,
             transcript_name,
             transcript_text,
+            task.notes_project_id.clone(),
+            task.notes_project_name.clone(),
         )?;
     } else {
         crate::record_import::open_prefill_with_attachment(
@@ -1183,6 +1468,8 @@ fn open_notes_in_chat(
             transcript_name,
             transcript_text,
             false,
+            task.notes_project_id.clone(),
+            task.notes_project_name.clone(),
         )?;
     }
     overlay::hide_overlay(app);
@@ -1541,9 +1828,7 @@ fn spawn_overlay_updater(app: AppHandle, recording_id: String) {
                 let state = app.state::<MeetingManagerState>();
                 let guard = state.recorder.lock().expect("recorder poisoned");
                 match guard.as_ref() {
-                    Some(recorder) => {
-                        LiveCaptureStatus::from_shared(&recorder.shared, unix_millis())
-                    }
+                    Some(recorder) => LiveCaptureStatus::from_shared(&recorder.shared),
                     None => return,
                 }
             };
@@ -1553,15 +1838,10 @@ fn spawn_overlay_updater(app: AppHandle, recording_id: String) {
             }) {
                 return;
             }
-            overlay::update_overlay(
-                &window,
-                overlay::OverlayState::recording(
-                    recording_id.clone(),
-                    status.elapsed_ms,
-                    status.mic_active,
-                    status.system_audio_active,
-                ),
-            );
+            let Some(task) = state.store.load_task() else {
+                return;
+            };
+            overlay::update_overlay(&window, build_overlay_state(&state, &task, status));
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         }
     });
@@ -1618,8 +1898,9 @@ mod tests {
     use super::permissions::PermissionAccess;
     use super::{
         can_attempt_recording_without_permission_request, imported_audio_task, is_valid_session_id,
-        normalize_chat_handoff_state, should_automatically_generate_notes,
-        site_switch_is_blocked_by_state, MeetingSettings, MeetingTask, TaskState, Transcript,
+        normalize_chat_handoff_state, normalize_recording_projects,
+        should_automatically_generate_notes, site_switch_is_blocked_by_state, MeetingSettings,
+        MeetingTask, TaskState, Transcript,
     };
     use std::fs;
 
@@ -1737,5 +2018,44 @@ mod tests {
         assert!(!is_valid_session_id(""));
         assert!(!is_valid_session_id("session-1"));
         assert!(!is_valid_session_id("123456789012345678901"));
+    }
+
+    #[test]
+    fn recording_projects_are_trimmed_and_deduplicated() {
+        let projects = normalize_recording_projects(vec![
+            super::overlay::RecordingProjectOption {
+                project_id: " 101 ".to_string(),
+                project_name: " 产品项目 ".to_string(),
+            },
+            super::overlay::RecordingProjectOption {
+                project_id: "101".to_string(),
+                project_name: "重复项目".to_string(),
+            },
+        ])
+        .unwrap();
+
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0].project_id, "101");
+        assert_eq!(projects[0].project_name, "产品项目");
+    }
+
+    #[test]
+    fn recording_projects_accept_an_empty_list() {
+        assert!(normalize_recording_projects(Vec::new()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn recording_projects_reject_invalid_identity_or_name() {
+        let invalid_id = vec![super::overlay::RecordingProjectOption {
+            project_id: "project-1".to_string(),
+            project_name: "产品项目".to_string(),
+        }];
+        let missing_name = vec![super::overlay::RecordingProjectOption {
+            project_id: "101".to_string(),
+            project_name: "  ".to_string(),
+        }];
+
+        assert!(normalize_recording_projects(invalid_id).is_err());
+        assert!(normalize_recording_projects(missing_name).is_err());
     }
 }

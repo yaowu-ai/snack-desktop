@@ -1,0 +1,243 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<title>Snack 会议录音</title>
+<style>
+  :root { color-scheme: light; }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { width: 100%; height: 100%; overflow: hidden; background: transparent; }
+  body {
+    padding: 1px; color: #0f172a; user-select: none; -webkit-user-select: none;
+    font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif;
+  }
+  button, input, select { font: inherit; }
+  .card {
+    position: relative; width: 100%; height: 100%; overflow: hidden;
+    border: 1px solid #fee5d0; border-radius: 12px; background: rgba(255, 255, 255, .98);
+    background-clip: padding-box;
+  }
+  .drag-region { position: absolute; z-index: 1; inset: 0 0 auto; height: 16px; cursor: grab; }
+  .drag-region:active { cursor: grabbing; }
+  .drag-hint {
+    position: absolute; left: 50%; top: 2px; transform: translateX(-50%);
+    color: #cbd5e1; font-size: 9px; line-height: 12px; pointer-events: none; white-space: nowrap;
+  }
+  .summary {
+    position: relative; display: grid; grid-template-columns: 38px minmax(0, 1fr) 38px;
+    align-items: center; gap: 8px; min-height: 106px; padding: 16px 10px 18px;
+  }
+  .icon-button {
+    display: inline-flex; width: 38px; height: 38px; align-items: center; justify-content: center;
+    border-radius: 10px; cursor: pointer; transition: background .15s ease, opacity .15s ease;
+  }
+  .icon-button[hidden] { display: none; }
+  .icon-button svg { width: 16px; height: 16px; fill: currentColor; }
+  .pause-action { grid-column: 1; grid-row: 1; border: 1px solid #fe720a; background: #fff; color: #fe720a; }
+  .pause-action:hover { background: #fff7ed; }
+  .stop-action { grid-column: 3; grid-row: 1; border: 1px solid #fe720a; background: #fe720a; color: #fff; }
+  .stop-action:hover { background: #e96608; }
+  .icon-button:disabled { cursor: default; opacity: .55; }
+  .status { grid-column: 2; grid-row: 1; min-width: 0; text-align: center; }
+  .title-row { display: flex; align-items: center; justify-content: center; gap: 6px; }
+  .status-dot {
+    width: 8px; height: 8px; flex: 0 0 auto; border-radius: 50%; background: #fe720a;
+    animation: pulse 1.2s infinite;
+  }
+  body[data-paused="true"] .status-dot { animation: none; opacity: .45; }
+  @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: .3; } }
+  .title { overflow: hidden; font-size: 12px; font-weight: 650; text-overflow: ellipsis; white-space: nowrap; }
+  .metric { margin-top: 3px; font-size: 19px; font-weight: 700; font-variant-numeric: tabular-nums; }
+  .expand-action {
+    position: absolute; bottom: 1px; left: 50%; display: inline-flex; width: 28px; height: 20px;
+    transform: translateX(-50%); align-items: center;
+    justify-content: center; border: 0; background: transparent; color: #94a3b8; cursor: pointer;
+  }
+  .expand-action svg { width: 15px; height: 15px; fill: none; stroke: currentColor; stroke-width: 2; }
+  .error {
+    position: absolute; right: 56px; bottom: 7px; left: 56px; overflow: hidden;
+    color: #dc2626; font-size: 9px; text-align: center; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .settings { display: none; border-top: 1px solid #f1f5f9; padding: 8px 12px 12px; }
+  body[data-expanded="true"] .settings { display: block; }
+  .setting-row {
+    display: flex; min-height: 48px; align-items: center; justify-content: space-between;
+    gap: 8px; border-bottom: 1px solid #f8fafc;
+  }
+  .setting-row:last-child { border-bottom: 0; }
+  .setting-label { flex: 0 0 auto; color: #475569; font-size: 12px; font-weight: 600; }
+  .filename-input {
+    width: auto; min-width: 0; flex: 1; border: 1px solid transparent; border-radius: 7px;
+    background: transparent; color: #0f172a; font-size: 12px; text-align: right;
+    text-overflow: ellipsis; outline: none; cursor: pointer; user-select: text; -webkit-user-select: text;
+  }
+  .filename-input:not([readonly]) { border-color: #fdba74; padding: 5px 7px; background: #fff; cursor: text; }
+  .switch {
+    position: relative; width: 34px; height: 20px; border: 0; border-radius: 999px;
+    background: #cbd5e1; cursor: pointer; transition: background .15s ease;
+  }
+  .switch::after {
+    content: ""; position: absolute; width: 16px; height: 16px; left: 2px; top: 2px;
+    border-radius: 50%; background: #fff; transition: transform .15s ease;
+  }
+  .switch[aria-checked="true"] { background: #fe720a; }
+  .switch[aria-checked="true"]::after { transform: translateX(14px); }
+</style>
+</head>
+<body data-paused="false" data-expanded="false">
+  <div class="card">
+    <div class="drag-region" data-tauri-drag-region><div class="drag-hint">拖动可移动</div></div>
+    <div class="summary">
+      <button class="icon-button pause-action" id="pause-action" type="button" aria-label="暂停录音" title="暂停录音">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 4h4v16H6zM14 4h4v16h-4z" /></svg>
+      </button>
+      <button class="icon-button pause-action" id="resume-action" type="button" aria-label="恢复录音" title="恢复录音" hidden>
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 4v16l13-8z" /></svg>
+      </button>
+      <div class="status">
+        <div class="title-row"><span class="status-dot"></span><span class="title" id="title">正在录音</span></div>
+        <div class="metric" id="metric">00:00</div>
+      </div>
+      <button class="icon-button stop-action" id="stop-action" type="button" aria-label="结束录音" title="结束录音">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6h12v12H6z" /></svg>
+      </button>
+      <button class="expand-action" id="expand-action" type="button" aria-label="展开录音配置" title="展开录音配置">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path id="chevron" d="m6 9 6 6 6-6" /></svg>
+      </button>
+      <div class="error" id="error" hidden></div>
+    </div>
+    <div class="settings">
+      <label class="setting-row">
+        <span class="setting-label">转写文件标题</span>
+        <input class="filename-input" id="filename-input" type="text" readonly aria-label="转写文件标题" />
+      </label>
+      <div class="setting-row">
+        <span class="setting-label">会议自动总结</span>
+        <button class="switch" id="auto-notes" type="button" role="switch" aria-checked="false" aria-label="本次录音自动生成会议纪要"></button>
+      </div>
+    </div>
+  </div>
+  <script>
+    (function () {
+      var current = { elapsedMs: 0, recordingId: '', paused: false, displayName: '', autoGenerateNotesEnabled: false };
+      var expanded = false;
+      var pending = false;
+      var errorMessage = '';
+      var titleEl = document.getElementById('title');
+      var metricEl = document.getElementById('metric');
+      var errorEl = document.getElementById('error');
+      var pauseAction = document.getElementById('pause-action');
+      var resumeAction = document.getElementById('resume-action');
+      var stopAction = document.getElementById('stop-action');
+      var expandAction = document.getElementById('expand-action');
+      var chevron = document.getElementById('chevron');
+      var filenameInput = document.getElementById('filename-input');
+      var autoNotes = document.getElementById('auto-notes');
+
+      function invoke(command, args) {
+        if (window.__TAURI__ && window.__TAURI__.core) return window.__TAURI__.core.invoke(command, args || {});
+        if (window.__TAURI_INTERNALS__ && window.__TAURI_INTERNALS__.invoke) return window.__TAURI_INTERNALS__.invoke(command, args || {});
+        return Promise.reject(new Error('native bridge unavailable'));
+      }
+      function withTimeout(promise, timeoutMs) {
+        return Promise.race([promise, new Promise(function (_, reject) {
+          setTimeout(function () { reject(new Error('操作超时')); }, timeoutMs);
+        })]);
+      }
+      function formatDuration(ms) {
+        var total = Math.floor(ms / 1000);
+        return String(Math.floor(total / 60)).padStart(2, '0') + ':' + String(total % 60).padStart(2, '0');
+      }
+      function showError(error, fallback) {
+        pending = false;
+        errorMessage = (error && error.message) || String(error || fallback);
+        render();
+      }
+      function render() {
+        document.body.dataset.paused = String(Boolean(current.paused));
+        document.body.dataset.expanded = String(expanded);
+        titleEl.textContent = current.paused ? '录音已暂停' : '正在录音';
+        metricEl.textContent = formatDuration(current.elapsedMs || 0);
+        pauseAction.hidden = Boolean(current.paused);
+        resumeAction.hidden = !current.paused;
+        pauseAction.disabled = pending;
+        resumeAction.disabled = pending;
+        stopAction.disabled = pending;
+        chevron.setAttribute('d', expanded ? 'm6 15 6-6 6 6' : 'm6 9 6 6 6-6');
+        expandAction.title = expandAction.ariaLabel = expanded ? '收起录音配置' : '展开录音配置';
+        if (document.activeElement !== filenameInput) filenameInput.value = current.displayName || '';
+        autoNotes.setAttribute('aria-checked', String(Boolean(current.autoGenerateNotesEnabled)));
+        errorEl.hidden = !errorMessage;
+        errorEl.textContent = errorMessage;
+      }
+      function apply(next) {
+        if (!next) return;
+        var changed = next.recordingId && next.recordingId !== current.recordingId;
+        current = Object.assign({}, current, next);
+        if (changed) { pending = false; errorMessage = ''; expanded = false; }
+        render();
+      }
+      function togglePause() {
+        if (pending) return;
+        pending = true; errorMessage = ''; render();
+        invoke('meeting_set_recording_paused', { paused: !current.paused })
+          .then(function () { pending = false; })
+          .catch(function (error) { showError(error, '录音状态切换失败，请重试'); });
+      }
+      function stopViaProtocol() {
+        return withTimeout(fetch('/stop', { method: 'POST', cache: 'no-store' }), 4000).then(function (response) {
+          if (response.ok) return;
+          return response.text().then(function (message) { throw new Error(message || '结束录音失败'); });
+        });
+      }
+      function stopRecording() {
+        if (pending) return;
+        pending = true; errorMessage = ''; render();
+        withTimeout(invoke('meeting_stop_recording', {}), 4000)
+          .catch(function () { return stopViaProtocol(); })
+          .catch(function (error) { showError(error, '结束失败，请重试'); });
+      }
+      function toggleExpanded() {
+        var next = !expanded;
+        invoke('set_overlay_expanded', { expanded: next }).then(function () {
+          expanded = next; render();
+        }).catch(function (error) { showError(error, '无法展开录音配置'); });
+      }
+      function beginRename() {
+        filenameInput.readOnly = false;
+        filenameInput.value = '';
+        filenameInput.focus();
+      }
+      function saveRename() {
+        if (filenameInput.readOnly) return;
+        filenameInput.readOnly = true;
+        invoke('meeting_set_recording_file_name', { displayName: filenameInput.value })
+          .catch(function (error) { showError(error, '文件名保存失败'); });
+      }
+      function toggleAutoNotes() {
+        var enabled = !current.autoGenerateNotesEnabled;
+        invoke('meeting_set_recording_auto_notes', { enabled: enabled })
+          .catch(function (error) { showError(error, '自动转写设置失败'); });
+      }
+
+      pauseAction.addEventListener('click', function (event) { event.stopPropagation(); togglePause(); });
+      resumeAction.addEventListener('click', function (event) { event.stopPropagation(); togglePause(); });
+      stopAction.addEventListener('click', function (event) { event.stopPropagation(); stopRecording(); });
+      expandAction.addEventListener('click', function (event) { event.stopPropagation(); toggleExpanded(); });
+      filenameInput.addEventListener('click', function (event) { event.stopPropagation(); if (filenameInput.readOnly) beginRename(); });
+      filenameInput.addEventListener('blur', saveRename);
+      filenameInput.addEventListener('keydown', function (event) {
+        if (event.key === 'Enter') filenameInput.blur();
+        if (event.key === 'Escape') { filenameInput.readOnly = true; filenameInput.value = current.displayName || ''; filenameInput.blur(); }
+      });
+      autoNotes.addEventListener('click', function (event) { event.stopPropagation(); toggleAutoNotes(); });
+      render();
+      try {
+        var eventApi = window.__TAURI__ && window.__TAURI__.event;
+        if (eventApi) eventApi.listen('meeting-overlay-state', function (event) { apply(event.payload); });
+        invoke('meeting_get_recording_overlay_state', {}).then(apply).catch(function () {});
+      } catch (error) {}
+    })();
+  </script>
+</body>
+</html>

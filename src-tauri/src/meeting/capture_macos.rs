@@ -23,7 +23,7 @@ use screencapturekit::prelude::{
 use crate::meeting::audio::WavWriter;
 use crate::meeting::capture::{
     downmix_f32, mix_chunks, pcm_bytes_to_f32_mono, prepare_audio_output, resample_to_target,
-    CaptureError, CaptureShared, Recorder, CAPTURE_CHUNK_SAMPLES,
+    write_mixed_samples, CaptureError, CaptureShared, Recorder, CAPTURE_CHUNK_SAMPLES,
 };
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
@@ -196,7 +196,7 @@ fn push_mic_chunk(
     tx: &Sender<Vec<f32>>,
     shared: &CaptureShared,
 ) {
-    if data.is_empty() {
+    if data.is_empty() || !shared.accepts_audio() {
         return;
     }
     let mono = downmix_f32(data, channels);
@@ -249,6 +249,9 @@ fn start_mac_system_audio(
     let shared_for_handler = Arc::clone(shared);
     let handler_id = stream.add_output_handler(
         move |sample: CMSampleBuffer, _output_type| {
+            if !shared_for_handler.accepts_audio() {
+                return;
+            }
             if let Some(samples) = sample_buffer_to_f32_mono(&sample) {
                 if !samples.is_empty() {
                     shared_for_handler.system_live.store(true, Ordering::SeqCst);
@@ -337,7 +340,7 @@ fn run_writer(
                 let sys_take = sys_buffer.len().min(CAPTURE_CHUNK_SAMPLES);
                 let sys: Vec<f32> = sys_buffer.drain(..sys_take).collect();
                 let mixed = mix_chunks(&mic, &sys);
-                if writer.write_samples(&mixed).is_err() {
+                if write_mixed_samples(shared, writer, &mixed).is_err() {
                     return false;
                 }
             }
@@ -345,6 +348,16 @@ fn run_writer(
         };
 
     while !shared.should_stop() {
+        if shared.take_discard_pending() {
+            mic_buffer.clear();
+            sys_buffer.clear();
+            while mic_rx.try_recv().is_ok() {}
+            while sys_rx.try_recv().is_ok() {}
+        }
+        if shared.is_paused() {
+            mic_buffer.clear();
+            sys_buffer.clear();
+        }
         let mut drained_any = false;
         while let Ok(chunk) = mic_rx.try_recv() {
             mic_buffer.extend_from_slice(&chunk);
@@ -376,7 +389,7 @@ fn run_writer(
         let sys_take = sys_buffer.len().min(CAPTURE_CHUNK_SAMPLES);
         let sys: Vec<f32> = sys_buffer.drain(..sys_take).collect();
         let mixed = mix_chunks(&mic, &sys);
-        if writer.write_samples(&mixed).is_err() {
+        if write_mixed_samples(shared, &mut writer, &mixed).is_err() {
             break;
         }
     }

@@ -14,8 +14,9 @@ pub(crate) const OVERLAY_LABEL: &str = "record_overlay";
 pub(crate) const OVERLAY_SCHEME: &str = "snack-overlay";
 pub(crate) const REMINDER_LABEL: &str = "recording_reminder";
 const OVERLAY_STATE_EVENT: &str = "meeting-overlay-state";
-const OVERLAY_WIDTH: f64 = 248.0;
-const OVERLAY_HEIGHT: f64 = 88.0;
+const OVERLAY_WIDTH: f64 = 240.0;
+const OVERLAY_HEIGHT: f64 = 108.0;
+const OVERLAY_EXPANDED_HEIGHT: f64 = 228.0;
 const REMINDER_WIDTH: f64 = 326.0;
 const REMINDER_HEIGHT: f64 = 116.0;
 
@@ -33,21 +34,48 @@ pub(crate) struct OverlayState {
     pub(crate) mic_active: bool,
     pub(crate) system_audio_active: bool,
     pub(crate) recording_id: String,
+    pub(crate) paused: bool,
+    pub(crate) display_name: String,
+    pub(crate) auto_generate_notes_enabled: bool,
+    pub(crate) notes_project_id: Option<String>,
+    pub(crate) notes_project_name: Option<String>,
+    pub(crate) projects: Vec<RecordingProjectOption>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RecordingProjectOption {
+    pub(crate) project_id: String,
+    pub(crate) project_name: String,
+}
+
+pub(crate) struct RecordingOverlayState {
+    pub(crate) recording_id: String,
+    pub(crate) elapsed_ms: u64,
+    pub(crate) mic_active: bool,
+    pub(crate) system_audio_active: bool,
+    pub(crate) paused: bool,
+    pub(crate) display_name: String,
+    pub(crate) auto_generate_notes_enabled: bool,
+    pub(crate) notes_project_id: Option<String>,
+    pub(crate) notes_project_name: Option<String>,
+    pub(crate) projects: Vec<RecordingProjectOption>,
 }
 
 impl OverlayState {
-    pub(crate) fn recording(
-        recording_id: String,
-        elapsed_ms: u64,
-        mic_active: bool,
-        system_audio_active: bool,
-    ) -> Self {
+    pub(crate) fn recording(state: RecordingOverlayState) -> Self {
         Self {
             phase: OverlayPhase::Recording,
-            elapsed_ms,
-            mic_active,
-            system_audio_active,
-            recording_id,
+            elapsed_ms: state.elapsed_ms,
+            mic_active: state.mic_active,
+            system_audio_active: state.system_audio_active,
+            recording_id: state.recording_id,
+            paused: state.paused,
+            display_name: state.display_name,
+            auto_generate_notes_enabled: state.auto_generate_notes_enabled,
+            notes_project_id: state.notes_project_id,
+            notes_project_name: state.notes_project_name,
+            projects: state.projects,
         }
     }
 }
@@ -146,7 +174,7 @@ pub(crate) fn show_overlay(app: &AppHandle, state: OverlayState) -> Result<(), S
 
     if let Ok(Some(monitor)) = window.current_monitor() {
         let area = monitor.work_area();
-        let window_width = window.outer_size().map(|size| size.width).unwrap_or(248) as i32;
+        let window_width = window.outer_size().map(|size| size.width).unwrap_or(240) as i32;
         let x = area.position.x + area.size.width as i32 - window_width - 24;
         let y = area.position.y + 24;
         let _ = window.set_position(PhysicalPosition::new(x, y));
@@ -297,172 +325,25 @@ pub(crate) fn dismiss_overlay(window: tauri::WebviewWindow) -> Result<(), String
     window.hide().map_err(|error| error.to_string())
 }
 
-const OVERLAY_HTML: &str = r#"<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-<meta charset="UTF-8" />
-<title>Snack 会议录音</title>
-<style>
-  :root { color-scheme: light; }
-  * { margin: 0; padding: 0; box-sizing: border-box; }
-  html, body { width: 100%; height: 100%; overflow: hidden; background: transparent; }
-  body {
-    padding: 1px;
-    font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif;
-    color: #0f172a;
-    user-select: none; -webkit-user-select: none;
-  }
-  .bar {
-    position: relative; display: flex; align-items: center; gap: 10px;
-    width: 100%; height: 100%; padding: 17px 12px 8px;
-    overflow: hidden; border: 1px solid #fee5d0; border-radius: 12px;
-    background: rgba(255, 255, 255, 0.98); background-clip: padding-box;
-  }
-  .drag-region {
-    position: absolute; z-index: 1; inset: 0 0 auto; height: 17px; cursor: grab;
-  }
-  .drag-region:active { cursor: grabbing; }
-  .drag-hint {
-    position: absolute; left: 50%; top: 3px; transform: translateX(-50%);
-    color: #cbd5e1; font-size: 9px; line-height: 12px; pointer-events: none; white-space: nowrap;
-  }
-  .status-icon {
-    display: flex; width: 22px; height: 22px; flex-shrink: 0; align-items: center;
-    justify-content: center; border-radius: 50%; background: #fff2e8;
-    color: #fe720a; font-size: 13px; font-weight: 700;
-  }
-  .status-icon.recording { color: #fe720a; animation: pulse 1.2s infinite; }
-  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .35; } }
-  .info { flex: 1; min-width: 0; }
-  .title { font-size: 12px; font-weight: 650; }
-  .metric { margin-top: 2px; font-size: 18px; font-weight: 700; font-variant-numeric: tabular-nums; }
-  .detail { display: none; margin-top: 3px; overflow: hidden; color: #64748b; font-size: 9px; line-height: 12px; text-overflow: ellipsis; white-space: nowrap; }
-  .primary-action {
-    flex-shrink: 0; border: none; border-radius: 9px; padding: 9px 12px;
-    background: #fe720a; color: #fff; cursor: pointer; font-size: 11px; font-weight: 650;
-  }
-  .primary-action:hover { background: #e96608; }
-  .primary-action:disabled { cursor: default; opacity: .6; }
-</style>
-</head>
-<body data-phase="recording">
-  <div class="bar">
-    <div class="drag-region" data-tauri-drag-region><div class="drag-hint">拖动可移动</div></div>
-    <div class="status-icon recording" id="status-icon">●</div>
-    <div class="info">
-      <div class="title" id="title">正在录音</div>
-      <div class="metric" id="metric">00:00</div>
-      <div class="detail" id="detail"></div>
-    </div>
-    <button class="primary-action" id="primary-action" type="button">结束</button>
-  </div>
-  <script>
-    (function () {
-      var current = { phase: 'recording', elapsedMs: 0, recordingId: '' };
-      var stopPending = false;
-      var stopError = '';
-      var iconEl = document.getElementById('status-icon');
-      var titleEl = document.getElementById('title');
-      var metricEl = document.getElementById('metric');
-      var detailEl = document.getElementById('detail');
-      var actionEl = document.getElementById('primary-action');
+#[tauri::command]
+pub(crate) fn set_overlay_expanded(
+    window: tauri::WebviewWindow,
+    expanded: bool,
+) -> Result<(), String> {
+    if !is_overlay_window(&window) {
+        return Err("只有录音浮窗可以执行此操作".to_string());
+    }
+    let height = if expanded {
+        OVERLAY_EXPANDED_HEIGHT
+    } else {
+        OVERLAY_HEIGHT
+    };
+    window
+        .set_size(LogicalSize::new(OVERLAY_WIDTH, height))
+        .map_err(|error| error.to_string())
+}
 
-      function invoke(command, args) {
-        if (window.__TAURI__ && window.__TAURI__.core) return window.__TAURI__.core.invoke(command, args || {});
-        if (window.__TAURI_INTERNALS__ && window.__TAURI_INTERNALS__.invoke) return window.__TAURI_INTERNALS__.invoke(command, args || {});
-        return Promise.reject(new Error('native bridge unavailable'));
-      }
-
-      function withTimeout(promise, timeoutMs) {
-        return Promise.race([promise, new Promise(function (_, reject) {
-          setTimeout(function () { reject(new Error('操作超时')); }, timeoutMs);
-        })]);
-      }
-
-      function stopViaProtocol() {
-        return withTimeout(fetch('/stop', { method: 'POST', cache: 'no-store' }), 4000).then(function (response) {
-          if (response.ok) return;
-          return response.text().then(function (message) { throw new Error(message || '结束录音失败'); });
-        });
-      }
-
-      function formatDuration(ms) {
-        var total = Math.floor(ms / 1000);
-        return String(Math.floor(total / 60)).padStart(2, '0') + ':' + String(total % 60).padStart(2, '0');
-      }
-
-      function resetView() {
-        metricEl.style.display = 'none';
-        detailEl.style.display = 'none';
-        actionEl.disabled = false;
-        iconEl.textContent = '';
-        iconEl.className = 'status-icon ' + current.phase;
-        document.body.dataset.phase = current.phase;
-      }
-
-      function renderRecording() {
-        iconEl.textContent = '●';
-        titleEl.textContent = '正在录音';
-        metricEl.textContent = formatDuration(current.elapsedMs || 0);
-        metricEl.style.display = 'block';
-        actionEl.textContent = stopPending ? '结束中…' : '结束';
-        actionEl.disabled = stopPending;
-        actionEl.style.display = 'block';
-        if (stopError) {
-          detailEl.textContent = stopError;
-          detailEl.style.display = 'block';
-        }
-      }
-
-      function render() {
-        resetView();
-        renderRecording();
-      }
-
-      function apply(next) {
-        if (!next) return;
-        var changedRecording = next.recordingId && next.recordingId !== current.recordingId;
-        current = Object.assign({}, current, next, { phase: 'recording' });
-        if (changedRecording) {
-          stopPending = false;
-          stopError = '';
-        }
-        render();
-      }
-
-      function showStopError(error) {
-        stopPending = false;
-        current.phase = 'recording';
-        stopError = (error && error.message) || '结束失败，请重试';
-        render();
-      }
-
-      function stopRecording() {
-        if (stopPending || current.phase !== 'recording') return;
-        stopPending = true;
-        stopError = '';
-        render();
-        withTimeout(invoke('meeting_stop_recording', {}), 4000)
-          .catch(function () { return stopViaProtocol(); })
-          .catch(showStopError);
-      }
-
-      actionEl.addEventListener('click', function (event) {
-        event.preventDefault();
-        event.stopPropagation();
-        stopRecording();
-      });
-      render();
-      try {
-        var eventApi = window.__TAURI__ && window.__TAURI__.event;
-        if (eventApi) eventApi.listen('meeting-overlay-state', function (event) { apply(event.payload); });
-        invoke('meeting_get_recording_status', {}).then(apply).catch(function () {});
-      } catch (error) {}
-    })();
-  </script>
-</body>
-</html>
-"#;
+const OVERLAY_HTML: &str = include_str!("overlay.html");
 
 const REMINDER_HTML: &str = r#"<!DOCTYPE html>
 <html lang="zh-CN">
@@ -587,6 +468,11 @@ mod tests {
         let html = String::from_utf8(response.into_body()).unwrap();
         assert!(html.contains("fetch('/stop'"));
         assert!(html.contains("meeting_stop_recording"));
+        assert!(html.contains("meeting_set_recording_paused"));
+        assert!(html.contains("meeting_set_recording_file_name"));
+        assert!(html.contains("meeting_set_recording_auto_notes"));
+        assert!(!html.contains("meeting_request_recording_project"));
+        assert!(!html.contains("meeting_set_recording_project"));
         assert!(html.contains("return stopViaProtocol();"));
         assert!(!html.contains("meeting_open_notes_in_chat"));
         assert!(!html.contains("正在转写"));
@@ -597,9 +483,10 @@ mod tests {
         assert!(html.contains(
             "html, body { width: 100%; height: 100%; overflow: hidden; background: transparent; }"
         ));
-        assert!(html.contains("width: 100%; height: 100%; padding: 17px 12px 8px"));
-        assert!(html.contains("overflow: hidden; border: 1px solid #fee5d0; border-radius: 12px"));
-        assert!(html.contains("background: rgba(255, 255, 255, 0.98)"));
+        assert!(html.contains("grid-template-columns: 38px minmax(0, 1fr) 38px"));
+        assert_eq!(OVERLAY_WIDTH, 240.0);
+        assert!(html.contains("border: 1px solid #fee5d0; border-radius: 12px"));
+        assert!(html.contains("background: rgba(255, 255, 255, .98)"));
         assert!(!html.contains("body {\n    font-family: -apple-system, BlinkMacSystemFont, \"PingFang SC\", \"Microsoft YaHei\", sans-serif;\n    background:"));
         assert!(!html.contains("focus_recording_overlay"));
         assert!(!html.contains("class=\"bar\" data-tauri-drag-region"));
@@ -610,6 +497,23 @@ mod tests {
         assert!(!html.contains("aria-label=\"关闭\""));
         assert!(!html.contains(">麦克风<"));
         assert!(!html.contains(">系统音频<"));
+        assert!(html.contains("aria-label=\"暂停录音\""));
+        assert!(html.contains("aria-label=\"恢复录音\""));
+        assert!(html.contains("id=\"pause-action\""));
+        assert!(html.contains("id=\"resume-action\""));
+        assert!(html.contains("aria-label=\"结束录音\""));
+        assert!(html.contains("转写文件标题"));
+        assert!(html.contains("会议自动总结"));
+        assert!(!html.contains("会议归属项目"));
+        assert!(!html.contains(">修改转写文件标题<"));
+        assert!(!html.contains(">会议纪要自动转写<"));
+        assert!(!html.contains(">会议纪要归属项目<"));
+        assert!(!html.contains(">修改文件名<"));
+        assert!(!html.contains(">纪要自动转写<"));
+        assert!(!html.contains(">纪要归属项目<"));
+        assert!(!html.contains("普通会话"));
+        assert!(!html.contains("id=\"project-select\""));
+        assert!(!html.contains("新建项目"));
         assert!(!html.contains("stopViaProtocol(),\n          invokeWithTimeout"));
     }
 
@@ -634,7 +538,7 @@ mod tests {
 
         let html = String::from_utf8(serve_overlay_request(request).into_body()).unwrap();
 
-        assert!(html.contains("body {\n    padding: 1px;"));
+        assert!(html.contains("padding: 1px; color: #0f172a"));
         assert!(html.contains("background: transparent;"));
         assert!(html.contains("background-clip: padding-box;"));
         assert!(html.contains("border-radius: 12px;"));
@@ -664,16 +568,28 @@ mod tests {
 
     #[test]
     fn recording_state_serializes_the_recording_identity() {
-        let value = serde_json::to_value(OverlayState::recording(
-            "rec-1".to_string(),
-            2500,
-            true,
-            true,
-        ))
+        let value = serde_json::to_value(OverlayState::recording(RecordingOverlayState {
+            recording_id: "rec-1".to_string(),
+            elapsed_ms: 2500,
+            mic_active: true,
+            system_audio_active: true,
+            paused: false,
+            display_name: "Snack会议".to_string(),
+            auto_generate_notes_enabled: true,
+            notes_project_id: Some("101".to_string()),
+            notes_project_name: Some("产品项目".to_string()),
+            projects: vec![RecordingProjectOption {
+                project_id: "101".to_string(),
+                project_name: "产品项目".to_string(),
+            }],
+        }))
         .unwrap();
 
         assert_eq!(value["phase"], "recording");
         assert_eq!(value["recordingId"], "rec-1");
         assert_eq!(value["elapsedMs"], 2500);
+        assert_eq!(value["displayName"], "Snack会议");
+        assert_eq!(value["notesProjectId"], "101");
+        assert_eq!(value["projects"][0]["projectName"], "产品项目");
     }
 }
