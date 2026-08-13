@@ -54,6 +54,7 @@ pub fn run() {
             commands::open_downloaded_file,
             commands::reveal_desktop_log_dir,
             commands::reveal_downloaded_file,
+            commands::save_generated_share_image,
             commands::set_desktop_attention,
             commands::write_desktop_log,
             meeting::meeting_cancel_install,
@@ -132,6 +133,11 @@ pub fn run() {
             let selected_site = site::selected_site(app.handle(), &window_config.url);
             let mut window_config = window_config.clone();
             window_config.url = site::initial_webview_url(app.handle(), &window_config.url);
+            let window_title = if site::site_from_webview_url(&window_config.url).is_some() {
+                selected_site.window_title()
+            } else {
+                app.package_info().name.as_str()
+            };
 
             let user_agent = desktop_user_agent();
             let app_handle = app.handle().clone();
@@ -153,7 +159,7 @@ pub fn run() {
                     }
                 })
                 .build()?;
-            window.set_title(selected_site.window_title())?;
+            window.set_title(window_title)?;
 
             logging::write_app_log(
                 app.handle(),
