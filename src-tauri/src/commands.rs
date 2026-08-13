@@ -3,7 +3,8 @@ use tauri::{AppHandle, WebviewWindow};
 use crate::attention::update_desktop_attention;
 use crate::download::{
     download_snack_file_inner, emit_failed_download, open_downloaded_path, reveal_downloaded_path,
-    DownloadSnackFileRequest, DownloadSnackFileResult,
+    save_generated_share_image_inner, DownloadSnackFileRequest, DownloadSnackFileResult,
+    SaveGeneratedShareImageRequest,
 };
 use crate::logging::{log_dir, log_path, write_app_log};
 use crate::platform::open_path;
@@ -113,6 +114,21 @@ pub(crate) async fn download_snack_file(
     let download_id = request.download_id.clone();
     let filename = request.filename.clone();
     let result = download_snack_file_inner(app, window.clone(), request).await;
+    if let Err(message) = &result {
+        emit_failed_download(&window, download_id, filename, message.clone());
+    }
+    result
+}
+
+#[tauri::command]
+pub(crate) async fn save_generated_share_image(
+    app: AppHandle,
+    window: WebviewWindow,
+    request: SaveGeneratedShareImageRequest,
+) -> Result<DownloadSnackFileResult, String> {
+    let download_id = request.download_id.clone();
+    let filename = request.filename.clone();
+    let result = save_generated_share_image_inner(app, window.clone(), request).await;
     if let Err(message) = &result {
         emit_failed_download(&window, download_id, filename, message.clone());
     }

@@ -1,3 +1,4 @@
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use futures_util::StreamExt;
 use reqwest::header::{COOKIE, LOCATION, USER_AGENT};
 use std::path::{Path, PathBuf};
@@ -11,6 +12,8 @@ use crate::platform::{open_path, reveal_path};
 use crate::web::{desktop_user_agent, is_allowed_web_origin};
 
 const DOWNLOAD_PROGRESS_EVENT: &str = "snack-download-progress";
+const MAX_GENERATED_IMAGE_BYTES: usize = 32 * 1024 * 1024;
+const PNG_SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
 const PROGRESS_EMIT_INTERVAL: Duration = Duration::from_millis(150);
 
 #[derive(Debug, serde::Deserialize)]
@@ -18,6 +21,14 @@ const PROGRESS_EMIT_INTERVAL: Duration = Duration::from_millis(150);
 pub(crate) struct DownloadSnackFileRequest {
     pub(crate) download_id: String,
     pub(crate) url: String,
+    pub(crate) filename: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SaveGeneratedShareImageRequest {
+    pub(crate) data_base64: String,
+    pub(crate) download_id: String,
     pub(crate) filename: String,
 }
 
@@ -208,6 +219,124 @@ pub(crate) async fn download_snack_file_inner(
         path,
         downloaded_bytes,
     })
+}
+
+pub(crate) async fn save_generated_share_image_inner(
+    app: AppHandle,
+    window: WebviewWindow,
+    request: SaveGeneratedShareImageRequest,
+) -> Result<DownloadSnackFileResult, String> {
+    validate_download_id(&request.download_id)?;
+    validate_download_origin(&window)?;
+    let filename = sanitize_png_filename(&request.filename)?;
+    let bytes = decode_generated_png(&request.data_base64)?;
+    let total_bytes = bytes.len() as u64;
+    let destination_dir = resolve_destination_dir(&app)?;
+    let final_path = resolve_available_path(&destination_dir, &filename);
+
+    emit_generated_image_started(&window, &request.download_id, &filename, total_bytes);
+    tokio::fs::create_dir_all(&destination_dir)
+        .await
+        .map_err(|_| "failed to create download directory".to_string())?;
+    tokio::fs::write(&final_path, bytes)
+        .await
+        .map_err(|_| "failed to save generated image".to_string())?;
+
+    let path = final_path.to_string_lossy().to_string();
+    emit_generated_image_completed(&window, &request.download_id, &filename, &path, total_bytes);
+    Ok(DownloadSnackFileResult {
+        download_id: request.download_id,
+        path,
+        downloaded_bytes: total_bytes,
+    })
+}
+
+fn validate_download_origin(window: &WebviewWindow) -> Result<(), String> {
+    let current_url = window
+        .url()
+        .map_err(|_| "failed to read current window URL".to_string())?;
+    if is_allowed_web_origin(&current_url) {
+        Ok(())
+    } else {
+        Err("origin is not allowed to save generated images".to_string())
+    }
+}
+
+fn sanitize_png_filename(filename: &str) -> Result<String, String> {
+    let filename = sanitize_filename(filename)?;
+    let is_png = Path::new(&filename)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("png"));
+    if is_png {
+        Ok(filename)
+    } else {
+        Err("generated image filename must use the .png extension".to_string())
+    }
+}
+
+fn decode_generated_png(data_base64: &str) -> Result<Vec<u8>, String> {
+    if data_base64.len() > MAX_GENERATED_IMAGE_BYTES.saturating_mul(4) / 3 + 4 {
+        return Err("generated image exceeds the size limit".to_string());
+    }
+    let bytes = BASE64_STANDARD
+        .decode(data_base64)
+        .map_err(|_| "generated image data is invalid".to_string())?;
+    if bytes.len() > MAX_GENERATED_IMAGE_BYTES {
+        return Err("generated image exceeds the size limit".to_string());
+    }
+    if !bytes.starts_with(PNG_SIGNATURE) {
+        return Err("generated image is not a valid PNG".to_string());
+    }
+    Ok(bytes)
+}
+
+fn emit_generated_image_started(
+    window: &WebviewWindow,
+    download_id: &str,
+    filename: &str,
+    total_bytes: u64,
+) {
+    emit_download_progress(
+        window,
+        DownloadProgressPayload {
+            download_id: download_id.to_string(),
+            status: "started",
+            filename: Some(filename.to_string()),
+            downloaded_bytes: 0,
+            total_bytes: Some(total_bytes),
+            percent: Some(0),
+            path: None,
+            message: None,
+        },
+    );
+    set_window_progress(window, Some(total_bytes), 0);
+}
+
+fn emit_generated_image_completed(
+    window: &WebviewWindow,
+    download_id: &str,
+    filename: &str,
+    path: &str,
+    total_bytes: u64,
+) {
+    emit_download_progress(
+        window,
+        DownloadProgressPayload {
+            download_id: download_id.to_string(),
+            status: "completed",
+            filename: Some(filename.to_string()),
+            downloaded_bytes: total_bytes,
+            total_bytes: Some(total_bytes),
+            percent: Some(100),
+            path: Some(path.to_string()),
+            message: None,
+        },
+    );
+    let _ = window.set_progress_bar(ProgressBarState {
+        status: Some(ProgressBarStatus::None),
+        progress: None,
+    });
 }
 
 pub(crate) fn emit_failed_download(
@@ -429,4 +558,31 @@ fn set_window_progress(window: &WebviewWindow, total_bytes: Option<u64>, downloa
         None => (Some(ProgressBarStatus::Indeterminate), None),
     };
     let _ = window.set_progress_bar(ProgressBarState { status, progress });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{decode_generated_png, sanitize_png_filename, PNG_SIGNATURE};
+    use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
+
+    #[test]
+    fn accepts_generated_png_data() {
+        let encoded = BASE64_STANDARD.encode([PNG_SIGNATURE.as_slice(), b"content"].concat());
+        assert!(decode_generated_png(&encoded).is_ok());
+    }
+
+    #[test]
+    fn rejects_non_png_data() {
+        let encoded = BASE64_STANDARD.encode(b"not a png");
+        assert_eq!(
+            decode_generated_png(&encoded).unwrap_err(),
+            "generated image is not a valid PNG"
+        );
+    }
+
+    #[test]
+    fn requires_png_filename_after_sanitizing() {
+        assert_eq!(sanitize_png_filename("share.PNG").unwrap(), "share.PNG");
+        assert!(sanitize_png_filename("share.jpg").is_err());
+    }
 }

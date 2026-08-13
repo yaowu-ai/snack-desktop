@@ -3961,6 +3961,7 @@ checksum = "8ed6a63f02c8539c91a8685a86f4099661ba3da017932f6ebbea6de3f0fa7c90"
 name = "snack-desktop"
 version = "1.3.0"
 dependencies = [
+ "base64 0.22.1",
  "block2",
  "chrono",
  "core-graphics",

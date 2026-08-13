@@ -357,10 +357,10 @@
           "markdownDescription": "Allow the remote Snack web app to write and reveal Snack desktop diagnostic logs."
         },
         {
-          "description": "Allow the remote Snack web app to download authenticated Snack files through the desktop shell.",
+          "description": "Allow the remote Snack web app to download authenticated files and generated share images through the desktop shell.",
           "type": "string",
           "const": "allow-download-snack-file",
-          "markdownDescription": "Allow the remote Snack web app to download authenticated Snack files through the desktop shell."
+          "markdownDescription": "Allow the remote Snack web app to download authenticated files and generated share images through the desktop shell."
         },
         {
           "description": "Allow the remote Snack web app to close the desktop shell after a forced update is cancelled.",

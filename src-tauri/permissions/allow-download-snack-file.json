@@ -3,12 +3,13 @@
   "permission": [
     {
       "identifier": "allow-download-snack-file",
-      "description": "Allow the remote Snack web app to download authenticated Snack files through the desktop shell.",
+      "description": "Allow the remote Snack web app to download authenticated files and generated share images through the desktop shell.",
       "commands": {
         "allow": [
           "download_snack_file",
           "open_downloaded_file",
-          "reveal_downloaded_file"
+          "reveal_downloaded_file",
+          "save_generated_share_image"
         ],
         "deny": []
       }
