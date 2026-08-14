@@ -211,8 +211,8 @@
       function saveRename() {
         if (filenameInput.readOnly) return;
         filenameInput.readOnly = true;
-        invoke('meeting_set_recording_file_name', { displayName: filenameInput.value })
-          .catch(function (error) { showError(error, '文件名保存失败'); });
+        invoke('meeting_set_transcript_file_title', { displayName: filenameInput.value })
+          .catch(function (error) { showError(error, '转写文件标题保存失败'); });
       }
       function toggleAutoNotes() {
         var enabled = !current.autoGenerateNotesEnabled;

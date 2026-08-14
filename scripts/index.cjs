@@ -230,7 +230,7 @@ const tauriConfig = {
 const localBuildConfig = operation.localSigning
   ? JSON.stringify({
       ...tauriConfig,
-      identifier: envValue("SNACK_LOCAL_IDENTIFIER", "cn.yaowutech.snack.local"),
+      identifier: envValue("SNACK_LOCAL_IDENTIFIER", tauriConf.identifier),
       productName: envValue("SNACK_LOCAL_PRODUCT_NAME", "Snack local"),
     })
   : null;

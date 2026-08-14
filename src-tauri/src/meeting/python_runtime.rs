@@ -128,7 +128,7 @@ impl FailureCategory {
         match self {
             Self::Package => "Snack 本地运行环境缺失或损坏，请更新或重新安装 Snack 后重试",
             Self::Compatibility => "本地运行环境与转写依赖不兼容，请更新 Snack 后重试",
-            Self::Network => "下载本地转写依赖失败，请检查网络或代理设置后重试",
+            Self::Network => "网络异常，下载本地转写依赖失败，请切换网络或检查代理设置后重试",
             Self::Disk => "磁盘空间不足，无法安装本地转写依赖，请清理空间后重试",
             Self::Permission => "无法写入本地运行环境，请检查磁盘权限后重试",
             Self::Timeout => "本地转写依赖安装超时，请检查网络后重试",
@@ -478,8 +478,8 @@ fn classify_diagnostic(detail: &str) -> FailureCategory {
     [
         (FailureCategory::Disk, DISK_PATTERNS),
         (FailureCategory::Permission, PERMISSION_PATTERNS),
-        (FailureCategory::Compatibility, COMPATIBILITY_PATTERNS),
         (FailureCategory::Network, NETWORK_PATTERNS),
+        (FailureCategory::Compatibility, COMPATIBILITY_PATTERNS),
     ]
     .into_iter()
     .find_map(|(category, patterns)| contains_any(detail, patterns).then_some(category))
@@ -713,6 +713,19 @@ mod tests {
             FailureCategory::Disk
         );
         assert_eq!(classify_failure("", true), FailureCategory::Timeout);
+    }
+
+    #[test]
+    fn prefers_network_when_pip_falls_through_to_no_matching_distribution() {
+        let diagnostic = concat!(
+            "Retrying after connection broken by ProxyError\n",
+            "Could not find a version that satisfies the requirement funasr==1.3.14\n",
+            "No matching distribution found for funasr==1.3.14",
+        );
+        assert_eq!(
+            classify_failure(diagnostic, false),
+            FailureCategory::Network
+        );
     }
 
     #[test]

@@ -1,10 +1,11 @@
 //! Local FunASR transcription backed by Snack's fixed ModelScope snapshot.
 
 use std::io::{BufRead, BufReader, Read};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStderr, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -13,7 +14,11 @@ use crate::meeting::catalog::ModelKey;
 use crate::meeting::state::TranscriptSegment;
 
 const FUNASR_TRANSCRIBER: &str = include_str!("funasr_transcribe.py");
+const TRANSCRIPTION_STALLED: &str = "本地转写长时间停留在 95%";
+const TRANSCRIPTION_STALL_GRACE: Duration = Duration::from_secs(120);
+const AUDIO_NORMALIZATION_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 static SCRIPT_UPDATE_COUNTER: AtomicU64 = AtomicU64::new(0);
+static NORMALIZED_AUDIO_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug)]
 pub(crate) enum TranscriptionOutcome {
@@ -87,11 +92,41 @@ pub(crate) fn transcribe_file(
         return Ok(TranscriptionOutcome::NoAudioDetected);
     }
     ensure_runtime()?;
-    let decoded = run_modelscope(&request, &mut on_progress)?;
+    let decoded = run_modelscope_with_format_fallback(&request, &mut on_progress)?;
     if !on_progress(completion_update(&decoded)) {
         return Err("本地转写已停止".to_string());
     }
     Ok(transcription_outcome(decoded, request.language))
+}
+
+fn run_modelscope_with_format_fallback(
+    request: &TranscriptionRequest<'_>,
+    on_progress: &mut impl FnMut(TranscriptionProgress) -> bool,
+) -> Result<ModelScopeTranscript, String> {
+    match run_modelscope(request, on_progress) {
+        Err(message) if message == TRANSCRIPTION_STALLED => {
+            if !on_progress(format_fallback_update()) {
+                return Err("本地转写已停止".to_string());
+            }
+            let normalized = normalize_audio_for_retry(request, on_progress)?;
+            let retry = TranscriptionRequest {
+                model_key: request.model_key,
+                model_dir: request.model_dir,
+                wav_path: normalized.path(),
+                language: request.language,
+            };
+            run_modelscope(&retry, on_progress).map_err(format_retry_error)
+        }
+        result => result,
+    }
+}
+
+fn format_retry_error(message: String) -> String {
+    if message == TRANSCRIPTION_STALLED {
+        "本地转写切换为标准 WAV 后仍未响应，请重新转写".to_string()
+    } else {
+        format!("本地转写切换为标准 WAV 后失败: {message}")
+    }
 }
 
 fn validate_request(request: &TranscriptionRequest<'_>) -> Result<(), String> {
@@ -153,6 +188,10 @@ fn spawn_transcriber(
         .arg(script)
         .arg(request.wav_path)
         .env("MODELSCOPE_CACHE", cache_dir)
+        .env(
+            "SNACK_TRANSCRIBER_PARENT_PID",
+            std::process::id().to_string(),
+        )
         .env("PYTHONIOENCODING", "utf-8")
         .env("PYTHONUTF8", "1")
         .stdout(Stdio::piped())
@@ -198,14 +237,21 @@ fn consume_protocol(
     on_progress: &mut impl FnMut(TranscriptionProgress) -> bool,
 ) -> Result<Option<ModelScopeTranscript>, String> {
     let mut transcript = None;
+    let mut stall = TranscriptionStall::default();
     while let Some(line) = read_protocol_line(&mut reader)? {
         match decode_message_bytes(&line) {
             Some(ModelScopeMessage::Progress {
                 percent,
                 remaining_seconds,
-            }) if !on_progress(progress_update(percent.min(99), Some(remaining_seconds))) => {
-                child.kill().ok();
-                return Err("本地转写已停止".to_string());
+            }) => {
+                if stall.observe(percent, remaining_seconds, Instant::now()) {
+                    child.kill().ok();
+                    return Err(TRANSCRIPTION_STALLED.to_string());
+                }
+                if !on_progress(progress_update(percent.min(99), Some(remaining_seconds))) {
+                    child.kill().ok();
+                    return Err("本地转写已停止".to_string());
+                }
             }
             Some(ModelScopeMessage::Result { text, segments }) => {
                 transcript = Some(ModelScopeTranscript { text, segments });
@@ -214,6 +260,22 @@ fn consume_protocol(
         }
     }
     Ok(transcript)
+}
+
+#[derive(Default)]
+struct TranscriptionStall {
+    started_at: Option<Instant>,
+}
+
+impl TranscriptionStall {
+    fn observe(&mut self, percent: u8, remaining_seconds: u64, now: Instant) -> bool {
+        if percent < 95 || remaining_seconds > 15 {
+            self.started_at = None;
+            return false;
+        }
+        let started_at = self.started_at.get_or_insert(now);
+        now.saturating_duration_since(*started_at) >= TRANSCRIPTION_STALL_GRACE
+    }
 }
 
 fn read_protocol_line(reader: &mut impl BufRead) -> Result<Option<Vec<u8>>, String> {
@@ -261,6 +323,146 @@ fn completion_update(decoded: &ModelScopeTranscript) -> TranscriptionProgress {
         current_text: decoded.text.clone(),
         segment_count: decoded.segments.len(),
     }
+}
+
+fn format_fallback_update() -> TranscriptionProgress {
+    TranscriptionProgress {
+        percent: 95,
+        remaining_seconds: None,
+        current_text: "转写耗时过长，正在切换为标准 WAV 格式重试".to_string(),
+        segment_count: 0,
+    }
+}
+
+struct NormalizedAudio {
+    path: PathBuf,
+}
+
+impl NormalizedAudio {
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for NormalizedAudio {
+    fn drop(&mut self) {
+        std::fs::remove_file(&self.path).ok();
+    }
+}
+
+fn normalize_audio_for_retry(
+    request: &TranscriptionRequest<'_>,
+    on_progress: &mut impl FnMut(TranscriptionProgress) -> bool,
+) -> Result<NormalizedAudio, String> {
+    let path = normalized_audio_path(request.model_dir);
+    let result =
+        normalize_audio(request, &path, on_progress).and_then(|_| validate_normalized_audio(&path));
+    if let Err(message) = result {
+        std::fs::remove_file(&path).ok();
+        return Err(message);
+    }
+    Ok(NormalizedAudio { path })
+}
+
+fn normalized_audio_path(model_dir: &Path) -> PathBuf {
+    let counter = NORMALIZED_AUDIO_COUNTER.fetch_add(1, Ordering::Relaxed);
+    model_dir.join("runtime").join(format!(
+        ".normalized-audio-{}-{counter}.wav",
+        std::process::id()
+    ))
+}
+
+fn normalize_audio(
+    request: &TranscriptionRequest<'_>,
+    output: &Path,
+    on_progress: &mut impl FnMut(TranscriptionProgress) -> bool,
+) -> Result<(), String> {
+    match crate::meeting::audio::read_wav_i16(request.wav_path) {
+        Ok((samples, _)) => write_normalized_wav(output, &samples),
+        Err(_) => normalize_audio_with_python(request, output, on_progress),
+    }
+}
+
+fn write_normalized_wav(output: &Path, samples: &[i16]) -> Result<(), String> {
+    let mut writer = crate::meeting::audio::WavWriter::create(output)?;
+    writer.write_samples(samples)?;
+    writer.finalize().map(drop)
+}
+
+fn normalize_audio_with_python(
+    request: &TranscriptionRequest<'_>,
+    output: &Path,
+    on_progress: &mut impl FnMut(TranscriptionProgress) -> bool,
+) -> Result<(), String> {
+    let runtime_dir = request.model_dir.join("runtime");
+    let python = crate::meeting::python_runtime::venv_python(&runtime_dir);
+    let script = ensure_transcriber_script(&runtime_dir)?;
+    let mut child = Command::new(python)
+        .args(["-I", "-X", "utf8"])
+        .arg(script)
+        .arg("--normalize")
+        .arg(request.wav_path)
+        .arg(output)
+        .env(
+            "SNACK_TRANSCRIBER_PARENT_PID",
+            std::process::id().to_string(),
+        )
+        .env("PYTHONIOENCODING", "utf-8")
+        .env("PYTHONUTF8", "1")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("无法启动音频格式转换: {error}"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .map(drain_stderr)
+        .ok_or_else(|| "无法读取音频格式转换日志".to_string())?;
+    wait_for_normalizer(&mut child, stderr, on_progress)
+}
+
+fn wait_for_normalizer(
+    child: &mut Child,
+    stderr: JoinHandle<String>,
+    on_progress: &mut impl FnMut(TranscriptionProgress) -> bool,
+) -> Result<(), String> {
+    let started_at = Instant::now();
+    let mut last_progress_at = started_at;
+    loop {
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|error| format!("等待音频格式转换失败: {error}"))?
+        {
+            let stderr_output = stderr.join().unwrap_or_default();
+            return if status.success() {
+                Ok(())
+            } else {
+                Err(format!("音频格式转换失败: {}", diagnostic(&stderr_output)))
+            };
+        }
+        if started_at.elapsed() >= AUDIO_NORMALIZATION_TIMEOUT {
+            child.kill().ok();
+            child.wait().ok();
+            let stderr_output = stderr.join().unwrap_or_default();
+            return Err(format!("音频格式转换超时: {}", diagnostic(&stderr_output)));
+        }
+        if last_progress_at.elapsed() >= Duration::from_secs(1) {
+            if !on_progress(format_fallback_update()) {
+                child.kill().ok();
+                child.wait().ok();
+                stderr.join().ok();
+                return Err("本地转写已停止".to_string());
+            }
+            last_progress_at = Instant::now();
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+fn validate_normalized_audio(path: &Path) -> Result<(), String> {
+    crate::meeting::audio::read_wav_i16(path)
+        .map(drop)
+        .map_err(|message| format!("标准 WAV 校验失败: {message}"))
 }
 
 fn transcription_outcome(decoded: ModelScopeTranscript, language: &str) -> TranscriptionOutcome {
@@ -356,6 +558,17 @@ mod tests {
                 remaining_seconds: 125
             }
         ));
+    }
+
+    #[test]
+    fn progress_stall_requires_two_minutes_at_ninety_five_percent() {
+        let started_at = Instant::now();
+        let mut stall = TranscriptionStall::default();
+
+        assert!(!stall.observe(95, 15, started_at));
+        assert!(!stall.observe(95, 15, started_at + Duration::from_secs(119)));
+        assert!(stall.observe(95, 15, started_at + Duration::from_secs(120)));
+        assert!(!stall.observe(94, 16, started_at + Duration::from_secs(121)));
     }
 
     #[test]

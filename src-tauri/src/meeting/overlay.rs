@@ -469,7 +469,7 @@ mod tests {
         assert!(html.contains("fetch('/stop'"));
         assert!(html.contains("meeting_stop_recording"));
         assert!(html.contains("meeting_set_recording_paused"));
-        assert!(html.contains("meeting_set_recording_file_name"));
+        assert!(html.contains("meeting_set_transcript_file_title"));
         assert!(html.contains("meeting_set_recording_auto_notes"));
         assert!(!html.contains("meeting_request_recording_project"));
         assert!(!html.contains("meeting_set_recording_project"));
