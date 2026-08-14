@@ -173,6 +173,7 @@ pub(crate) enum TaskState {
     Recording,
     Finalizing,
     TranscribingLocal,
+    TranscriptionPaused,
     NoAudioDetected,
     TranscriptReady,
     WaitingForNetwork,
@@ -204,6 +205,7 @@ impl TaskState {
                 | TaskState::Recording
                 | TaskState::Finalizing
                 | TaskState::TranscribingLocal
+                | TaskState::TranscriptionPaused
                 | TaskState::GeneratingNotes
         )
     }
@@ -714,6 +716,21 @@ impl MeetingStore {
         let _ = fs::remove_file(self.root.join(TASK_FILE));
     }
 
+    pub(crate) fn delete_task_record(&self, recording_id: &str) -> Result<(), String> {
+        match fs::remove_file(self.task_record_path(recording_id)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.to_string()),
+        }
+        if self
+            .load_task()
+            .is_some_and(|task| task.recording_id == recording_id)
+        {
+            self.delete_task_file();
+        }
+        Ok(())
+    }
+
     fn task_record_path(&self, recording_id: &str) -> PathBuf {
         self.root
             .join(TASKS_DIR_NAME)
@@ -981,6 +998,7 @@ mod tests {
         assert!(task.audio_file_owned);
         assert!(TaskState::TranscriptionFailed.is_terminal_error());
         assert!(!TaskState::TranscribingLocal.is_terminal_error());
+        assert!(TaskState::TranscriptionPaused.is_active());
         assert!(!TaskState::NoAudioDetected.is_terminal_error());
         assert!(!TaskState::NoAudioDetected.is_active());
         assert!(!TaskState::Idle.blocks_recording());
@@ -1262,6 +1280,30 @@ mod tests {
             store.load_task_record("transcribing").unwrap().state,
             TaskState::TranscribingLocal
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn deleting_a_paused_task_record_preserves_its_audio_file() {
+        let root =
+            std::env::temp_dir().join(format!("snack-delete-paused-task-{}", super::unix_millis()));
+        let state_root = root.join("state");
+        fs::create_dir_all(state_root.join(super::TASKS_DIR_NAME)).unwrap();
+        let store = MeetingStore {
+            root: state_root,
+            default_recordings_root: root.clone(),
+        };
+        let audio_path = root.join("recording.wav");
+        fs::write(&audio_path, b"audio").unwrap();
+        let mut task = MeetingTask::new("paused".to_string(), "zh".to_string());
+        task.state = TaskState::TranscriptionPaused;
+        task.audio_path = Some(audio_path.to_string_lossy().into_owned());
+        store.save_task_record(&task).unwrap();
+
+        store.delete_task_record("paused").unwrap();
+
+        assert!(store.load_task_record("paused").is_none());
+        assert!(audio_path.exists());
         fs::remove_dir_all(root).unwrap();
     }
 

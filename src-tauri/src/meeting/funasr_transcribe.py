@@ -24,6 +24,20 @@ ESTIMATED_REALTIME_FACTOR = 0.65
 PCM_BYTES_PER_SECOND = 32_000
 PROTOCOL_OUTPUT = sys.stdout.buffer
 PROTOCOL_LOCK = threading.Lock()
+EXPECTED_PARENT_PID = int(os.environ.get("SNACK_TRANSCRIBER_PARENT_PID", "0"))
+
+
+def start_parent_watchdog() -> None:
+    if not EXPECTED_PARENT_PID:
+        return
+
+    def watch() -> None:
+        while True:
+            time.sleep(PROGRESS_INTERVAL_SECONDS)
+            if os.getppid() != EXPECTED_PARENT_PID:
+                os._exit(1)
+
+    threading.Thread(target=watch, name="snack-parent-watchdog", daemon=True).start()
 
 
 def model_dir(cache: Path, name: str) -> Path:
@@ -135,7 +149,20 @@ def run_model(audio_path: Path) -> list[dict]:
         )
 
 
+def normalize_audio(source: Path, output: Path) -> None:
+    with redirect_stdout(sys.stderr):
+        import librosa
+        import soundfile
+
+        samples, _ = librosa.load(str(source), sr=16_000, mono=True)
+        soundfile.write(str(output), samples, 16_000, subtype="PCM_16", format="WAV")
+
+
 def main() -> None:
+    start_parent_watchdog()
+    if len(sys.argv) == 4 and sys.argv[1] == "--normalize":
+        normalize_audio(Path(sys.argv[2]).resolve(), Path(sys.argv[3]).resolve())
+        return
     audio_path = Path(sys.argv[1]).resolve()
     reporter = ProgressReporter(audio_duration(audio_path))
     reporter.start()

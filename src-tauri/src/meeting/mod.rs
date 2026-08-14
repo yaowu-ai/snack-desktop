@@ -25,10 +25,12 @@ mod reminder_macos;
 mod state;
 mod transcribe;
 
+use std::collections::HashSet;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::LazyLock;
 use std::sync::{Arc, Mutex};
 
 use serde::Serialize;
@@ -58,6 +60,11 @@ pub(crate) struct MeetingManagerState {
 }
 
 static RECORDING_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_TRANSCRIPTIONS: LazyLock<Mutex<HashSet<String>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+static PENDING_TRANSCRIPTION_RESTARTS: LazyLock<Mutex<HashSet<String>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+static TRANSCRIPTION_GATE: Mutex<()> = Mutex::new(());
 
 // ---------------------------------------------------------------------------
 // Snapshot
@@ -904,6 +911,15 @@ pub(crate) fn meeting_set_recording_file_name(
     window: WebviewWindow,
     display_name: String,
 ) -> Result<(), String> {
+    meeting_set_transcript_file_title(app, window, display_name)
+}
+
+#[tauri::command]
+pub(crate) fn meeting_set_transcript_file_title(
+    app: AppHandle,
+    window: WebviewWindow,
+    display_name: String,
+) -> Result<(), String> {
     require_recording_overlay(&window)?;
     update_current_recording_task(&app, |task| {
         task.display_name = normalize_recording_display_name(&display_name)?;
@@ -1519,22 +1535,84 @@ pub(crate) fn meeting_rename_task_record(
         .load_task_record(&recording_id)
         .ok_or_else(|| "没有找到本地转写记录".to_string())?;
     let display_name = normalize_transcript_file_name(&display_name)?;
-
-    if let Some(current_path) = task.transcript_path.as_deref().map(PathBuf::from) {
-        let next_path = current_path.with_file_name(&display_name);
-        if next_path != current_path {
-            if next_path.exists() {
-                return Err("同名转写文件已存在，请换一个名称".to_string());
-            }
-            fs::rename(&current_path, &next_path)
-                .map_err(|error| format!("无法重命名本地转写文件: {error}"))?;
-            task.transcript_path = Some(next_path.to_string_lossy().into_owned());
-        }
-    }
+    rename_transcript_text_file(&mut task, &display_name)?;
     task.display_name = Some(display_name);
     task.updated_at = now_rfc3339();
     store.save_task_progress(&task)?;
     emit_state(&app, &store);
+    Ok(())
+}
+
+fn rename_transcript_text_file(task: &mut MeetingTask, display_name: &str) -> Result<(), String> {
+    let Some(current_path) = task.transcript_path.as_deref().map(PathBuf::from) else {
+        return Ok(());
+    };
+    let next_path = current_path.with_file_name(display_name);
+    if next_path == current_path {
+        return Ok(());
+    }
+    if next_path.exists() {
+        return Err("同名转写文件已存在，请换一个名称".to_string());
+    }
+    fs::rename(&current_path, &next_path)
+        .map_err(|error| format!("无法重命名本地转写文件: {error}"))?;
+    task.transcript_path = Some(next_path.to_string_lossy().into_owned());
+    Ok(())
+}
+
+#[tauri::command]
+pub(crate) fn meeting_set_transcription_paused(
+    app: AppHandle,
+    window: WebviewWindow,
+    recording_id: String,
+    paused: bool,
+) -> Result<(), String> {
+    require_allowed_window(&window)?;
+    let state = app.state::<MeetingManagerState>();
+    let store = state.store.clone_for_task();
+    let mut task = store
+        .load_task_record(&recording_id)
+        .ok_or_else(|| "没有找到本地转写任务".to_string())?;
+    task.state = next_transcription_pause_state(task.state, paused)?;
+    task.error = None;
+    task.updated_at = now_rfc3339();
+    store.save_task_progress(&task)?;
+    emit_state(&app, &store);
+    if !paused {
+        spawn_transcription(app, store, recording_id);
+    }
+    Ok(())
+}
+
+fn next_transcription_pause_state(state: TaskState, paused: bool) -> Result<TaskState, String> {
+    match (state, paused) {
+        (TaskState::TranscribingLocal, true) => Ok(TaskState::TranscriptionPaused),
+        (TaskState::TranscriptionPaused, false) => Ok(TaskState::TranscribingLocal),
+        (TaskState::TranscriptionPaused, true) | (TaskState::TranscribingLocal, false) => Ok(state),
+        _ => Err("当前任务不能切换转写状态".to_string()),
+    }
+}
+
+#[tauri::command]
+pub(crate) fn meeting_delete_transcription_task(
+    app: AppHandle,
+    window: WebviewWindow,
+    recording_id: String,
+) -> Result<(), String> {
+    require_allowed_window(&window)?;
+    let state = app.state::<MeetingManagerState>();
+    let task = state
+        .store
+        .load_task_record(&recording_id)
+        .ok_or_else(|| "没有找到本地转写任务".to_string())?;
+    if !matches!(
+        task.state,
+        TaskState::TranscribingLocal | TaskState::TranscriptionPaused
+    ) {
+        return Err("只能移除进行中或已暂停的转写任务".to_string());
+    }
+    state.store.delete_task_record(&recording_id)?;
+    emit_state(&app, &state.store);
     Ok(())
 }
 
@@ -1584,9 +1662,29 @@ pub(crate) fn meeting_retranscribe(
 // ---------------------------------------------------------------------------
 
 fn spawn_transcription(app: AppHandle, store: MeetingStore, recording_id: String) {
-    std::thread::Builder::new()
+    if !register_transcription(&recording_id) {
+        return;
+    }
+    let failure_app = app.clone();
+    let failure_store = store.clone_for_task();
+    let failure_recording_id = recording_id.clone();
+    if let Err(error) = std::thread::Builder::new()
         .name("snack-transcribe".to_string())
         .spawn(move || {
+            let _registration = TranscriptionRegistration::new(
+                app.clone(),
+                store.clone_for_task(),
+                recording_id.clone(),
+            );
+            let _gate = TRANSCRIPTION_GATE
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if !store
+                .load_task_record(&recording_id)
+                .is_some_and(|task| task.state == TaskState::TranscribingLocal)
+            {
+                return;
+            }
             let resource = store.load_resource();
             let model_key = match resource
                 .model_key
@@ -1595,58 +1693,44 @@ fn spawn_transcription(app: AppHandle, store: MeetingStore, recording_id: String
             {
                 Some(key) => key,
                 None => {
-                    let mut task = store.load_task_record(&recording_id).unwrap();
-                    let message = "本地模型未安装".to_string();
-                    task.state = TaskState::TranscriptionFailed;
-                    task.error = Some(message.clone());
-                    let _ = store.save_task_progress(&task);
-                    emit_state(&app, &store);
-                    notifications::notify_transcript_failed(&app, &recording_id);
+                    fail_transcription_task(
+                        &app,
+                        &store,
+                        &recording_id,
+                        "本地模型未安装".to_string(),
+                    );
                     return;
                 }
             };
             let model_path = match install::installed_model_path(&store, &resource) {
                 Ok(path) => path,
                 Err(message) => {
-                    let mut task = store.load_task_record(&recording_id).unwrap();
-                    task.state = TaskState::TranscriptionFailed;
-                    task.error = Some(message.clone());
-                    let _ = store.save_task_progress(&task);
-                    emit_state(&app, &store);
-                    notifications::notify_transcript_failed(&app, &recording_id);
+                    fail_transcription_task(&app, &store, &recording_id, message);
                     return;
                 }
             };
             let Some(model_dir) = model_path.parent().map(PathBuf::from) else {
-                let mut task = store.load_task_record(&recording_id).unwrap();
-                let message = "本地模型路径无效".to_string();
-                task.state = TaskState::TranscriptionFailed;
-                task.error = Some(message.clone());
-                let _ = store.save_task_progress(&task);
-                emit_state(&app, &store);
-                notifications::notify_transcript_failed(&app, &task.recording_id);
+                fail_transcription_task(
+                    &app,
+                    &store,
+                    &recording_id,
+                    "本地模型路径无效".to_string(),
+                );
                 return;
             };
 
-            let mut task = store.load_task_record(&recording_id).unwrap();
+            let Some(mut task) = store.load_task_record(&recording_id) else {
+                return;
+            };
             if let Err(message) = store.ensure_transcript_output_directory(&task) {
                 let message = format!("无法创建当天转写目录: {message}");
-                task.state = TaskState::TranscriptionFailed;
-                task.error = Some(message.clone());
-                let _ = store.save_task_progress(&task);
-                emit_state(&app, &store);
-                notifications::notify_transcript_failed(&app, &recording_id);
+                fail_transcription_task(&app, &store, &recording_id, message);
                 return;
             }
-            let wav_path = match task.audio_path.clone().map(PathBuf::from) {
-                Some(path) if path.exists() => path,
-                _ => {
-                    let message = "录音文件缺失，无法转写".to_string();
-                    task.state = TaskState::TranscriptionFailed;
-                    task.error = Some(message.clone());
-                    let _ = store.save_task_progress(&task);
-                    emit_state(&app, &store);
-                    notifications::notify_transcript_failed(&app, &recording_id);
+            let wav_path = match prepare_transcription_audio(&store, &mut task) {
+                Ok(path) => path,
+                Err(message) => {
+                    fail_transcription_task(&app, &store, &recording_id, message);
                     return;
                 }
             };
@@ -1711,29 +1795,16 @@ fn spawn_transcription(app: AppHandle, store: MeetingStore, recording_id: String
                     generated_at: now_rfc3339(),
                 },
                 Err(message) => {
-                    let mut task = store.load_task_record(&recording_id).unwrap();
-                    task.state = TaskState::TranscriptionFailed;
-                    task.error = Some(message.clone());
-                    let _ = store.save_task_progress(&task);
-                    emit_state(&app, &store);
-                    notifications::notify_transcript_failed(&app, &recording_id);
-                    crate::logging::write_app_log(
-                        &app,
-                        "error",
-                        "meeting-transcribe",
-                        "local transcription failed",
-                        Some(
-                            &serde_json::json!({ "recordingId": recording_id, "reason": message }),
-                        ),
-                    );
+                    fail_transcription_task(&app, &store, &recording_id, message);
                     return;
                 }
             };
 
             // Atomically persist the transcript and retain the user-owned audio.
             let mut task = match store.load_task_record(&recording_id) {
-                Some(task) => task,
+                Some(task) if task.state == TaskState::TranscribingLocal => task,
                 None => return,
+                Some(_) => return,
             };
             if let Err(message) = network::persist_transcript(&store, &mut task, transcript) {
                 task.state = TaskState::TranscriptionFailed;
@@ -1756,7 +1827,171 @@ fn spawn_transcription(app: AppHandle, store: MeetingStore, recording_id: String
             emit_state(&app, &store);
             handoff_completed_transcript(&app, &recording_id);
         })
-        .expect("failed to spawn transcription thread");
+    {
+        ACTIVE_TRANSCRIPTIONS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&failure_recording_id);
+        PENDING_TRANSCRIPTION_RESTARTS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&failure_recording_id);
+        fail_transcription_task(
+            &failure_app,
+            &failure_store,
+            &failure_recording_id,
+            format!("无法启动本地转写线程: {error}"),
+        );
+    }
+}
+
+fn fail_transcription_task(
+    app: &AppHandle,
+    store: &MeetingStore,
+    recording_id: &str,
+    message: String,
+) {
+    let Some(mut task) = store.load_task_record(recording_id) else {
+        return;
+    };
+    if task.state != TaskState::TranscribingLocal {
+        return;
+    }
+    task.state = TaskState::TranscriptionFailed;
+    task.error = Some(message.clone());
+    let _ = store.save_task_progress(&task);
+    emit_state(app, store);
+    notifications::notify_transcript_failed(app, recording_id);
+    crate::logging::write_app_log(
+        app,
+        "error",
+        "meeting-transcribe",
+        "local transcription failed",
+        Some(&serde_json::json!({ "recordingId": recording_id, "reason": message })),
+    );
+}
+
+fn register_transcription(recording_id: &str) -> bool {
+    let inserted = ACTIVE_TRANSCRIPTIONS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(recording_id.to_string());
+    if !inserted {
+        PENDING_TRANSCRIPTION_RESTARTS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(recording_id.to_string());
+    }
+    inserted
+}
+
+struct TranscriptionRegistration {
+    app: AppHandle,
+    recording_id: String,
+    store: MeetingStore,
+}
+
+impl TranscriptionRegistration {
+    fn new(app: AppHandle, store: MeetingStore, recording_id: String) -> Self {
+        Self {
+            app,
+            recording_id,
+            store,
+        }
+    }
+}
+
+impl Drop for TranscriptionRegistration {
+    fn drop(&mut self) {
+        ACTIVE_TRANSCRIPTIONS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&self.recording_id);
+        let should_restart = PENDING_TRANSCRIPTION_RESTARTS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&self.recording_id)
+            && self
+                .store
+                .load_task_record(&self.recording_id)
+                .is_some_and(|task| task.state == TaskState::TranscribingLocal);
+        if should_restart {
+            spawn_transcription(
+                self.app.clone(),
+                self.store.clone_for_task(),
+                self.recording_id.clone(),
+            );
+        }
+    }
+}
+
+fn prepare_transcription_audio(
+    store: &MeetingStore,
+    task: &mut MeetingTask,
+) -> Result<PathBuf, String> {
+    let source = task
+        .audio_path
+        .as_deref()
+        .map(PathBuf::from)
+        .filter(|path| path.is_file())
+        .ok_or_else(|| "录音文件缺失，无法转写".to_string())?;
+    if !has_txt_extension(&source) {
+        return Ok(source);
+    }
+    let (recovered, duration_ms, audio_bytes) =
+        recover_txt_audio_file(&source, &task.recording_id)?;
+    if !store
+        .load_task_record(&task.recording_id)
+        .is_some_and(|current| current.state == TaskState::TranscribingLocal)
+    {
+        fs::remove_file(&recovered).ok();
+        return Err("本地转写已停止".to_string());
+    }
+    task.audio_path = Some(recovered.to_string_lossy().into_owned());
+    task.audio_bytes = Some(audio_bytes);
+    task.duration_ms = Some(duration_ms);
+    task.updated_at = now_rfc3339();
+    store.save_task_progress(task)?;
+    if task.audio_file_owned {
+        fs::remove_file(&source).map_err(|error| format!("无法移除错误的 TXT 录音: {error}"))?;
+    }
+    Ok(recovered)
+}
+
+fn recover_txt_audio_file(
+    source: &std::path::Path,
+    recording_id: &str,
+) -> Result<(PathBuf, u64, u64), String> {
+    let (_, duration_ms) = audio::read_wav_i16(source)
+        .map_err(|message| format!("TXT 录音无法恢复为 WAV: {message}"))?;
+    let recovered = available_recovered_wav_path(source, recording_id);
+    let audio_bytes =
+        fs::copy(source, &recovered).map_err(|error| format!("无法恢复 WAV 录音: {error}"))?;
+    Ok((recovered, duration_ms, audio_bytes))
+}
+
+fn has_txt_extension(path: &std::path::Path) -> bool {
+    path.extension()
+        .and_then(|value| value.to_str())
+        .is_some_and(|value| value.eq_ignore_ascii_case("txt"))
+}
+
+fn available_recovered_wav_path(source: &std::path::Path, recording_id: &str) -> PathBuf {
+    let preferred = source.with_extension("wav");
+    if !preferred.exists() {
+        return preferred;
+    }
+    let recovered = source.with_file_name(format!("{recording_id}-recovered.wav"));
+    if !recovered.exists() {
+        return recovered;
+    }
+    for index in 2..=10_000 {
+        let candidate = source.with_file_name(format!("{recording_id}-recovered-{index}.wav"));
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    source.with_file_name(format!("{recording_id}-recovered-{}.wav", unix_millis()))
 }
 
 fn finish_without_audio(app: &AppHandle, store: &MeetingStore, recording_id: &str) {
@@ -1898,10 +2133,11 @@ mod tests {
     use super::permissions::PermissionAccess;
     use super::{
         can_attempt_recording_without_permission_request, imported_audio_task, is_valid_session_id,
-        normalize_chat_handoff_state, normalize_recording_projects,
-        should_automatically_generate_notes, site_switch_is_blocked_by_state, MeetingSettings,
-        MeetingTask, TaskState, Transcript,
+        next_transcription_pause_state, normalize_chat_handoff_state, normalize_recording_projects,
+        recover_txt_audio_file, rename_transcript_text_file, should_automatically_generate_notes,
+        site_switch_is_blocked_by_state, MeetingSettings, MeetingTask, TaskState, Transcript,
     };
+    use crate::meeting::audio::WavWriter;
     use std::fs;
 
     #[test]
@@ -2010,6 +2246,60 @@ mod tests {
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].as_ref().unwrap().path(), source);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn transcript_title_rename_never_renames_the_audio_file() {
+        let root =
+            std::env::temp_dir().join(format!("snack-transcript-title-{}", super::unix_millis()));
+        fs::create_dir_all(&root).unwrap();
+        let audio_path = root.join("recording.wav");
+        let transcript_path = root.join("before.txt");
+        fs::write(&audio_path, b"audio").unwrap();
+        fs::write(&transcript_path, b"transcript").unwrap();
+        let mut task = MeetingTask::new("rec-title".to_string(), "zh".to_string());
+        task.audio_path = Some(audio_path.to_string_lossy().into_owned());
+        task.transcript_path = Some(transcript_path.to_string_lossy().into_owned());
+
+        rename_transcript_text_file(&mut task, "after.txt").unwrap();
+
+        assert_eq!(fs::read(&audio_path).unwrap(), b"audio");
+        assert!(!transcript_path.exists());
+        assert_eq!(fs::read(root.join("after.txt")).unwrap(), b"transcript");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn mislabeled_txt_recording_is_recovered_as_wav() {
+        let root =
+            std::env::temp_dir().join(format!("snack-txt-audio-recovery-{}", super::unix_millis()));
+        fs::create_dir_all(&root).unwrap();
+        let source = root.join("产品周会.txt");
+        let mut writer = WavWriter::create(&source).unwrap();
+        writer.write_samples(&vec![120; 16_000]).unwrap();
+        writer.finalize().unwrap();
+
+        let (recovered, duration_ms, audio_bytes) =
+            recover_txt_audio_file(&source, "rec-recovered").unwrap();
+
+        assert_eq!(recovered, root.join("产品周会.wav"));
+        assert_eq!(duration_ms, 1_000);
+        assert_eq!(audio_bytes, fs::metadata(&recovered).unwrap().len());
+        assert!(crate::meeting::audio::read_wav_i16(&recovered).is_ok());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn transcription_can_pause_resume_and_reject_completed_tasks() {
+        assert_eq!(
+            next_transcription_pause_state(TaskState::TranscribingLocal, true).unwrap(),
+            TaskState::TranscriptionPaused
+        );
+        assert_eq!(
+            next_transcription_pause_state(TaskState::TranscriptionPaused, false).unwrap(),
+            TaskState::TranscribingLocal
+        );
+        assert!(next_transcription_pause_state(TaskState::TranscriptReady, true).is_err());
     }
 
     #[test]
