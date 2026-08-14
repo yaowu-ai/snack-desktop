@@ -1,6 +1,6 @@
 [package]
 name = "snack-desktop"
-version = "1.4.2"
+version = "1.3.0"
 description = "Snack desktop client"
 authors = ["Snack"]
 edition = "2021"
