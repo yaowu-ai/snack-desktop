@@ -171,6 +171,9 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
+      - name: Test FunASR process watchdog
+        run: python -m unittest src-tauri/src/meeting/test_funasr_transcribe.py
+
       - name: Run Windows native tests
         # Tauri's common-controls-v6 feature imports TaskDialogIndirect, but
         # cargo test does not use the packaged application's Windows manifest.

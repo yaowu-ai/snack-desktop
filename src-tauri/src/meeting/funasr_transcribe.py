@@ -27,6 +27,43 @@ PROTOCOL_LOCK = threading.Lock()
 EXPECTED_PARENT_PID = int(os.environ.get("SNACK_TRANSCRIBER_PARENT_PID", "0"))
 
 
+def windows_process_is_alive(pid: int) -> bool:
+    import ctypes
+    from ctypes import wintypes
+
+    synchronize = 0x00100000
+    wait_timeout = 0x00000102
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    kernel32.WaitForSingleObject.restype = wintypes.DWORD
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    handle = kernel32.OpenProcess(synchronize, False, pid)
+    if not handle:
+        return False
+    try:
+        return kernel32.WaitForSingleObject(handle, 0) == wait_timeout
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def parent_process_is_alive(
+    expected_pid: int,
+    *,
+    platform: str | None = None,
+    direct_parent_pid: int | None = None,
+    windows_pid_is_alive=None,
+) -> bool:
+    platform = platform or os.name
+    if platform == "nt":
+        checker = windows_pid_is_alive or windows_process_is_alive
+        return checker(expected_pid)
+    parent_pid = direct_parent_pid if direct_parent_pid is not None else os.getppid()
+    return parent_pid == expected_pid
+
+
 def start_parent_watchdog() -> None:
     if not EXPECTED_PARENT_PID:
         return
@@ -34,7 +71,7 @@ def start_parent_watchdog() -> None:
     def watch() -> None:
         while True:
             time.sleep(PROGRESS_INTERVAL_SECONDS)
-            if os.getppid() != EXPECTED_PARENT_PID:
+            if not parent_process_is_alive(EXPECTED_PARENT_PID):
                 os._exit(1)
 
     threading.Thread(target=watch, name="snack-parent-watchdog", daemon=True).start()

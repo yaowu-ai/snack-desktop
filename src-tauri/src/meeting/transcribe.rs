@@ -168,7 +168,7 @@ fn run_modelscope(
     let stderr = stderr_thread.join().unwrap_or_default();
     let transcript = protocol_result?;
     if !status.success() {
-        return Err(format!("本地 FunASR 转写失败: {}", diagnostic(&stderr)));
+        return Err(transcriber_failure_message(&stderr));
     }
     transcript.ok_or_else(|| "本地转写结果无效：模型未返回结果".to_string())
 }
@@ -305,6 +305,14 @@ fn diagnostic(stderr: &str) -> String {
     let trimmed = stderr.trim();
     let start = trimmed.len().saturating_sub(4_000);
     trimmed.get(start..).unwrap_or(trimmed).to_string()
+}
+
+fn transcriber_failure_message(stderr: &str) -> String {
+    let details = diagnostic(stderr);
+    if details.is_empty() {
+        return "本地 FunASR 转写进程异常退出，未返回诊断信息".to_string();
+    }
+    format!("本地 FunASR 转写失败: {details}")
 }
 
 fn progress_update(percent: u8, remaining_seconds: Option<u64>) -> TranscriptionProgress {
@@ -569,6 +577,14 @@ mod tests {
         assert!(!stall.observe(95, 15, started_at + Duration::from_secs(119)));
         assert!(stall.observe(95, 15, started_at + Duration::from_secs(120)));
         assert!(!stall.observe(94, 16, started_at + Duration::from_secs(121)));
+    }
+
+    #[test]
+    fn empty_stderr_returns_an_actionable_transcriber_failure() {
+        assert_eq!(
+            transcriber_failure_message(""),
+            "本地 FunASR 转写进程异常退出，未返回诊断信息"
+        );
     }
 
     #[test]
