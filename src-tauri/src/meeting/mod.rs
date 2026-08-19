@@ -160,17 +160,25 @@ pub(crate) fn desktop_update_block_reason(app: &AppHandle) -> Option<String> {
     if state.recorder.lock().expect("recorder poisoned").is_some() {
         return Some("正在录音，结束录音后才能更新桌面端".to_string());
     }
-    if state
-        .store
-        .load_task()
-        .is_some_and(|task| task.state.is_active())
-    {
+    if has_desktop_update_blocking_task(&state.store) {
         return Some("会议内容仍在处理中，完成后才能更新桌面端".to_string());
     }
     if !state.store.load_resource().state.is_idle() {
         return Some("本地资源正在安装，完成后才能更新桌面端".to_string());
     }
     None
+}
+
+fn has_desktop_update_blocking_task(store: &MeetingStore) -> bool {
+    has_desktop_update_blocking_state(store.load_task(), store.load_task_records())
+}
+
+fn has_desktop_update_blocking_state(
+    current: Option<MeetingTask>,
+    records: Vec<MeetingTask>,
+) -> bool {
+    records.into_iter().any(|task| task.state.is_active())
+        || current.is_some_and(|task| task.state.is_active())
 }
 
 pub(crate) fn site_switch_block_reason(app: &AppHandle) -> Option<String> {
@@ -2132,10 +2140,12 @@ fn open_permission_settings(_app: &AppHandle, permission: &str) -> Result<(), St
 mod tests {
     use super::permissions::PermissionAccess;
     use super::{
-        can_attempt_recording_without_permission_request, imported_audio_task, is_valid_session_id,
-        next_transcription_pause_state, normalize_chat_handoff_state, normalize_recording_projects,
-        recover_txt_audio_file, rename_transcript_text_file, should_automatically_generate_notes,
-        site_switch_is_blocked_by_state, MeetingSettings, MeetingTask, TaskState, Transcript,
+        can_attempt_recording_without_permission_request, has_desktop_update_blocking_state,
+        imported_audio_task, is_valid_session_id, next_transcription_pause_state,
+        normalize_chat_handoff_state, normalize_recording_projects, recover_txt_audio_file,
+        rename_transcript_text_file, should_automatically_generate_notes,
+        site_switch_is_blocked_by_state, task_with_state, MeetingSettings, MeetingTask, TaskState,
+        Transcript,
     };
     use crate::meeting::audio::WavWriter;
     use std::fs;
@@ -2222,6 +2232,18 @@ mod tests {
         ));
         assert!(!site_switch_is_blocked_by_state(TaskState::TranscriptReady));
         assert!(!site_switch_is_blocked_by_state(TaskState::Ready));
+    }
+
+    #[test]
+    fn desktop_update_guard_blocks_background_task_records() {
+        assert!(has_desktop_update_blocking_state(
+            None,
+            vec![task_with_state(TaskState::TranscribingLocal)],
+        ));
+        assert!(!has_desktop_update_blocking_state(
+            None,
+            vec![task_with_state(TaskState::TranscriptReady)],
+        ));
     }
 
     #[test]
