@@ -32,8 +32,10 @@ const PYTHON_INFO_SCRIPT: &str = concat!(
     "print(json.dumps({'major':sys.version_info.major,'minor':sys.version_info.minor,",
     "'patch':sys.version_info.micro,'machine':platform.machine()}))"
 );
-const DEPENDENCY_CHECK_SCRIPT: &str =
-    "import funasr,librosa,modelscope,numpy,soundfile,torch,torchaudio; torch.zeros(1).numpy()";
+const DEPENDENCY_CHECK_SCRIPT: &str = concat!(
+    "import funasr,librosa,modelscope,numpy,sentencepiece,soundfile,torch,torchaudio;",
+    "torch.zeros(1).numpy()"
+);
 static RUNTIME_SETUP_LOCK: Mutex<()> = Mutex::new(());
 const DISK_PATTERNS: &[&str] = &["no space left", "errno 28", "disk full"];
 const PERMISSION_PATTERNS: &[&str] = &["permission denied", "access is denied", "errno 13"];
@@ -758,6 +760,12 @@ mod tests {
             "numpy==1.26.4 ; sys_platform == \"darwin\" and platform_machine == \"x86_64\""
         ));
         assert!(DEPENDENCY_CHECK_SCRIPT.contains("torch.zeros(1).numpy()"));
+    }
+
+    #[test]
+    fn pins_and_imports_the_windows_sentencepiece_build() {
+        assert!(REQUIREMENTS.contains("sentencepiece==0.2.0 ; sys_platform == \"win32\""));
+        assert!(DEPENDENCY_CHECK_SCRIPT.contains("sentencepiece"));
     }
 
     #[test]

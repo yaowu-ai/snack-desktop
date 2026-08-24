@@ -42,7 +42,7 @@ use install::InstallManager;
 use permissions::{request_mac_permissions, PermissionAccess};
 use state::{
     normalize_transcript_file_name, now_rfc3339, unix_millis, MeetingSettings, MeetingStore,
-    MeetingTask, ResourceState, ResourceStatus, TaskState, Transcript,
+    MeetingTask, ResourceState, ResourceStatus, TaskState, Transcript, TranscriptAssetState,
 };
 
 const STATE_EVENT: &str = "meeting-state";
@@ -119,6 +119,7 @@ pub(crate) struct MeetingSnapshot {
     available: bool,
     supported_platform: bool,
     recording_reminder_supported: bool,
+    capabilities: MeetingCapabilities,
     platform: String,
     resource: ResourceStatus,
     task: Option<MeetingTask>,
@@ -127,6 +128,22 @@ pub(crate) struct MeetingSnapshot {
     catalog: Vec<CatalogInfo>,
     permissions: Option<PermissionStatus>,
     disk_free_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MeetingCapabilities {
+    transcript_project_assets: bool,
+    transcription_task_controls: bool,
+}
+
+impl MeetingCapabilities {
+    fn current() -> Self {
+        Self {
+            transcript_project_assets: true,
+            transcription_task_controls: true,
+        }
+    }
 }
 
 pub(crate) fn build_snapshot(store: &MeetingStore) -> MeetingSnapshot {
@@ -139,6 +156,7 @@ pub(crate) fn build_snapshot(store: &MeetingStore) -> MeetingSnapshot {
         available: true,
         supported_platform: cfg!(any(target_os = "macos", target_os = "windows")),
         recording_reminder_supported: reminder::supported(),
+        capabilities: MeetingCapabilities::current(),
         platform: platform_label(),
         resource,
         task: store.load_task(),
@@ -202,8 +220,12 @@ fn has_site_switch_blocking_task(store: &MeetingStore) -> bool {
 fn has_site_switch_blocking_state(current: Option<MeetingTask>, records: Vec<MeetingTask>) -> bool {
     records
         .into_iter()
-        .any(|task| task.state.blocks_site_switch())
-        || current.is_some_and(|task| task.state.blocks_site_switch())
+        .any(|task| task_blocks_site_switch(&task))
+        || current.is_some_and(|task| task_blocks_site_switch(&task))
+}
+
+fn task_blocks_site_switch(task: &MeetingTask) -> bool {
+    task.state.blocks_site_switch() || task.transcript_asset_state.is_active()
 }
 
 #[cfg(test)]
@@ -276,13 +298,13 @@ pub(crate) fn initialize(app: &AppHandle) -> Result<(), String> {
 fn reconcile_tasks(app: &AppHandle, store: &MeetingStore) {
     let current_task_id = store.load_task().map(|task| task.recording_id);
     if let Some(mut task) = store.load_task() {
-        if normalize_chat_handoff_state(&mut task) {
+        if normalize_retained_task(&mut task) {
             let _ = store.save_task(&task);
         }
         let _ = store.save_task_record(&task);
     }
     for mut task in store.load_task_records() {
-        if normalize_chat_handoff_state(&mut task) {
+        if normalize_retained_task(&mut task) {
             let _ = store.save_task_progress(&task);
         }
         if task.state == TaskState::TranscribingLocal
@@ -305,6 +327,22 @@ fn reconcile_tasks(app: &AppHandle, store: &MeetingStore) {
             Some(&serde_json::json!({ "error": error })),
         );
     }
+}
+
+fn normalize_retained_task(task: &mut MeetingTask) -> bool {
+    let chat_changed = normalize_chat_handoff_state(task);
+    let asset_changed = normalize_transcript_asset_upload_state(task);
+    chat_changed || asset_changed
+}
+
+fn normalize_transcript_asset_upload_state(task: &mut MeetingTask) -> bool {
+    if task.transcript_asset_state != TranscriptAssetState::Uploading {
+        return false;
+    }
+    task.transcript_asset_state = TranscriptAssetState::Pending;
+    task.transcript_asset_error = None;
+    task.updated_at = now_rfc3339();
+    true
 }
 
 /// Meeting notes are now produced by handing the local transcript to Snack
@@ -885,6 +923,8 @@ fn build_overlay_state(
         auto_generate_notes_enabled: task.auto_generate_notes_enabled.unwrap_or(false),
         notes_project_id: task.notes_project_id.clone(),
         notes_project_name: task.notes_project_name.clone(),
+        transcript_project_id: task.transcript_project_id.clone(),
+        transcript_project_name: task.transcript_project_name.clone(),
         projects: state
             .recording_projects
             .lock()
@@ -1014,6 +1054,228 @@ pub(crate) fn meeting_set_recording_project(
     })
 }
 
+#[tauri::command]
+pub(crate) fn meeting_set_transcript_project(
+    app: AppHandle,
+    window: WebviewWindow,
+    recording_id: String,
+    project_id: Option<String>,
+    project_name: Option<String>,
+) -> Result<(), String> {
+    require_main_or_recording_overlay(&window)?;
+    let project = normalize_transcript_project(project_id, project_name)?;
+    update_task_record(&app, &recording_id, move |task| {
+        apply_transcript_project(task, project)
+    })
+}
+
+#[tauri::command]
+pub(crate) fn meeting_claim_transcript_asset_upload(
+    app: AppHandle,
+    window: WebviewWindow,
+    recording_id: String,
+    project_id: String,
+) -> Result<bool, String> {
+    require_allowed_window(&window)?;
+    let project_id = normalize_numeric_id(&project_id, "项目 ID")?;
+    let mut claimed = false;
+    update_task_record(&app, &recording_id, |task| {
+        claimed = claim_transcript_asset_upload(task, &project_id)?;
+        Ok(())
+    })?;
+    Ok(claimed)
+}
+
+#[tauri::command]
+pub(crate) fn meeting_mark_transcript_asset_file_uploaded(
+    app: AppHandle,
+    window: WebviewWindow,
+    recording_id: String,
+    project_id: String,
+    file_id: String,
+) -> Result<(), String> {
+    require_allowed_window(&window)?;
+    let project_id = normalize_numeric_id(&project_id, "项目 ID")?;
+    let file_id = normalize_numeric_id(&file_id, "文件 ID")?;
+    update_task_record(&app, &recording_id, move |task| {
+        require_active_asset_upload(task, &project_id)?;
+        task.transcript_asset_file_id = Some(file_id);
+        Ok(())
+    })
+}
+
+#[tauri::command]
+pub(crate) fn meeting_complete_transcript_asset_upload(
+    app: AppHandle,
+    window: WebviewWindow,
+    recording_id: String,
+    project_id: String,
+    file_id: String,
+    asset_id: String,
+) -> Result<(), String> {
+    require_allowed_window(&window)?;
+    let identifiers = normalize_asset_identifiers(project_id, file_id, asset_id)?;
+    update_task_record(&app, &recording_id, move |task| {
+        complete_transcript_asset_upload(task, identifiers)
+    })
+}
+
+#[tauri::command]
+pub(crate) fn meeting_fail_transcript_asset_upload(
+    app: AppHandle,
+    window: WebviewWindow,
+    recording_id: String,
+    project_id: String,
+    error: String,
+) -> Result<(), String> {
+    require_allowed_window(&window)?;
+    let project_id = normalize_numeric_id(&project_id, "项目 ID")?;
+    update_task_record(&app, &recording_id, move |task| {
+        require_active_asset_upload(task, &project_id)?;
+        task.transcript_asset_state = TranscriptAssetState::Failed;
+        task.transcript_asset_error = normalize_asset_error(&error);
+        Ok(())
+    })
+}
+
+fn require_main_or_recording_overlay(window: &WebviewWindow) -> Result<(), String> {
+    if overlay::is_overlay_window(window) {
+        return Ok(());
+    }
+    require_allowed_window(window)
+}
+
+fn normalize_transcript_project(
+    project_id: Option<String>,
+    project_name: Option<String>,
+) -> Result<Option<(String, String)>, String> {
+    let Some(project_id) = project_id.filter(|value| !value.trim().is_empty()) else {
+        return Ok(None);
+    };
+    let project_id = normalize_numeric_id(&project_id, "项目 ID")?;
+    let project_name: String = project_name
+        .unwrap_or_default()
+        .trim()
+        .chars()
+        .take(100)
+        .collect();
+    if project_name.is_empty() {
+        return Err("项目名称不能为空".to_string());
+    }
+    Ok(Some((project_id, project_name)))
+}
+
+fn apply_transcript_project(
+    task: &mut MeetingTask,
+    project: Option<(String, String)>,
+) -> Result<(), String> {
+    if task.transcript_asset_state == TranscriptAssetState::Saved {
+        return Err("转写文件已经保存到项目".to_string());
+    }
+    let (project_id, project_name) = project.unzip();
+    task.transcript_project_id = project_id;
+    task.transcript_project_name = project_name;
+    task.transcript_asset_state = if task.transcript_project_id.is_some() {
+        TranscriptAssetState::Pending
+    } else {
+        TranscriptAssetState::NotSelected
+    };
+    task.transcript_asset_file_id = None;
+    task.transcript_asset_id = None;
+    task.transcript_asset_error = None;
+    Ok(())
+}
+
+fn claim_transcript_asset_upload(task: &mut MeetingTask, project_id: &str) -> Result<bool, String> {
+    require_asset_project(task, project_id)?;
+    if task.transcript.is_none() || task.transcript_asset_state == TranscriptAssetState::Saved {
+        return Ok(false);
+    }
+    if task.transcript_asset_state == TranscriptAssetState::NotSelected {
+        return Ok(false);
+    }
+    task.transcript_asset_state = TranscriptAssetState::Uploading;
+    task.transcript_asset_error = None;
+    Ok(true)
+}
+
+fn require_active_asset_upload(task: &MeetingTask, project_id: &str) -> Result<(), String> {
+    require_asset_project(task, project_id)?;
+    if task.transcript_asset_state != TranscriptAssetState::Uploading {
+        return Err("转写资产上传状态已发生变化".to_string());
+    }
+    Ok(())
+}
+
+fn require_asset_project(task: &MeetingTask, project_id: &str) -> Result<(), String> {
+    if task.transcript_project_id.as_deref() == Some(project_id) {
+        return Ok(());
+    }
+    Err("转写保存项目已发生变化".to_string())
+}
+
+fn normalize_numeric_id(value: &str, label: &str) -> Result<String, String> {
+    let value = value.trim();
+    if value.is_empty() || !value.chars().all(|character| character.is_ascii_digit()) {
+        return Err(format!("{label} 无效"));
+    }
+    Ok(value.to_string())
+}
+
+type AssetIdentifiers = (String, String, String);
+
+fn normalize_asset_identifiers(
+    project_id: String,
+    file_id: String,
+    asset_id: String,
+) -> Result<AssetIdentifiers, String> {
+    Ok((
+        normalize_numeric_id(&project_id, "项目 ID")?,
+        normalize_numeric_id(&file_id, "文件 ID")?,
+        normalize_numeric_id(&asset_id, "资产 ID")?,
+    ))
+}
+
+fn complete_transcript_asset_upload(
+    task: &mut MeetingTask,
+    identifiers: AssetIdentifiers,
+) -> Result<(), String> {
+    let (project_id, file_id, asset_id) = identifiers;
+    require_active_asset_upload(task, &project_id)?;
+    task.transcript_asset_state = TranscriptAssetState::Saved;
+    task.transcript_asset_file_id = Some(file_id);
+    task.transcript_asset_id = Some(asset_id);
+    task.transcript_asset_error = None;
+    Ok(())
+}
+
+fn normalize_asset_error(error: &str) -> Option<String> {
+    let error = error.trim().chars().take(240).collect::<String>();
+    (!error.is_empty()).then_some(error)
+}
+
+fn update_task_record(
+    app: &AppHandle,
+    recording_id: &str,
+    update: impl FnOnce(&mut MeetingTask) -> Result<(), String>,
+) -> Result<(), String> {
+    let state = app.state::<MeetingManagerState>();
+    let _guard = state
+        .recording_task_update
+        .lock()
+        .expect("recording task update poisoned");
+    let mut task = state
+        .store
+        .load_task_record(recording_id)
+        .ok_or("没有找到本地转写记录")?;
+    update(&mut task)?;
+    task.updated_at = now_rfc3339();
+    state.store.save_task_progress(&task)?;
+    emit_state(app, &state.store);
+    refresh_recording_overlay(app);
+    Ok(())
+}
+
 fn require_recording_overlay(window: &WebviewWindow) -> Result<(), String> {
     if overlay::is_overlay_window(window) {
         Ok(())
@@ -1073,21 +1335,34 @@ fn clear_missing_recording_project(app: &AppHandle) -> Result<(), String> {
     let Some(task) = state.store.load_task() else {
         return Ok(());
     };
-    let Some(project_id) = task.notes_project_id.as_deref() else {
+    if task.state != TaskState::Recording {
         return Ok(());
-    };
-    let project_exists = state
+    }
+    let projects = state
         .recording_projects
         .lock()
-        .expect("recording projects poisoned")
-        .iter()
-        .any(|project| project.project_id == project_id);
-    if project_exists || task.state != TaskState::Recording {
+        .expect("recording projects poisoned");
+    let project_is_missing = |project_id: Option<&str>| {
+        project_id.is_some_and(|project_id| {
+            !projects
+                .iter()
+                .any(|project| project.project_id == project_id)
+        })
+    };
+    let notes_project_missing = project_is_missing(task.notes_project_id.as_deref());
+    let transcript_project_missing = project_is_missing(task.transcript_project_id.as_deref());
+    drop(projects);
+    if !notes_project_missing && !transcript_project_missing {
         return Ok(());
     }
     update_current_recording_task(app, |task| {
-        task.notes_project_id = None;
-        task.notes_project_name = None;
+        if notes_project_missing {
+            task.notes_project_id = None;
+            task.notes_project_name = None;
+        }
+        if transcript_project_missing {
+            apply_transcript_project(task, None)?;
+        }
         Ok(())
     })
 }
@@ -2140,15 +2415,25 @@ fn open_permission_settings(_app: &AppHandle, permission: &str) -> Result<(), St
 mod tests {
     use super::permissions::PermissionAccess;
     use super::{
-        can_attempt_recording_without_permission_request, has_desktop_update_blocking_state,
-        imported_audio_task, is_valid_session_id, next_transcription_pause_state,
-        normalize_chat_handoff_state, normalize_recording_projects, recover_txt_audio_file,
-        rename_transcript_text_file, should_automatically_generate_notes,
-        site_switch_is_blocked_by_state, task_with_state, MeetingSettings, MeetingTask, TaskState,
-        Transcript,
+        apply_transcript_project, can_attempt_recording_without_permission_request,
+        claim_transcript_asset_upload, complete_transcript_asset_upload,
+        has_desktop_update_blocking_state, has_site_switch_blocking_state, imported_audio_task,
+        is_valid_session_id, next_transcription_pause_state, normalize_chat_handoff_state,
+        normalize_recording_projects, normalize_transcript_asset_upload_state,
+        recover_txt_audio_file, rename_transcript_text_file, should_automatically_generate_notes,
+        site_switch_is_blocked_by_state, task_with_state, MeetingCapabilities, MeetingSettings,
+        MeetingTask, TaskState, Transcript, TranscriptAssetState,
     };
     use crate::meeting::audio::WavWriter;
     use std::fs;
+
+    #[test]
+    fn snapshot_capabilities_are_explicit_even_for_local_versioned_builds() {
+        let value = serde_json::to_value(MeetingCapabilities::current()).unwrap();
+
+        assert_eq!(value["transcriptionTaskControls"], true);
+        assert_eq!(value["transcriptProjectAssets"], true);
+    }
 
     #[test]
     fn quick_recording_requests_any_permission_that_is_not_preflight_granted() {
@@ -2209,6 +2494,44 @@ mod tests {
     }
 
     #[test]
+    fn transcript_project_upload_progress_is_persistable_and_idempotent() {
+        let mut task = task_with_transcript();
+        apply_transcript_project(&mut task, Some(("101".to_string(), "桌面迭代".to_string())))
+            .unwrap();
+        assert_eq!(task.transcript_asset_state, TranscriptAssetState::Pending);
+        assert!(claim_transcript_asset_upload(&mut task, "101").unwrap());
+        complete_transcript_asset_upload(
+            &mut task,
+            ("101".to_string(), "201".to_string(), "301".to_string()),
+        )
+        .unwrap();
+        assert_eq!(task.transcript_asset_state, TranscriptAssetState::Saved);
+        assert_eq!(task.transcript_asset_file_id.as_deref(), Some("201"));
+        assert!(!claim_transcript_asset_upload(&mut task, "101").unwrap());
+    }
+
+    #[test]
+    fn interrupted_transcript_asset_upload_returns_to_pending() {
+        let mut task = task_with_transcript();
+        task.transcript_asset_state = TranscriptAssetState::Uploading;
+        assert!(normalize_transcript_asset_upload_state(&mut task));
+        assert_eq!(task.transcript_asset_state, TranscriptAssetState::Pending);
+    }
+
+    fn task_with_transcript() -> MeetingTask {
+        let mut task = MeetingTask::new("recording-asset".to_string(), "zh".to_string());
+        task.transcript = Some(Transcript {
+            text: "会议转写".to_string(),
+            language: "zh".to_string(),
+            segments: Vec::new(),
+            model_key: "small".to_string(),
+            engine: "FunASR".to_string(),
+            generated_at: "2026-08-24T10:00:00+08:00".to_string(),
+        });
+        task
+    }
+
+    #[test]
     fn automatic_notes_handoff_respects_the_saved_preference() {
         let mut settings = MeetingSettings::default();
         assert!(!should_automatically_generate_notes(&settings));
@@ -2232,6 +2555,10 @@ mod tests {
         ));
         assert!(!site_switch_is_blocked_by_state(TaskState::TranscriptReady));
         assert!(!site_switch_is_blocked_by_state(TaskState::Ready));
+
+        let mut asset_upload = task_with_state(TaskState::TranscriptReady);
+        asset_upload.transcript_asset_state = TranscriptAssetState::Pending;
+        assert!(has_site_switch_blocking_state(None, vec![asset_upload]));
     }
 
     #[test]

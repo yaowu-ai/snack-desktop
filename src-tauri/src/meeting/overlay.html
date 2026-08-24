@@ -72,6 +72,11 @@
     text-overflow: ellipsis; outline: none; cursor: pointer; user-select: text; -webkit-user-select: text;
   }
   .filename-input:not([readonly]) { border-color: #fdba74; padding: 5px 7px; background: #fff; cursor: text; }
+  .project-select {
+    width: 126px; min-width: 0; border: 0; background: transparent; color: #0f172a;
+    font-size: 12px; text-align: right; text-align-last: right; text-overflow: ellipsis;
+    outline: none; cursor: pointer;
+  }
   .switch {
     position: relative; width: 34px; height: 20px; border: 0; border-radius: 999px;
     background: #cbd5e1; cursor: pointer; transition: background .15s ease;
@@ -115,14 +120,19 @@
         <span class="setting-label">会议自动总结</span>
         <button class="switch" id="auto-notes" type="button" role="switch" aria-checked="false" aria-label="本次录音自动生成会议纪要"></button>
       </div>
+      <label class="setting-row">
+        <span class="setting-label">转写保存到项目</span>
+        <select class="project-select" id="project-select" aria-label="转写保存到项目"></select>
+      </label>
     </div>
   </div>
   <script>
     (function () {
-      var current = { elapsedMs: 0, recordingId: '', paused: false, displayName: '', autoGenerateNotesEnabled: false };
+      var current = { elapsedMs: 0, recordingId: '', paused: false, displayName: '', autoGenerateNotesEnabled: false, transcriptProjectId: '', transcriptProjectName: '', projects: [] };
       var expanded = false;
       var pending = false;
       var errorMessage = '';
+      var projectSignature = '';
       var titleEl = document.getElementById('title');
       var metricEl = document.getElementById('metric');
       var errorEl = document.getElementById('error');
@@ -133,6 +143,7 @@
       var chevron = document.getElementById('chevron');
       var filenameInput = document.getElementById('filename-input');
       var autoNotes = document.getElementById('auto-notes');
+      var projectSelect = document.getElementById('project-select');
 
       function invoke(command, args) {
         if (window.__TAURI__ && window.__TAURI__.core) return window.__TAURI__.core.invoke(command, args || {});
@@ -150,8 +161,24 @@
       }
       function showError(error, fallback) {
         pending = false;
-        errorMessage = (error && error.message) || String(error || fallback);
+        errorMessage = fallback;
+        console.error('[meeting-overlay]', error);
         render();
+      }
+      function renderProjectOptions() {
+        var projects = current.projects || [];
+        var selectedId = current.transcriptProjectId || '';
+        var signature = selectedId + '|' + projects.map(function (item) { return item.projectId + ':' + item.projectName; }).join('|');
+        if (signature === projectSignature) return;
+        projectSignature = signature;
+        projectSelect.replaceChildren();
+        projectSelect.add(new Option('未保存', ''));
+        projects.forEach(function (project) { projectSelect.add(new Option(project.projectName, project.projectId)); });
+        if (selectedId && !projects.some(function (project) { return project.projectId === selectedId; })) {
+          projectSelect.add(new Option(current.transcriptProjectName || '已选项目', selectedId));
+        }
+        projectSelect.value = selectedId;
+        projectSelect.title = selectedId ? (current.transcriptProjectName || '已选项目') : '未保存';
       }
       function render() {
         document.body.dataset.paused = String(Boolean(current.paused));
@@ -167,6 +194,7 @@
         expandAction.title = expandAction.ariaLabel = expanded ? '收起录音配置' : '展开录音配置';
         if (document.activeElement !== filenameInput) filenameInput.value = current.displayName || '';
         autoNotes.setAttribute('aria-checked', String(Boolean(current.autoGenerateNotesEnabled)));
+        renderProjectOptions();
         errorEl.hidden = !errorMessage;
         errorEl.textContent = errorMessage;
       }
@@ -219,6 +247,20 @@
         invoke('meeting_set_recording_auto_notes', { enabled: enabled })
           .catch(function (error) { showError(error, '自动转写设置失败'); });
       }
+      function selectTranscriptProject() {
+        var projectId = projectSelect.value || null;
+        var project = (current.projects || []).find(function (item) { return item.projectId === projectId; });
+        errorMessage = '';
+        render();
+        invoke('meeting_set_transcript_project', {
+          recordingId: current.recordingId,
+          projectId: projectId,
+          projectName: project ? project.projectName : null
+        }).catch(function (error) {
+          projectSignature = '';
+          showError(error, '转写保存项目设置失败');
+        });
+      }
 
       pauseAction.addEventListener('click', function (event) { event.stopPropagation(); togglePause(); });
       resumeAction.addEventListener('click', function (event) { event.stopPropagation(); togglePause(); });
@@ -231,6 +273,8 @@
         if (event.key === 'Escape') { filenameInput.readOnly = true; filenameInput.value = current.displayName || ''; filenameInput.blur(); }
       });
       autoNotes.addEventListener('click', function (event) { event.stopPropagation(); toggleAutoNotes(); });
+      projectSelect.addEventListener('click', function (event) { event.stopPropagation(); });
+      projectSelect.addEventListener('change', function (event) { event.stopPropagation(); selectTranscriptProject(); });
       render();
       try {
         var eventApi = window.__TAURI__ && window.__TAURI__.event;

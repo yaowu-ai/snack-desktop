@@ -16,7 +16,7 @@ pub(crate) const REMINDER_LABEL: &str = "recording_reminder";
 const OVERLAY_STATE_EVENT: &str = "meeting-overlay-state";
 const OVERLAY_WIDTH: f64 = 240.0;
 const OVERLAY_HEIGHT: f64 = 108.0;
-const OVERLAY_EXPANDED_HEIGHT: f64 = 228.0;
+const OVERLAY_EXPANDED_HEIGHT: f64 = 276.0;
 const REMINDER_WIDTH: f64 = 326.0;
 const REMINDER_HEIGHT: f64 = 116.0;
 
@@ -39,6 +39,8 @@ pub(crate) struct OverlayState {
     pub(crate) auto_generate_notes_enabled: bool,
     pub(crate) notes_project_id: Option<String>,
     pub(crate) notes_project_name: Option<String>,
+    pub(crate) transcript_project_id: Option<String>,
+    pub(crate) transcript_project_name: Option<String>,
     pub(crate) projects: Vec<RecordingProjectOption>,
 }
 
@@ -59,6 +61,8 @@ pub(crate) struct RecordingOverlayState {
     pub(crate) auto_generate_notes_enabled: bool,
     pub(crate) notes_project_id: Option<String>,
     pub(crate) notes_project_name: Option<String>,
+    pub(crate) transcript_project_id: Option<String>,
+    pub(crate) transcript_project_name: Option<String>,
     pub(crate) projects: Vec<RecordingProjectOption>,
 }
 
@@ -75,6 +79,8 @@ impl OverlayState {
             auto_generate_notes_enabled: state.auto_generate_notes_enabled,
             notes_project_id: state.notes_project_id,
             notes_project_name: state.notes_project_name,
+            transcript_project_id: state.transcript_project_id,
+            transcript_project_name: state.transcript_project_name,
             projects: state.projects,
         }
     }
@@ -471,6 +477,9 @@ mod tests {
         assert!(html.contains("meeting_set_recording_paused"));
         assert!(html.contains("meeting_set_transcript_file_title"));
         assert!(html.contains("meeting_set_recording_auto_notes"));
+        assert!(html.contains("meeting_set_transcript_project"));
+        assert!(html.contains("errorMessage = fallback;"));
+        assert!(!html.contains("errorMessage = (error && error.message)"));
         assert!(!html.contains("meeting_request_recording_project"));
         assert!(!html.contains("meeting_set_recording_project"));
         assert!(html.contains("return stopViaProtocol();"));
@@ -512,9 +521,29 @@ mod tests {
         assert!(!html.contains(">纪要自动转写<"));
         assert!(!html.contains(">纪要归属项目<"));
         assert!(!html.contains("普通会话"));
-        assert!(!html.contains("id=\"project-select\""));
+        assert!(html.contains("转写保存到项目"));
+        assert!(html.contains("id=\"project-select\""));
+        assert!(html.contains("new Option('未保存', '')"));
+        assert!(html.contains("text-align-last: right"));
         assert!(!html.contains("新建项目"));
         assert!(!html.contains("stopViaProtocol(),\n          invokeWithTimeout"));
+    }
+
+    #[test]
+    fn project_asset_commands_are_in_meeting_permission_set() {
+        let permissions = include_str!("../../permissions/allow-meeting.json");
+        for command in [
+            "meeting_set_transcript_project",
+            "meeting_claim_transcript_asset_upload",
+            "meeting_mark_transcript_asset_file_uploaded",
+            "meeting_complete_transcript_asset_upload",
+            "meeting_fail_transcript_asset_upload",
+        ] {
+            assert!(
+                permissions.contains(command),
+                "missing permission for {command}"
+            );
+        }
     }
 
     #[test]
@@ -578,6 +607,8 @@ mod tests {
             auto_generate_notes_enabled: true,
             notes_project_id: Some("101".to_string()),
             notes_project_name: Some("产品项目".to_string()),
+            transcript_project_id: Some("202".to_string()),
+            transcript_project_name: Some("桌面迭代".to_string()),
             projects: vec![RecordingProjectOption {
                 project_id: "101".to_string(),
                 project_name: "产品项目".to_string(),
@@ -590,6 +621,7 @@ mod tests {
         assert_eq!(value["elapsedMs"], 2500);
         assert_eq!(value["displayName"], "Snack会议");
         assert_eq!(value["notesProjectId"], "101");
+        assert_eq!(value["transcriptProjectId"], "202");
         assert_eq!(value["projects"][0]["projectName"], "产品项目");
     }
 }

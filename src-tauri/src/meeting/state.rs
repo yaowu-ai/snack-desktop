@@ -293,6 +293,18 @@ pub(crate) struct MeetingTask {
     pub(crate) notes_project_id: Option<String>,
     #[serde(default)]
     pub(crate) notes_project_name: Option<String>,
+    #[serde(default)]
+    pub(crate) transcript_project_id: Option<String>,
+    #[serde(default)]
+    pub(crate) transcript_project_name: Option<String>,
+    #[serde(default)]
+    pub(crate) transcript_asset_state: TranscriptAssetState,
+    #[serde(default)]
+    pub(crate) transcript_asset_file_id: Option<String>,
+    #[serde(default)]
+    pub(crate) transcript_asset_id: Option<String>,
+    #[serde(default)]
+    pub(crate) transcript_asset_error: Option<String>,
     pub(crate) state: TaskState,
     pub(crate) started_at: Option<String>,
     pub(crate) ended_at: Option<String>,
@@ -322,6 +334,12 @@ impl MeetingTask {
             auto_generate_notes_enabled: None,
             notes_project_id: None,
             notes_project_name: None,
+            transcript_project_id: None,
+            transcript_project_name: None,
+            transcript_asset_state: TranscriptAssetState::NotSelected,
+            transcript_asset_file_id: None,
+            transcript_asset_id: None,
+            transcript_asset_error: None,
             state: TaskState::Idle,
             started_at: None,
             ended_at: None,
@@ -345,6 +363,23 @@ impl MeetingTask {
         self.state = state;
         self.updated_at = now_rfc3339();
         self
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum TranscriptAssetState {
+    #[default]
+    NotSelected,
+    Pending,
+    Uploading,
+    Saved,
+    Failed,
+}
+
+impl TranscriptAssetState {
+    pub(crate) fn is_active(self) -> bool {
+        matches!(self, Self::Pending | Self::Uploading | Self::Failed)
     }
 }
 
@@ -565,7 +600,9 @@ impl MeetingStore {
             if fs::read(&path)
                 .ok()
                 .and_then(|bytes| serde_json::from_slice::<MeetingTask>(&bytes).ok())
-                .is_some_and(|task| task.state.is_active())
+                .is_some_and(|task| {
+                    task.state.is_active() || task.transcript_asset_state.is_active()
+                })
             {
                 continue;
             }
@@ -961,7 +998,7 @@ mod tests {
     use super::{
         now_rfc3339, parse_rfc3339_millis, validate_meeting_settings, DownloadProgress,
         MeetingSettings, MeetingStore, MeetingTask, ResourceState, ResourceStatus,
-        ServerSubmission, TaskState, DEFAULT_MEETING_NOTES_PROMPT,
+        ServerSubmission, TaskState, TranscriptAssetState, DEFAULT_MEETING_NOTES_PROMPT,
     };
     use std::fs;
 
@@ -1280,6 +1317,25 @@ mod tests {
             store.load_task_record("transcribing").unwrap().state,
             TaskState::TranscribingLocal
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn clearing_task_records_keeps_pending_project_uploads() {
+        let root = std::env::temp_dir().join(format!(
+            "snack-meeting-clear-asset-uploads-{}",
+            super::unix_millis()
+        ));
+        let store = MeetingStore {
+            root: root.join("state"),
+            default_recordings_root: root.join("recordings"),
+        };
+        let mut task = MeetingTask::new("pending-asset".to_string(), "zh".to_string());
+        task.transcript_asset_state = TranscriptAssetState::Pending;
+        store.save_task_record(&task).unwrap();
+
+        assert_eq!(store.clear_task_records().unwrap(), 0);
+        assert!(store.load_task_record("pending-asset").is_some());
         fs::remove_dir_all(root).unwrap();
     }
 
