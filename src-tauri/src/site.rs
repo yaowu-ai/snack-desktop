@@ -64,10 +64,10 @@ impl SiteKey {
         .expect("configured Snack site URL must be valid")
     }
 
-    pub(crate) fn desktop_login_url(self) -> Url {
+    pub(crate) fn login_url(self) -> Url {
         self.url()
-            .join("/login/desktop")
-            .expect("configured Snack desktop login URL must be valid")
+            .join("/login")
+            .expect("configured Snack login URL must be valid")
     }
 
     pub(crate) fn from_menu_id(id: &str) -> Option<Self> {
@@ -81,77 +81,47 @@ impl SiteKey {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct SitePreference {
-    pub(crate) site: SiteKey,
-    #[serde(default)]
-    pub(crate) login_required: bool,
-}
-
-impl SitePreference {
-    pub(crate) fn pending_login(site: SiteKey) -> Self {
-        Self {
-            site,
-            login_required: true,
-        }
-    }
-
-    pub(crate) fn after_load(site: SiteKey, path: &str) -> Self {
-        Self {
-            site,
-            login_required: is_login_path(path),
-        }
-    }
+struct SitePreference {
+    site: SiteKey,
 }
 
 pub(crate) fn initial_webview_url(app: &AppHandle, configured: &WebviewUrl) -> WebviewUrl {
-    resolve_initial_webview_url(configured, load_site_preference(app))
+    resolve_initial_webview_url(configured, load_site(app))
 }
 
 pub(crate) fn selected_site(app: &AppHandle, configured: &WebviewUrl) -> SiteKey {
     let resolved = initial_webview_url(app, configured);
-    site_from_webview_url(&resolved).unwrap_or_else(|| load_site_preference(app).site)
+    site_from_webview_url(&resolved).unwrap_or_else(|| load_site(app))
 }
 
 pub(crate) fn site_from_webview_url(url: &WebviewUrl) -> Option<SiteKey> {
     external_url(url).and_then(SiteKey::from_url)
 }
 
-fn resolve_initial_webview_url(configured: &WebviewUrl, saved: SitePreference) -> WebviewUrl {
+fn resolve_initial_webview_url(configured: &WebviewUrl, saved: SiteKey) -> WebviewUrl {
     let Some(configured_url) = external_url(configured) else {
         return configured.clone();
     };
     if SiteKey::from_url(configured_url) != Some(SiteKey::Yaowu) {
         return configured.clone();
     }
-    let saved_url = if saved.login_required {
-        saved.site.desktop_login_url()
-    } else {
-        saved.site.url()
-    };
-    WebviewUrl::External(saved_url)
+    WebviewUrl::External(saved.url())
 }
 
 pub(crate) fn load_site(app: &AppHandle) -> SiteKey {
-    load_site_preference(app).site
-}
-
-pub(crate) fn load_site_preference(app: &AppHandle) -> SitePreference {
     site_preference_path(app)
         .ok()
         .and_then(|path| read_site_preference(&path))
         .unwrap_or_default()
 }
 
-pub(crate) fn save_site_preference(
-    app: &AppHandle,
-    preference: SitePreference,
-) -> Result<(), String> {
+pub(crate) fn save_site(app: &AppHandle, site: SiteKey) -> Result<(), String> {
     let path = site_preference_path(app)?;
     let parent = path.parent().ok_or("站点配置路径无效")?;
     fs::create_dir_all(parent).map_err(|error| error.to_string())?;
-    persist_site_preference(&path, preference)
+    persist_site_preference(&path, site)
 }
 
 fn external_url(configured: &WebviewUrl) -> Option<&Url> {
@@ -167,10 +137,6 @@ fn same_origin(left: &Url, right: &Url) -> bool {
         && left.port_or_known_default() == right.port_or_known_default()
 }
 
-fn is_login_path(path: &str) -> bool {
-    path == "/login" || path.starts_with("/login/")
-}
-
 fn site_preference_path(app: &AppHandle) -> Result<PathBuf, String> {
     app.path()
         .app_data_dir()
@@ -178,14 +144,16 @@ fn site_preference_path(app: &AppHandle) -> Result<PathBuf, String> {
         .map_err(|error| error.to_string())
 }
 
-fn read_site_preference(path: &Path) -> Option<SitePreference> {
+fn read_site_preference(path: &Path) -> Option<SiteKey> {
     let bytes = fs::read(path).ok()?;
-    serde_json::from_slice::<SitePreference>(&bytes).ok()
+    serde_json::from_slice::<SitePreference>(&bytes)
+        .ok()
+        .map(|preference| preference.site)
 }
 
-fn persist_site_preference(path: &Path, preference: SitePreference) -> Result<(), String> {
+fn persist_site_preference(path: &Path, site: SiteKey) -> Result<(), String> {
     let temporary_path = path.with_extension("json.tmp");
-    let bytes = serde_json::to_vec(&preference).map_err(|error| error.to_string())?;
+    let bytes = serde_json::to_vec(&SitePreference { site }).map_err(|error| error.to_string())?;
     fs::write(&temporary_path, bytes).map_err(|error| error.to_string())?;
     fs::rename(temporary_path, path).map_err(|error| error.to_string())
 }
@@ -204,38 +172,23 @@ mod tests {
         let _ = fs::remove_file(&missing);
         assert_eq!(
             read_site_preference(&missing).unwrap_or_default(),
-            SitePreference::default()
+            SiteKey::Yaowu
         );
 
         let invalid = temporary_file("invalid.json");
         fs::write(&invalid, br#"{"site":"unknown"}"#).unwrap();
         assert_eq!(
             read_site_preference(&invalid).unwrap_or_default(),
-            SitePreference::default()
+            SiteKey::Yaowu
         );
         let _ = fs::remove_file(invalid);
     }
 
     #[test]
-    fn persists_and_restores_pending_login_state() {
+    fn persists_and_restores_selected_site() {
         let path = temporary_file("saved.json");
-        let preference = SitePreference::pending_login(SiteKey::Mechlink);
-        persist_site_preference(&path, preference).unwrap();
-        assert_eq!(read_site_preference(&path), Some(preference));
-        let _ = fs::remove_file(path);
-    }
-
-    #[test]
-    fn reads_legacy_site_only_preference_as_settled() {
-        let path = temporary_file("legacy.json");
-        fs::write(&path, br#"{"site":"jifuwu"}"#).unwrap();
-        assert_eq!(
-            read_site_preference(&path),
-            Some(SitePreference {
-                site: SiteKey::Jifuwu,
-                login_required: false,
-            })
-        );
+        persist_site_preference(&path, SiteKey::Mechlink).unwrap();
+        assert_eq!(read_site_preference(&path), Some(SiteKey::Mechlink));
         let _ = fs::remove_file(path);
     }
 
@@ -260,50 +213,36 @@ mod tests {
     }
 
     #[test]
-    fn maps_sites_to_desktop_login_urls() {
+    fn maps_sites_to_login_urls() {
         assert_eq!(
-            SiteKey::Yaowu.desktop_login_url().as_str(),
-            "https://snack.mechlabs.cn/login/desktop"
+            SiteKey::Yaowu.login_url().as_str(),
+            "https://snack.mechlabs.cn/login"
         );
         assert_eq!(
-            SiteKey::Jifuwu.desktop_login_url().as_str(),
-            "https://snack.globalnexus-co.com/login/desktop"
+            SiteKey::Jifuwu.login_url().as_str(),
+            "https://snack.globalnexus-co.com/login"
         );
         assert_eq!(
-            SiteKey::Mechlink.desktop_login_url().as_str(),
-            "https://snack.mechandlink.com/login/desktop"
+            SiteKey::Mechlink.login_url().as_str(),
+            "https://snack.mechandlink.com/login"
         );
     }
 
     #[test]
     fn restores_saved_site_only_for_the_universal_production_build() {
         let production = WebviewUrl::External(SiteKey::Yaowu.url());
-        let settled = SitePreference {
-            site: SiteKey::Mechlink,
-            login_required: false,
-        };
         assert_eq!(
-            resolve_initial_webview_url(&production, settled),
+            resolve_initial_webview_url(&production, SiteKey::Mechlink),
             WebviewUrl::External(SiteKey::Mechlink.url())
         );
 
-        let pending = SitePreference::pending_login(SiteKey::Jifuwu);
+        let local = WebviewUrl::External(Url::parse("http://localhost:3000").unwrap());
         assert_eq!(
-            resolve_initial_webview_url(&production, pending),
-            WebviewUrl::External(SiteKey::Jifuwu.desktop_login_url())
+            resolve_initial_webview_url(&local, SiteKey::Mechlink),
+            local
         );
 
-        let local = WebviewUrl::External(Url::parse("http://localhost:3000").unwrap());
-        assert_eq!(resolve_initial_webview_url(&local, pending), local);
-
         let qa = WebviewUrl::External(Url::parse("https://qasnack.mechlabs.cn").unwrap());
-        assert_eq!(resolve_initial_webview_url(&qa, pending), qa);
-    }
-
-    #[test]
-    fn keeps_login_pending_until_a_non_login_page_finishes() {
-        assert!(SitePreference::after_load(SiteKey::Jifuwu, "/login").login_required);
-        assert!(SitePreference::after_load(SiteKey::Jifuwu, "/login/desktop").login_required);
-        assert!(!SitePreference::after_load(SiteKey::Jifuwu, "/").login_required);
+        assert_eq!(resolve_initial_webview_url(&qa, SiteKey::Mechlink), qa);
     }
 }

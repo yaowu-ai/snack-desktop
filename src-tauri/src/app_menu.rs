@@ -347,7 +347,7 @@ fn handle_site_selection(app: &AppHandle, site: crate::site::SiteKey) {
         restore_site_menu_selection(app, selected);
         return;
     }
-    if let Err(error) = switch_site(app, &window, site) {
+    if let Err(error) = switch_site(&window, site) {
         restore_site_menu_selection(app, selected);
         log_site_switch_failure(app, site, &error);
         show_site_switch_message("站点切换失败", "请稍后重试");
@@ -389,30 +389,14 @@ fn site_switch_confirmation_title(site: crate::site::SiteKey) -> String {
 
 #[cfg(any(target_os = "macos", windows))]
 fn site_switch_confirmation_description() -> &'static str {
-    "切换后需要重新登录，当前页面未保存的内容可能丢失。"
+    "首次切换时需要重新登录，当前页面未保存的内容可能丢失。"
 }
 
 #[cfg(any(target_os = "macos", windows))]
-fn switch_site(
-    app: &AppHandle,
-    window: &WebviewWindow,
-    site: crate::site::SiteKey,
-) -> Result<(), String> {
-    let previous = crate::site::load_site_preference(app);
-    crate::site::save_site_preference(app, crate::site::SitePreference::pending_login(site))?;
-    if let Err(error) = window.navigate(site.desktop_login_url()) {
-        let rollback = crate::site::save_site_preference(app, previous);
-        return Err(site_navigation_error(error.to_string(), rollback.err()));
-    }
-    Ok(())
-}
-
-#[cfg(any(target_os = "macos", windows))]
-fn site_navigation_error(navigation: String, rollback: Option<String>) -> String {
-    match rollback {
-        Some(rollback) => format!("{navigation}; preference rollback failed: {rollback}"),
-        None => navigation,
-    }
+fn switch_site(window: &WebviewWindow, site: crate::site::SiteKey) -> Result<(), String> {
+    window
+        .navigate(site.login_url())
+        .map_err(|error| error.to_string())
 }
 
 #[cfg(any(target_os = "macos", windows))]
@@ -424,9 +408,8 @@ pub(crate) fn sync_site_after_load(
     let Some(site) = crate::site::SiteKey::from_url(loaded_url) else {
         return;
     };
-    let preference = crate::site::SitePreference::after_load(site, loaded_url.path());
-    if crate::site::load_site_preference(app) != preference {
-        if let Err(error) = crate::site::save_site_preference(app, preference) {
+    if crate::site::load_site(app) != site {
+        if let Err(error) = crate::site::save_site(app, site) {
             log_site_switch_failure(app, site, &error);
         }
     }
@@ -564,7 +547,7 @@ mod tests {
         );
         assert_eq!(
             site_switch_confirmation_description(),
-            "切换后需要重新登录，当前页面未保存的内容可能丢失。"
+            "首次切换时需要重新登录，当前页面未保存的内容可能丢失。"
         );
     }
 }
