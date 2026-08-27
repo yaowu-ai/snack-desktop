@@ -24,7 +24,7 @@ const PIP_ATTEMPTS: u8 = 2;
 const COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const VENV_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const PIP_TIMEOUT: Duration = Duration::from_secs(45 * 60);
-const DEPENDENCY_CHECK_TIMEOUT: Duration = Duration::from_secs(2 * 60);
+const DEPENDENCY_CHECK_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const MAX_DIAGNOSTIC_LINES: usize = 120;
 const MAX_DIAGNOSTIC_BYTES: usize = 16 * 1024;
 const PYTHON_INFO_SCRIPT: &str = concat!(
@@ -766,6 +766,11 @@ mod tests {
     fn pins_and_imports_the_windows_sentencepiece_build() {
         assert!(REQUIREMENTS.contains("sentencepiece==0.2.0 ; sys_platform == \"win32\""));
         assert!(DEPENDENCY_CHECK_SCRIPT.contains("sentencepiece"));
+    }
+
+    #[test]
+    fn allows_slow_dependency_check_cold_starts() {
+        assert!(DEPENDENCY_CHECK_TIMEOUT >= Duration::from_secs(5 * 60));
     }
 
     #[test]
