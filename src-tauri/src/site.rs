@@ -55,19 +55,13 @@ impl SiteKey {
         }
     }
 
-    pub(crate) fn url(self) -> Url {
+    pub(crate) fn homepage_url(self) -> Url {
         Url::parse(match self {
             Self::Yaowu => YAOWU_URL,
             Self::Jifuwu => JIFUWU_URL,
             Self::Mechlink => MECHLINK_URL,
         })
         .expect("configured Snack site URL must be valid")
-    }
-
-    pub(crate) fn login_url(self) -> Url {
-        self.url()
-            .join("/login")
-            .expect("configured Snack login URL must be valid")
     }
 
     pub(crate) fn from_menu_id(id: &str) -> Option<Self> {
@@ -77,7 +71,7 @@ impl SiteKey {
     pub(crate) fn from_url(url: &Url) -> Option<Self> {
         Self::ALL
             .into_iter()
-            .find(|site| same_origin(url, &site.url()))
+            .find(|site| same_origin(url, &site.homepage_url()))
     }
 }
 
@@ -107,7 +101,7 @@ fn resolve_initial_webview_url(configured: &WebviewUrl, saved: SiteKey) -> Webvi
     if SiteKey::from_url(configured_url) != Some(SiteKey::Yaowu) {
         return configured.clone();
     }
-    WebviewUrl::External(saved.url())
+    WebviewUrl::External(saved.homepage_url())
 }
 
 pub(crate) fn load_site(app: &AppHandle) -> SiteKey {
@@ -213,27 +207,27 @@ mod tests {
     }
 
     #[test]
-    fn maps_sites_to_login_urls() {
+    fn maps_sites_to_homepage_urls() {
         assert_eq!(
-            SiteKey::Yaowu.login_url().as_str(),
-            "https://snack.mechlabs.cn/login"
+            SiteKey::Yaowu.homepage_url().as_str(),
+            "https://snack.mechlabs.cn/"
         );
         assert_eq!(
-            SiteKey::Jifuwu.login_url().as_str(),
-            "https://snack.globalnexus-co.com/login"
+            SiteKey::Jifuwu.homepage_url().as_str(),
+            "https://snack.globalnexus-co.com/"
         );
         assert_eq!(
-            SiteKey::Mechlink.login_url().as_str(),
-            "https://snack.mechandlink.com/login"
+            SiteKey::Mechlink.homepage_url().as_str(),
+            "https://snack.mechandlink.com/"
         );
     }
 
     #[test]
     fn restores_saved_site_only_for_the_universal_production_build() {
-        let production = WebviewUrl::External(SiteKey::Yaowu.url());
+        let production = WebviewUrl::External(SiteKey::Yaowu.homepage_url());
         assert_eq!(
             resolve_initial_webview_url(&production, SiteKey::Mechlink),
-            WebviewUrl::External(SiteKey::Mechlink.url())
+            WebviewUrl::External(SiteKey::Mechlink.homepage_url())
         );
 
         let local = WebviewUrl::External(Url::parse("http://localhost:3000").unwrap());

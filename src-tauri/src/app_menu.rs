@@ -389,13 +389,13 @@ fn site_switch_confirmation_title(site: crate::site::SiteKey) -> String {
 
 #[cfg(any(target_os = "macos", windows))]
 fn site_switch_confirmation_description() -> &'static str {
-    "首次切换时需要重新登录，当前页面未保存的内容可能丢失。"
+    "目标站点未登录时需要登录，当前页面未保存的内容可能丢失。"
 }
 
 #[cfg(any(target_os = "macos", windows))]
 fn switch_site(window: &WebviewWindow, site: crate::site::SiteKey) -> Result<(), String> {
     window
-        .navigate(site.login_url())
+        .navigate(site.homepage_url())
         .map_err(|error| error.to_string())
 }
 
@@ -547,7 +547,7 @@ mod tests {
         );
         assert_eq!(
             site_switch_confirmation_description(),
-            "首次切换时需要重新登录，当前页面未保存的内容可能丢失。"
+            "目标站点未登录时需要登录，当前页面未保存的内容可能丢失。"
         );
     }
 }
