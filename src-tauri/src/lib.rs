@@ -11,6 +11,7 @@ mod platform;
 mod record_import;
 mod site;
 mod web;
+mod web_runtime_recovery;
 mod window_state;
 
 use app_menu::install_close_to_status_menu;
@@ -154,6 +155,7 @@ pub fn run() {
             let window = WebviewWindowBuilder::from_config(app, &window_config)?
                 .visible(false)
                 .user_agent(&user_agent)
+                .initialization_script(web_runtime_recovery::initialization_script())
                 .on_new_window(move |url, _features| handle_new_window_request(&app_handle, url))
                 .on_page_load(move |window, payload| {
                     if payload.event() == PageLoadEvent::Finished {

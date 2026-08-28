@@ -1,6 +1,6 @@
 use tauri::Url;
 
-const ALLOWED_WEB_ORIGINS: &[&str] = &[
+pub(crate) const ALLOWED_WEB_ORIGINS: &[&str] = &[
     "https://snack.mechlabs.cn",
     "https://snack.globalnexus-co.com",
     "https://snack.mechandlink.com",
