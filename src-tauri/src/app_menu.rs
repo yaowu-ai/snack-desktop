@@ -395,7 +395,7 @@ fn site_switch_confirmation_description() -> &'static str {
 #[cfg(any(target_os = "macos", windows))]
 fn switch_site(window: &WebviewWindow, site: crate::site::SiteKey) -> Result<(), String> {
     window
-        .navigate(site.login_url())
+        .navigate(site.homepage_url())
         .map_err(|error| error.to_string())
 }
 
