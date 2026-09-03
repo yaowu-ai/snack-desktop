@@ -19,7 +19,17 @@ pub(crate) fn is_allowed_web_origin(url: &Url) -> bool {
         None => format!("{}://{}", url.scheme(), host),
     };
 
-    ALLOWED_WEB_ORIGINS.contains(&origin.as_str())
+    ALLOWED_WEB_ORIGINS.contains(&origin.as_str()) || is_allowed_development_origin(url)
+}
+
+#[cfg(debug_assertions)]
+fn is_allowed_development_origin(url: &Url) -> bool {
+    url.scheme() == "http" && matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "::1"))
+}
+
+#[cfg(not(debug_assertions))]
+fn is_allowed_development_origin(_url: &Url) -> bool {
+    false
 }
 
 pub(crate) fn desktop_user_agent() -> String {
@@ -48,6 +58,19 @@ mod tests {
         }
         assert!(!is_allowed_web_origin(
             &Url::parse("https://snack.mechandlink.com.evil.example").unwrap()
+        ));
+    }
+
+    #[test]
+    fn allows_loopback_ports_in_debug_builds() {
+        assert!(is_allowed_web_origin(
+            &Url::parse("http://127.0.0.1:3003/task-hub").unwrap()
+        ));
+        assert!(is_allowed_web_origin(
+            &Url::parse("http://localhost:4317/task-hub").unwrap()
+        ));
+        assert!(!is_allowed_web_origin(
+            &Url::parse("http://192.168.1.10:3003/task-hub").unwrap()
         ));
     }
 }

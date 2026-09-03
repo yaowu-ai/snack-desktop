@@ -2,9 +2,9 @@ use tauri::{AppHandle, WebviewWindow};
 
 use crate::attention::update_desktop_attention;
 use crate::download::{
-    download_snack_file_inner, emit_failed_download, open_downloaded_path, reveal_downloaded_path,
-    save_generated_share_image_inner, DownloadSnackFileRequest, DownloadSnackFileResult,
-    SaveGeneratedShareImageRequest,
+    delete_downloaded_path, download_snack_file_inner, emit_failed_download, open_downloaded_path,
+    reveal_downloaded_path, save_generated_share_image_inner, DownloadSnackFileRequest,
+    DownloadSnackFileResult, SaveGeneratedShareImageRequest,
 };
 use crate::logging::{log_dir, log_path, write_app_log};
 use crate::platform::open_path;
@@ -151,6 +151,15 @@ pub(crate) fn reveal_downloaded_file(
     request: DownloadedPathRequest,
 ) -> Result<(), String> {
     reveal_downloaded_path(&app, &window, &request.path)
+}
+
+#[tauri::command]
+pub(crate) fn delete_downloaded_file(
+    app: AppHandle,
+    window: WebviewWindow,
+    request: DownloadedPathRequest,
+) -> Result<(), String> {
+    delete_downloaded_path(&app, &window, &request.path)
 }
 
 fn resolve_desktop_log_info(app: &AppHandle) -> DesktopLogInfo {

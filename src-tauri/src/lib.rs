@@ -50,6 +50,7 @@ pub fn run() {
             bridge::bridge_info,
             bridge::bridge_probe,
             bridge::bridge_update,
+            commands::delete_downloaded_file,
             commands::download_snack_file,
             commands::exit_after_force_update_cancel,
             commands::open_downloaded_file,

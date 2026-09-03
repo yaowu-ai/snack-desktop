@@ -382,6 +382,19 @@ pub(crate) fn reveal_downloaded_path(
     reveal_path(&path)
 }
 
+pub(crate) fn delete_downloaded_path(
+    app: &AppHandle,
+    window: &WebviewWindow,
+    raw_path: &str,
+) -> Result<(), String> {
+    let path = validate_downloaded_path(app, window, raw_path)?;
+    delete_file(&path)
+}
+
+fn delete_file(path: &Path) -> Result<(), String> {
+    std::fs::remove_file(path).map_err(|_| "failed to delete downloaded file".to_string())
+}
+
 fn validate_download_id(download_id: &str) -> Result<(), String> {
     if download_id.trim().is_empty() || download_id.len() > 128 {
         return Err("download id is invalid".to_string());
@@ -413,8 +426,7 @@ fn ensure_supported_file_endpoint(url: &Url) -> Result<(), String> {
 
     let supported = segments.len() == 5
         && segments[0] == "api"
-        && (segments[1] == "snack" || segments[1] == "jxxq")
-        && segments[2] == "files"
+        && is_supported_file_namespace(&segments)
         && segments[3].chars().all(|ch| ch.is_ascii_digit())
         && segments[4] == "content";
 
@@ -423,6 +435,11 @@ fn ensure_supported_file_endpoint(url: &Url) -> Result<(), String> {
     } else {
         Err("download URL path is not supported".to_string())
     }
+}
+
+fn is_supported_file_namespace(segments: &[&str]) -> bool {
+    ((segments[1] == "snack" || segments[1] == "jxxq") && segments[2] == "files")
+        || (segments[1] == "task-hub" && segments[2] == "project-assets")
 }
 
 fn ensure_download_query(url: &mut Url) {
@@ -434,15 +451,47 @@ fn ensure_download_query(url: &mut Url) {
 
 fn read_auth_token_cookie(window: &WebviewWindow, url: Url) -> Result<String, String> {
     let cookies = window
-        .cookies_for_url(url)
+        .cookies_for_url(url.clone())
         .map_err(|_| "failed to read desktop session cookies".to_string())?;
 
+    find_auth_token(cookies)
+        .or_else(|| read_loopback_auth_token_cookie(window, &url))
+        .ok_or_else(|| "desktop session is not authenticated".to_string())
+}
+
+fn find_auth_token(cookies: Vec<tauri::webview::Cookie<'static>>) -> Option<String> {
     cookies
         .into_iter()
         .find(|cookie| cookie.name() == "auth_token")
         .map(|cookie| cookie.value().to_string())
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| "desktop session is not authenticated".to_string())
+}
+
+#[cfg(debug_assertions)]
+fn read_loopback_auth_token_cookie(window: &WebviewWindow, url: &Url) -> Option<String> {
+    let host = url.host_str()?;
+    let ip = host.parse::<std::net::IpAddr>().ok()?;
+    if !ip.is_loopback() {
+        return None;
+    }
+    let cookies = window.cookies().ok()?;
+    find_auth_token(
+        cookies
+            .into_iter()
+            .filter(|cookie| cookie_domain_matches(cookie.domain(), host))
+            .collect(),
+    )
+}
+
+#[cfg(not(debug_assertions))]
+fn read_loopback_auth_token_cookie(_window: &WebviewWindow, _url: &Url) -> Option<String> {
+    None
+}
+
+fn cookie_domain_matches(cookie_domain: Option<&str>, host: &str) -> bool {
+    cookie_domain
+        .map(|domain| domain.trim_start_matches('.') == host)
+        .unwrap_or(false)
 }
 
 fn sanitize_filename(filename: &str) -> Result<String, String> {
@@ -562,8 +611,11 @@ fn set_window_progress(window: &WebviewWindow, total_bytes: Option<u64>, downloa
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_generated_png, sanitize_png_filename, PNG_SIGNATURE};
+    use super::{
+        decode_generated_png, ensure_supported_file_endpoint, sanitize_png_filename, PNG_SIGNATURE,
+    };
     use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
+    use tauri::Url;
 
     #[test]
     fn accepts_generated_png_data() {
@@ -584,5 +636,52 @@ mod tests {
     fn requires_png_filename_after_sanitizing() {
         assert_eq!(sanitize_png_filename("share.PNG").unwrap(), "share.PNG");
         assert!(sanitize_png_filename("share.jpg").is_err());
+    }
+
+    #[test]
+    fn accepts_project_asset_content_endpoint() {
+        let url =
+            Url::parse("https://snack.test/api/task-hub/project-assets/3001/content?download")
+                .unwrap();
+
+        assert!(ensure_supported_file_endpoint(&url).is_ok());
+    }
+
+    #[test]
+    fn rejects_non_numeric_project_asset_endpoint() {
+        let url =
+            Url::parse("https://snack.test/api/task-hub/project-assets/asset-1/content").unwrap();
+
+        assert_eq!(
+            ensure_supported_file_endpoint(&url).unwrap_err(),
+            "download URL path is not supported"
+        );
+    }
+
+    #[test]
+    fn matches_only_the_same_cookie_domain_for_loopback_fallback() {
+        assert!(super::cookie_domain_matches(Some("127.0.0.1"), "127.0.0.1"));
+        assert!(super::cookie_domain_matches(
+            Some(".127.0.0.1"),
+            "127.0.0.1"
+        ));
+        assert!(!super::cookie_domain_matches(
+            Some("localhost"),
+            "127.0.0.1"
+        ));
+        assert!(!super::cookie_domain_matches(None, "127.0.0.1"));
+    }
+
+    #[test]
+    fn deletes_a_downloaded_file() {
+        let directory =
+            std::env::temp_dir().join(format!("snack-download-delete-test-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("report.pdf");
+        std::fs::write(&path, b"download").unwrap();
+
+        assert!(super::delete_file(&path).is_ok());
+        assert!(!path.exists());
+        std::fs::remove_dir(directory).unwrap();
     }
 }
