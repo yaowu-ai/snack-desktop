@@ -110,7 +110,7 @@ pub(crate) async fn download_snack_file_inner(
         .header(USER_AGENT, desktop_user_agent())
         .send()
         .await
-        .map_err(|_| "failed to request file access URL".to_string())?;
+        .map_err(|error| format!("failed to request file access URL: {}", error.without_url()))?;
 
     let response = if first_response.status().is_redirection() {
         let location = first_response
@@ -129,13 +129,18 @@ pub(crate) async fn download_snack_file_inner(
             .header(USER_AGENT, desktop_user_agent())
             .send()
             .await
-            .map_err(|_| "failed to request signed file URL".to_string())?
+            .map_err(|error| {
+                format!("failed to request signed file URL: {}", error.without_url())
+            })?
     } else {
         first_response
     };
 
     if !response.status().is_success() {
-        return Err("file download request failed".to_string());
+        return Err(format!(
+            "file download request failed with status {}",
+            response.status().as_u16()
+        ));
     }
 
     let total_bytes = response.content_length();
