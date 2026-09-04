@@ -113,8 +113,19 @@ pub(crate) async fn download_snack_file(
 ) -> Result<DownloadSnackFileResult, String> {
     let download_id = request.download_id.clone();
     let filename = request.filename.clone();
-    let result = download_snack_file_inner(app, window.clone(), request).await;
+    let result = download_snack_file_inner(app.clone(), window.clone(), request).await;
     if let Err(message) = &result {
+        write_app_log(
+            &app,
+            "error",
+            "download",
+            "Native file download failed",
+            Some(&serde_json::json!({
+                "downloadId": download_id,
+                "filename": filename,
+                "error": message,
+            })),
+        );
         emit_failed_download(&window, download_id, filename, message.clone());
     }
     result
