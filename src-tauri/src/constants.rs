@@ -13,6 +13,8 @@ pub(crate) const TRAY_MENU_QUIT_ID: &str = "quit";
 pub(crate) const NAVIGATION_MENU_BACK_ID: &str = "navigation-back";
 #[cfg(any(target_os = "macos", windows))]
 pub(crate) const NAVIGATION_MENU_ID: &str = "navigation";
+#[cfg(any(target_os = "macos", windows))]
+pub(crate) const VIEW_LOG_MENU_ID: &str = "view-log";
 
 #[cfg(target_os = "macos")]
 pub(crate) const TRAY_DEFAULT_ICON: tauri::image::Image<'_> = include_image!("./icons/white.png");
