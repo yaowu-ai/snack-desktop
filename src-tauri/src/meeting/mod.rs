@@ -32,6 +32,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::LazyLock;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, WebviewWindow};
@@ -602,7 +603,7 @@ pub(crate) fn meeting_install_model(app: AppHandle, window: WebviewWindow) -> Re
 pub(crate) fn meeting_pause_install(app: AppHandle, window: WebviewWindow) -> Result<(), String> {
     require_allowed_window(&window)?;
     let state = app.state::<MeetingManagerState>();
-    install::pause_install(&state.store, &state.manager)?;
+    install::pause_install(&app, &state.store, &state.manager)?;
     emit_state(&app, &state.store);
     Ok(())
 }
@@ -611,7 +612,7 @@ pub(crate) fn meeting_pause_install(app: AppHandle, window: WebviewWindow) -> Re
 pub(crate) fn meeting_resume_install(app: AppHandle, window: WebviewWindow) -> Result<(), String> {
     require_allowed_window(&window)?;
     let state = app.state::<MeetingManagerState>();
-    install::resume_install(&state.store, &state.manager)?;
+    install::resume_install(&app, &state.store, &state.manager)?;
     emit_state(&app, &state.store);
     Ok(())
 }
@@ -620,7 +621,7 @@ pub(crate) fn meeting_resume_install(app: AppHandle, window: WebviewWindow) -> R
 pub(crate) fn meeting_cancel_install(app: AppHandle, window: WebviewWindow) -> Result<(), String> {
     require_allowed_window(&window)?;
     let state = app.state::<MeetingManagerState>();
-    install::cancel_install(&state.store, &state.manager)?;
+    install::cancel_install(&app, &state.store, &state.manager)?;
     emit_state(&app, &state.store);
     Ok(())
 }
@@ -651,7 +652,7 @@ pub(crate) fn meeting_uninstall_model(
     if resource.state != ResourceState::Ready && resource.state != ResourceState::UpdateRequired {
         return Err("当前没有已安装的模型".to_string());
     }
-    let freed = install::uninstall_model(store, &resource)?;
+    let freed = install::uninstall_model(&app, store, &resource)?;
     emit_state(&app, store);
     Ok(serde_json::json!({ "freedBytes": freed }))
 }
@@ -1861,6 +1862,17 @@ pub(crate) fn meeting_set_transcription_paused(
     task.updated_at = now_rfc3339();
     store.save_task_progress(&task)?;
     emit_state(&app, &store);
+    crate::logging::write_app_log(
+        &app,
+        "info",
+        "meeting-transcribe",
+        if paused {
+            "local transcription paused"
+        } else {
+            "local transcription resumed"
+        },
+        Some(&serde_json::json!({ "recordingId": recording_id })),
+    );
     if !paused {
         spawn_transcription(app, store, recording_id);
     }
@@ -1896,6 +1908,13 @@ pub(crate) fn meeting_delete_transcription_task(
     }
     state.store.delete_task_record(&recording_id)?;
     emit_state(&app, &state.store);
+    crate::logging::write_app_log(
+        &app,
+        "info",
+        "meeting-transcribe",
+        "local transcription task removed",
+        Some(&serde_json::json!({ "recordingId": recording_id })),
+    );
     Ok(())
 }
 
@@ -1936,6 +1955,16 @@ pub(crate) fn meeting_retranscribe(
     task.updated_at = now_rfc3339();
     store.save_task_progress(&task)?;
     emit_state(&app, &store);
+    crate::logging::write_app_log(
+        &app,
+        "info",
+        "meeting-transcribe",
+        "local retranscription requested",
+        Some(&serde_json::json!({
+            "recordingId": recording_id,
+            "audioDurationMs": duration_ms,
+        })),
+    );
     spawn_transcription(app, store, recording_id);
     Ok(())
 }
@@ -1945,7 +1974,15 @@ pub(crate) fn meeting_retranscribe(
 // ---------------------------------------------------------------------------
 
 fn spawn_transcription(app: AppHandle, store: MeetingStore, recording_id: String) {
+    let queued_at = Instant::now();
     if !register_transcription(&recording_id) {
+        crate::logging::write_app_log(
+            &app,
+            "info",
+            "meeting-transcribe",
+            "local transcription restart queued behind active worker",
+            Some(&serde_json::json!({ "recordingId": recording_id })),
+        );
         return;
     }
     let failure_app = app.clone();
@@ -1962,12 +1999,32 @@ fn spawn_transcription(app: AppHandle, store: MeetingStore, recording_id: String
             let _gate = TRANSCRIPTION_GATE
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if !store
-                .load_task_record(&recording_id)
-                .is_some_and(|task| task.state == TaskState::TranscribingLocal)
-            {
+            let task_state = store.load_task_record(&recording_id).map(|task| task.state);
+            if task_state != Some(TaskState::TranscribingLocal) {
+                crate::logging::write_app_log(
+                    &app,
+                    "info",
+                    "meeting-transcribe",
+                    "local transcription skipped because task state changed",
+                    Some(&serde_json::json!({
+                        "recordingId": recording_id,
+                        "taskState": task_state.map(|state| format!("{state:?}")),
+                        "queueWaitMs": elapsed_millis(queued_at),
+                    })),
+                );
                 return;
             }
+            let started_at = Instant::now();
+            crate::logging::write_app_log(
+                &app,
+                "info",
+                "meeting-transcribe",
+                "local transcription started",
+                Some(&serde_json::json!({
+                    "recordingId": recording_id,
+                    "queueWaitMs": elapsed_millis(queued_at),
+                })),
+            );
             let resource = store.load_resource();
             let model_key = match resource
                 .model_key
@@ -1981,6 +2038,8 @@ fn spawn_transcription(app: AppHandle, store: MeetingStore, recording_id: String
                         &store,
                         &recording_id,
                         "本地模型未安装".to_string(),
+                        "resolve_model",
+                        Some(started_at),
                     );
                     return;
                 }
@@ -1988,7 +2047,14 @@ fn spawn_transcription(app: AppHandle, store: MeetingStore, recording_id: String
             let model_path = match install::installed_model_path(&store, &resource) {
                 Ok(path) => path,
                 Err(message) => {
-                    fail_transcription_task(&app, &store, &recording_id, message);
+                    fail_transcription_task(
+                        &app,
+                        &store,
+                        &recording_id,
+                        message,
+                        "validate_model",
+                        Some(started_at),
+                    );
                     return;
                 }
             };
@@ -1998,6 +2064,8 @@ fn spawn_transcription(app: AppHandle, store: MeetingStore, recording_id: String
                     &store,
                     &recording_id,
                     "本地模型路径无效".to_string(),
+                    "resolve_model",
+                    Some(started_at),
                 );
                 return;
             };
@@ -2007,18 +2075,49 @@ fn spawn_transcription(app: AppHandle, store: MeetingStore, recording_id: String
             };
             if let Err(message) = store.ensure_transcript_output_directory(&task) {
                 let message = format!("无法创建当天转写目录: {message}");
-                fail_transcription_task(&app, &store, &recording_id, message);
+                fail_transcription_task(
+                    &app,
+                    &store,
+                    &recording_id,
+                    message,
+                    "prepare_output",
+                    Some(started_at),
+                );
                 return;
             }
             let wav_path = match prepare_transcription_audio(&store, &mut task) {
                 Ok(path) => path,
                 Err(message) => {
-                    fail_transcription_task(&app, &store, &recording_id, message);
+                    fail_transcription_task(
+                        &app,
+                        &store,
+                        &recording_id,
+                        message,
+                        "prepare_audio",
+                        Some(started_at),
+                    );
                     return;
                 }
             };
             let language = task.language.clone();
+            let audio_duration_ms = task.duration_ms;
+            let audio_bytes = task
+                .audio_bytes
+                .or_else(|| fs::metadata(&wav_path).ok().map(|metadata| metadata.len()));
             drop(task);
+
+            crate::logging::write_app_log(
+                &app,
+                "info",
+                "meeting-transcribe",
+                "local transcription inference started",
+                Some(&serde_json::json!({
+                    "recordingId": recording_id,
+                    "modelKey": model_key.as_str(),
+                    "audioDurationMs": audio_duration_ms,
+                    "audioBytes": audio_bytes,
+                })),
+            );
 
             let app_for_progress = app.clone();
             let store_for_progress = store.clone_for_task();
@@ -2060,25 +2159,38 @@ fn spawn_transcription(app: AppHandle, store: MeetingStore, recording_id: String
                 },
             );
 
-            let transcript = match outcome {
+            let (transcript, segment_count) = match outcome {
                 Ok(transcribe::TranscriptionOutcome::NoAudioDetected) => {
-                    finish_without_audio(&app, &store, &recording_id);
+                    finish_without_audio(&app, &store, &recording_id, started_at);
                     return;
                 }
                 Ok(transcribe::TranscriptionOutcome::Detected {
                     segments,
                     text,
                     language,
-                }) => Transcript {
-                    text,
-                    language,
-                    segments,
-                    model_key: model_key.as_str().to_string(),
-                    engine: format!("FunASR ModelScope {}", env!("CARGO_PKG_VERSION")),
-                    generated_at: now_rfc3339(),
-                },
+                }) => {
+                    let segment_count = segments.len();
+                    (
+                        Transcript {
+                            text,
+                            language,
+                            segments,
+                            model_key: model_key.as_str().to_string(),
+                            engine: format!("FunASR ModelScope {}", env!("CARGO_PKG_VERSION")),
+                            generated_at: now_rfc3339(),
+                        },
+                        segment_count,
+                    )
+                }
                 Err(message) => {
-                    fail_transcription_task(&app, &store, &recording_id, message);
+                    fail_transcription_task(
+                        &app,
+                        &store,
+                        &recording_id,
+                        message,
+                        "inference",
+                        Some(started_at),
+                    );
                     return;
                 }
             };
@@ -2095,6 +2207,13 @@ fn spawn_transcription(app: AppHandle, store: MeetingStore, recording_id: String
                 let _ = store.save_task_progress(&task);
                 emit_state(&app, &store);
                 notifications::notify_transcript_failed(&app, &recording_id);
+                log_transcription_failure(
+                    &app,
+                    &recording_id,
+                    "persist_transcript",
+                    &message,
+                    Some(started_at),
+                );
                 return;
             }
             task.state = TaskState::TranscriptReady;
@@ -2106,8 +2225,30 @@ fn spawn_transcription(app: AppHandle, store: MeetingStore, recording_id: String
             }
             task.error = None;
             task.updated_at = now_rfc3339();
-            let _ = store.save_task_progress(&task);
+            let saved = store.save_task_progress(&task);
             emit_state(&app, &store);
+            match saved {
+                Ok(()) => crate::logging::write_app_log(
+                    &app,
+                    "info",
+                    "meeting-transcribe",
+                    "local transcription completed",
+                    Some(&serde_json::json!({
+                        "recordingId": recording_id,
+                        "modelKey": model_key.as_str(),
+                        "audioDurationMs": task.duration_ms,
+                        "segmentCount": segment_count,
+                        "elapsedMs": elapsed_millis(started_at),
+                    })),
+                ),
+                Err(message) => log_transcription_failure(
+                    &app,
+                    &recording_id,
+                    "save_completion",
+                    &message,
+                    Some(started_at),
+                ),
+            };
             handoff_completed_transcript(&app, &recording_id);
         })
     {
@@ -2124,6 +2265,8 @@ fn spawn_transcription(app: AppHandle, store: MeetingStore, recording_id: String
             &failure_store,
             &failure_recording_id,
             format!("无法启动本地转写线程: {error}"),
+            "spawn_thread",
+            None,
         );
     }
 }
@@ -2133,6 +2276,8 @@ fn fail_transcription_task(
     store: &MeetingStore,
     recording_id: &str,
     message: String,
+    stage: &str,
+    started_at: Option<Instant>,
 ) {
     let Some(mut task) = store.load_task_record(recording_id) else {
         return;
@@ -2145,13 +2290,32 @@ fn fail_transcription_task(
     let _ = store.save_task_progress(&task);
     emit_state(app, store);
     notifications::notify_transcript_failed(app, recording_id);
+    log_transcription_failure(app, recording_id, stage, &message, started_at);
+}
+
+fn log_transcription_failure(
+    app: &AppHandle,
+    recording_id: &str,
+    stage: &str,
+    message: &str,
+    started_at: Option<Instant>,
+) {
     crate::logging::write_app_log(
         app,
         "error",
         "meeting-transcribe",
         "local transcription failed",
-        Some(&serde_json::json!({ "recordingId": recording_id, "reason": message })),
+        Some(&serde_json::json!({
+            "recordingId": recording_id,
+            "stage": stage,
+            "elapsedMs": started_at.map(elapsed_millis),
+            "reason": message,
+        })),
     );
+}
+
+fn elapsed_millis(started_at: Instant) -> u64 {
+    started_at.elapsed().as_millis().min(u64::MAX as u128) as u64
 }
 
 fn register_transcription(recording_id: &str) -> bool {
@@ -2277,7 +2441,12 @@ fn available_recovered_wav_path(source: &std::path::Path, recording_id: &str) ->
     source.with_file_name(format!("{recording_id}-recovered-{}.wav", unix_millis()))
 }
 
-fn finish_without_audio(app: &AppHandle, store: &MeetingStore, recording_id: &str) {
+fn finish_without_audio(
+    app: &AppHandle,
+    store: &MeetingStore,
+    recording_id: &str,
+    started_at: Instant,
+) {
     let Some(mut task) = store.load_task_record(recording_id) else {
         return;
     };
@@ -2302,7 +2471,10 @@ fn finish_without_audio(app: &AppHandle, store: &MeetingStore, recording_id: &st
         "info",
         "meeting-transcribe",
         "no audio detected; transcription notification skipped",
-        Some(&serde_json::json!({ "recordingId": recording_id })),
+        Some(&serde_json::json!({
+            "recordingId": recording_id,
+            "elapsedMs": elapsed_millis(started_at),
+        })),
     );
 }
 

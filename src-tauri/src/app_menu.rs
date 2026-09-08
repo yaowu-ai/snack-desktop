@@ -4,6 +4,8 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 #[cfg(windows)]
 use std::time::Duration;
+#[cfg(any(target_os = "macos", windows))]
+use std::{fs::OpenOptions, path::Path};
 
 use tauri::{AppHandle, Manager, WebviewWindow};
 
@@ -14,7 +16,7 @@ use crate::constants::TRAY_ATTENTION_ICON;
 #[cfg(any(target_os = "macos", windows))]
 use crate::constants::{
     ABOUT_ICON, NAVIGATION_MENU_BACK_ID, NAVIGATION_MENU_ID, TRAY_DEFAULT_ICON, TRAY_ID,
-    TRAY_MENU_MEETING_ID, TRAY_MENU_QUIT_ID, TRAY_MENU_SHOW_ID,
+    TRAY_MENU_MEETING_ID, TRAY_MENU_QUIT_ID, TRAY_MENU_SHOW_ID, VIEW_LOG_MENU_ID,
 };
 #[cfg(any(target_os = "macos", windows))]
 use crate::navigation::navigate_back;
@@ -44,6 +46,7 @@ pub(crate) fn setup_navigation_menu(app: &mut tauri::App) -> tauri::Result<()> {
         Some(menu) => menu,
         None => default_app_menu(app)?,
     };
+    append_view_log_menu_item(app, &menu)?;
     let selected_site = app
         .config()
         .app
@@ -113,7 +116,7 @@ fn about_metadata(app: &tauri::App) -> tauri::menu::AboutMetadata<'static> {
 
 #[cfg(any(target_os = "macos", windows))]
 fn default_app_menu(app: &tauri::App) -> tauri::Result<tauri::menu::Menu<tauri::Wry>> {
-    use tauri::menu::{Menu, PredefinedMenuItem, Submenu};
+    use tauri::menu::{Menu, PredefinedMenuItem, Submenu, HELP_SUBMENU_ID};
 
     let package_name = app.package_info().name.clone();
 
@@ -133,7 +136,7 @@ fn default_app_menu(app: &tauri::App) -> tauri::Result<tauri::menu::Menu<tauri::
 
     let help_menu = Submenu::with_id_and_items(
         app,
-        "Help",
+        HELP_SUBMENU_ID,
         "Help",
         true,
         &[
@@ -196,6 +199,31 @@ fn default_app_menu(app: &tauri::App) -> tauri::Result<tauri::menu::Menu<tauri::
             &help_menu,
         ],
     )
+}
+
+#[cfg(any(target_os = "macos", windows))]
+fn append_view_log_menu_item(
+    app: &tauri::App,
+    menu: &tauri::menu::Menu<tauri::Wry>,
+) -> tauri::Result<()> {
+    use tauri::menu::{MenuItem, PredefinedMenuItem, Submenu, HELP_SUBMENU_ID};
+
+    let view_log = MenuItem::with_id(app, VIEW_LOG_MENU_ID, "查看日志", true, None::<&str>)?;
+    if let Some(help) = menu
+        .get(HELP_SUBMENU_ID)
+        .and_then(|item| item.as_submenu().cloned())
+    {
+        if help.items()?.is_empty() {
+            help.append(&view_log)?;
+        } else {
+            let separator = PredefinedMenuItem::separator(app)?;
+            help.prepend_items(&[&view_log, &separator])?;
+        }
+        return Ok(());
+    }
+
+    let help = Submenu::with_id_and_items(app, HELP_SUBMENU_ID, "Help", true, &[&view_log])?;
+    menu.append(&help)
 }
 
 #[cfg(windows)]
@@ -313,6 +341,7 @@ fn register_status_menu_events(app: &mut tauri::App) {
         }
         TRAY_MENU_SHOW_ID => show_main_window(app),
         TRAY_MENU_MEETING_ID => crate::meeting::quick_access::request_quick_recording(app),
+        VIEW_LOG_MENU_ID => reveal_latest_log(app),
         TRAY_MENU_QUIT_ID => app.exit(0),
         id => {
             if let Some(site) = crate::site::SiteKey::from_menu_id(id) {
@@ -320,6 +349,44 @@ fn register_status_menu_events(app: &mut tauri::App) {
             }
         }
     });
+}
+
+#[cfg(any(target_os = "macos", windows))]
+fn reveal_latest_log(app: &AppHandle) {
+    let path = crate::logging::log_path(app);
+    if let Err(error) = ensure_log_file(&path).and_then(|_| crate::platform::reveal_path(&path)) {
+        crate::logging::write_app_log(
+            app,
+            "warn",
+            "app-menu",
+            "desktop log could not be revealed",
+            Some(&serde_json::json!({ "reason": error })),
+        );
+        show_site_switch_message("无法查看日志", "请稍后重试");
+        return;
+    }
+    crate::logging::write_app_log(
+        app,
+        "info",
+        "app-menu",
+        "desktop log revealed in system file manager",
+        None,
+    );
+}
+
+#[cfg(any(target_os = "macos", windows))]
+fn ensure_log_file(path: &Path) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| "desktop log directory is unavailable".to_string())?;
+    std::fs::create_dir_all(parent)
+        .map_err(|_| "failed to create desktop log directory".to_string())?;
+    OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|_| "failed to create desktop log file".to_string())?;
+    Ok(())
 }
 
 #[cfg(any(target_os = "macos", windows))]
@@ -520,7 +587,7 @@ pub(crate) fn setup_macos_status_menu(app: &mut tauri::App) -> tauri::Result<()>
 #[cfg(target_os = "macos")]
 mod tests {
     use super::{
-        should_show_window_on_reopen, site_switch_confirmation_description,
+        ensure_log_file, should_show_window_on_reopen, site_switch_confirmation_description,
         site_switch_confirmation_title,
     };
     use crate::site::SiteKey;
@@ -549,5 +616,17 @@ mod tests {
             site_switch_confirmation_description(),
             "目标站点未登录时需要登录，当前页面未保存的内容可能丢失。"
         );
+    }
+
+    #[test]
+    fn view_log_prepares_a_missing_log_file_for_finder() {
+        let directory =
+            std::env::temp_dir().join(format!("snack-view-log-test-{}", std::process::id()));
+        let path = directory.join("nested").join("desktop.log");
+
+        ensure_log_file(&path).unwrap();
+
+        assert!(path.is_file());
+        std::fs::remove_dir_all(directory).unwrap();
     }
 }

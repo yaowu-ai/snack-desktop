@@ -159,6 +159,18 @@ pub(crate) fn start_install(
     if !resource.state.is_idle() {
         return Err("当前已有模型安装任务在进行中".to_string());
     }
+    let reinstall = resource.state == ResourceState::Ready;
+    log_install(
+        &app,
+        "info",
+        "model installation requested",
+        serde_json::json!({
+            "modelKey": model.key.as_str(),
+            "modelBytes": model.size_bytes,
+            "requiredBytes": model.install_requirement_bytes(),
+            "reinstall": reinstall,
+        }),
+    );
     if resource.state == ResourceState::Ready {
         // Reinstall (e.g. user confirmed an update): remove the old copy first.
         let freed = uninstall_model_files(&store, &resource)?;
@@ -196,6 +208,7 @@ pub(crate) fn start_install(
     let store_for_task = store.clone_for_task();
     let manager_for_task = Arc::clone(&manager);
     let model_for_task = model.clone();
+    let started_at = Instant::now();
     tauri::async_runtime::spawn(async move {
         let result = run_install_pipeline(
             app_for_task.clone(),
@@ -210,13 +223,18 @@ pub(crate) fn start_install(
         manager_for_task.unregister();
         match result {
             Ok(()) => {
+                let resource = store_for_task.load_resource();
                 log_install(
                     &app_for_task,
                     "info",
                     "model installed",
-                    serde_json::json!({}),
+                    serde_json::json!({
+                        "modelKey": model_for_task.key.as_str(),
+                        "elapsedMs": elapsed_millis(started_at),
+                        "installedBytes": resource.installed_size_bytes,
+                    }),
                 );
-                let mut resource = store_for_task.load_resource();
+                let mut resource = resource;
                 if resource.state != ResourceState::Ready {
                     resource = resource.with_state(ResourceState::Ready);
                     resource.error = None;
@@ -226,11 +244,21 @@ pub(crate) fn start_install(
                 crate::meeting::notifications::notify_model_ready(&app_for_task);
             }
             Err((state, message)) => {
+                let cancelled = state == ResourceState::NotInstalled;
                 log_install(
                     &app_for_task,
-                    "error",
-                    "model install failed",
-                    serde_json::json!({ "message": message }),
+                    if cancelled { "info" } else { "error" },
+                    if cancelled {
+                        "model installation cancelled"
+                    } else {
+                        "model installation failed"
+                    },
+                    serde_json::json!({
+                        "modelKey": model_for_task.key.as_str(),
+                        "elapsedMs": elapsed_millis(started_at),
+                        "terminalState": state,
+                        "reason": message,
+                    }),
                 );
                 let mut resource = store_for_task.load_resource();
                 resource = resource.with_state(state);
@@ -254,6 +282,7 @@ async fn run_install_pipeline(
     cancel: Arc<AtomicBool>,
     progress: Arc<Mutex<DownloadProgress>>,
 ) -> Result<(), (ResourceState, String)> {
+    log_install_stage(&app, &model, "checking_disk", 0);
     // This is deliberately a separate path from the legacy artifact downloader:
     // ModelScope repositories are snapshots, not stable individual file URLs.
     // The SDK owns resume and integrity verification for every repository file.
@@ -280,6 +309,7 @@ async fn run_install_pipeline(
     }
 
     // 2. Download every file in the native model bundle (resumable).
+    log_install_stage(&app, &model, "downloading_model", 0);
     set_resource(&store, ResourceState::Downloading, None);
     let mut downloaded_before = 0u64;
     let mut part_paths = Vec::with_capacity(model.artifacts.len());
@@ -328,6 +358,7 @@ async fn run_install_pipeline(
     }
 
     // 3. Integrity verification.
+    log_install_stage(&app, &model, "verifying_model", 90);
     set_resource(&store, ResourceState::Verifying, None);
     for (artifact, part_path) in model.artifacts.iter().zip(&part_paths) {
         let digest = sha256_file(part_path)
@@ -345,6 +376,7 @@ async fn run_install_pipeline(
     }
 
     // 4. Install the private Snack-owned bundle + write manifest.
+    log_install_stage(&app, &model, "installing_model", 95);
     set_resource(&store, ResourceState::Installing, None);
     let model_dir = store.models_dir().join(model.key.as_str());
     fs::create_dir_all(&model_dir)
@@ -376,6 +408,7 @@ async fn run_install_pipeline(
         .map_err(|error| (ResourceState::Failed, format!("无法写入模型清单: {error}")))?;
 
     // 5. Runtime + inference self-check.
+    log_install_stage(&app, &model, "validating_model", 99);
     set_resource(&store, ResourceState::Validating, None);
     crate::meeting::transcribe::validate_model(model.key, &model_dir)
         .map_err(|error| (ResourceState::Failed, format!("推理自检失败: {error}")))?;
@@ -643,14 +676,18 @@ fn publish_install_stage(
     stage: &'static str,
     percent: u8,
 ) {
-    let update = {
+    let (update, stage_changed) = {
         let mut progress = context.progress.lock().expect("progress poisoned");
+        let stage_changed = progress.stage.as_deref() != Some(stage);
         progress.stage = Some(stage.to_string());
         progress.percent = percent;
         progress.speed_bytes_per_sec = 0;
         progress.remaining_seconds = None;
-        progress.clone()
+        (progress.clone(), stage_changed)
     };
+    if stage_changed {
+        log_install_stage(&context.app, &context.model, stage, percent);
+    }
     save_install_progress(context, state, &update);
     emit_install_progress(&context.app, &update);
     crate::meeting::emit_state(&context.app, &context.store);
@@ -859,16 +896,30 @@ async fn wait_while_paused(pause: &AtomicBool, cancel: &AtomicBool) -> Result<()
 // Pause / resume / cancel / uninstall
 // ---------------------------------------------------------------------------
 
-pub(crate) fn pause_install(store: &MeetingStore, manager: &InstallManager) -> Result<(), String> {
+pub(crate) fn pause_install(
+    app: &AppHandle,
+    store: &MeetingStore,
+    manager: &InstallManager,
+) -> Result<(), String> {
     let control = manager
         .control()
         .ok_or_else(|| "当前没有进行中的下载".to_string())?;
     control.pause.store(true, Ordering::SeqCst);
     set_resource(store, ResourceState::Paused, None);
+    log_install(
+        app,
+        "info",
+        "model installation paused",
+        model_key_details(store),
+    );
     Ok(())
 }
 
-pub(crate) fn resume_install(store: &MeetingStore, manager: &InstallManager) -> Result<(), String> {
+pub(crate) fn resume_install(
+    app: &AppHandle,
+    store: &MeetingStore,
+    manager: &InstallManager,
+) -> Result<(), String> {
     let control = manager
         .control()
         .ok_or_else(|| "当前没有暂停的下载".to_string())?;
@@ -876,25 +927,43 @@ pub(crate) fn resume_install(store: &MeetingStore, manager: &InstallManager) -> 
     if store.load_resource().state == ResourceState::Paused {
         set_resource(store, ResourceState::Downloading, None);
     }
+    log_install(
+        app,
+        "info",
+        "model installation resumed",
+        model_key_details(store),
+    );
     Ok(())
 }
 
-pub(crate) fn cancel_install(store: &MeetingStore, manager: &InstallManager) -> Result<(), String> {
+pub(crate) fn cancel_install(
+    app: &AppHandle,
+    store: &MeetingStore,
+    manager: &InstallManager,
+) -> Result<(), String> {
     let control = manager
         .control()
         .ok_or_else(|| "当前没有进行中的下载".to_string())?;
     control.cancel.store(true, Ordering::SeqCst);
     control.pause.store(false, Ordering::SeqCst);
     set_resource(store, ResourceState::NotInstalled, None);
+    log_install(
+        app,
+        "info",
+        "model installation cancellation requested",
+        model_key_details(store),
+    );
     Ok(())
 }
 
 /// Uninstall the installed model. Returns the freed bytes. Blocked while a
 /// meeting task is recording or transcribing.
 pub(crate) fn uninstall_model(
+    app: &AppHandle,
     store: &MeetingStore,
     resource: &ResourceStatus,
 ) -> Result<u64, String> {
+    let model_key = resource.model_key.clone();
     let freed = uninstall_model_files(store, resource)?;
     let mut updated = store.load_resource();
     updated = updated.with_state(ResourceState::NotInstalled);
@@ -904,6 +973,12 @@ pub(crate) fn uninstall_model(
     updated.download = None;
     updated.error = None;
     store.save_resource(&updated)?;
+    log_install(
+        app,
+        "info",
+        "model uninstalled",
+        serde_json::json!({ "modelKey": model_key, "freedBytes": freed }),
+    );
     Ok(freed)
 }
 
@@ -1113,6 +1188,27 @@ fn log_install(app: &AppHandle, level: &str, message: &str, details: serde_json:
             "details": details,
         })),
     );
+}
+
+fn log_install_stage(app: &AppHandle, model: &CatalogModel, stage: &str, percent: u8) {
+    log_install(
+        app,
+        "info",
+        "model installation stage changed",
+        serde_json::json!({
+            "modelKey": model.key.as_str(),
+            "stage": stage,
+            "percent": percent,
+        }),
+    );
+}
+
+fn model_key_details(store: &MeetingStore) -> serde_json::Value {
+    serde_json::json!({ "modelKey": store.load_resource().model_key })
+}
+
+fn elapsed_millis(started_at: Instant) -> u64 {
+    started_at.elapsed().as_millis().min(u64::MAX as u128) as u64
 }
 
 /// Estimated free disk space at the meeting data root.
