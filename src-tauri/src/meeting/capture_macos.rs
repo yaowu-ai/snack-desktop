@@ -22,8 +22,9 @@ use screencapturekit::prelude::{
 
 use crate::meeting::audio::WavWriter;
 use crate::meeting::capture::{
-    downmix_f32, mix_chunks, pcm_bytes_to_f32_mono, prepare_audio_output, resample_to_target,
-    write_mixed_samples, CaptureError, CaptureShared, Recorder, CAPTURE_CHUNK_SAMPLES,
+    downmix_f32, mix_timeline_chunk, pcm_bytes_to_f32_mono, prepare_audio_output,
+    resample_to_target, write_mixed_samples, CaptureError, CaptureShared, Recorder,
+    CAPTURE_CHUNK_SAMPLES,
 };
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
@@ -68,6 +69,9 @@ pub(crate) fn start_macos_capture(
                 prepare_audio_output(&audio_for_thread)?;
                 Ok((mic_stream, sc_stream))
             })();
+            if start_result.is_ok() {
+                shared_for_thread.reset_elapsed_timer();
+            }
             let _ = started_tx.send(start_result.as_ref().map(|_| ()).map_err(|error| error.clone()));
             match start_result {
                 Ok((_mic_stream, _sc_stream)) => {
@@ -98,7 +102,6 @@ pub(crate) fn start_macos_capture(
             return Err(CaptureError::start_failed("录音启动超时"));
         }
     }
-
     Ok(Recorder {
         shared,
         session: Some(session),
@@ -330,23 +333,6 @@ fn run_writer(
     let mut mic_buffer: Vec<f32> = Vec::new();
     let mut sys_buffer: Vec<f32> = Vec::new();
 
-    let drain_and_mix =
-        |mic_buffer: &mut Vec<f32>, sys_buffer: &mut Vec<f32>, writer: &mut WavWriter| -> bool {
-            while mic_buffer.len() >= CAPTURE_CHUNK_SAMPLES
-                || sys_buffer.len() >= CAPTURE_CHUNK_SAMPLES
-            {
-                let mic_take = mic_buffer.len().min(CAPTURE_CHUNK_SAMPLES);
-                let mic: Vec<f32> = mic_buffer.drain(..mic_take).collect();
-                let sys_take = sys_buffer.len().min(CAPTURE_CHUNK_SAMPLES);
-                let sys: Vec<f32> = sys_buffer.drain(..sys_take).collect();
-                let mixed = mix_chunks(&mic, &sys);
-                if write_mixed_samples(shared, writer, &mixed).is_err() {
-                    return false;
-                }
-            }
-            true
-        };
-
     while !shared.should_stop() {
         if shared.take_discard_pending() {
             mic_buffer.clear();
@@ -358,22 +344,21 @@ fn run_writer(
             mic_buffer.clear();
             sys_buffer.clear();
         }
-        let mut drained_any = false;
         while let Ok(chunk) = mic_rx.try_recv() {
             mic_buffer.extend_from_slice(&chunk);
-            drained_any = true;
         }
         while let Ok(chunk) = sys_rx.try_recv() {
             sys_buffer.extend_from_slice(&chunk);
-            drained_any = true;
         }
-        if !drained_any {
-            thread::sleep(Duration::from_millis(5));
-            continue;
+        // Keep one chunk of latency so asynchronous mic/system callbacks for
+        // the same time window can arrive before it is mixed.
+        while !shared.is_paused() && shared.samples_due() >= (CAPTURE_CHUNK_SAMPLES * 2) as u64 {
+            let mixed = mix_timeline_chunk(&mut mic_buffer, &mut sys_buffer, CAPTURE_CHUNK_SAMPLES);
+            if write_mixed_samples(shared, &mut writer, &mixed).is_err() {
+                return;
+            }
         }
-        if !drain_and_mix(&mut mic_buffer, &mut sys_buffer, &mut writer) {
-            return;
-        }
+        thread::sleep(Duration::from_millis(5));
     }
 
     // Drain any remaining samples after stop.
@@ -383,12 +368,9 @@ fn run_writer(
     while let Ok(chunk) = sys_rx.try_recv() {
         sys_buffer.extend_from_slice(&chunk);
     }
-    while mic_buffer.len() >= 1 || sys_buffer.len() >= 1 {
-        let mic_take = mic_buffer.len().min(CAPTURE_CHUNK_SAMPLES);
-        let mic: Vec<f32> = mic_buffer.drain(..mic_take).collect();
-        let sys_take = sys_buffer.len().min(CAPTURE_CHUNK_SAMPLES);
-        let sys: Vec<f32> = sys_buffer.drain(..sys_take).collect();
-        let mixed = mix_chunks(&mic, &sys);
+    while !shared.is_paused() && shared.samples_due() > 0 {
+        let sample_count = shared.samples_due().min(CAPTURE_CHUNK_SAMPLES as u64) as usize;
+        let mixed = mix_timeline_chunk(&mut mic_buffer, &mut sys_buffer, sample_count);
         if write_mixed_samples(shared, &mut writer, &mixed).is_err() {
             break;
         }

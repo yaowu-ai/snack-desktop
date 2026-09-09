@@ -20,7 +20,6 @@ const STATE_FILE_NAME: &str = "window-state.json";
 const STATE_VERSION: u8 = 2;
 const WRITE_DEBOUNCE: Duration = Duration::from_millis(300);
 const MONITOR_DETECTION_TIMEOUT: Duration = Duration::from_millis(150);
-const DEFAULT_WINDOW_MARGIN: u32 = 48;
 const MIN_WIDTH: u32 = 960;
 const MIN_HEIGHT: u32 = 640;
 const MAX_DIMENSION: u32 = 32_768;
@@ -66,7 +65,6 @@ struct WorkArea {
 
 #[derive(Debug)]
 struct MonitorSnapshot {
-    work_areas: Vec<WorkArea>,
     primary: Option<WorkArea>,
 }
 
@@ -91,31 +89,6 @@ enum PersistSignal {
 pub(crate) fn restore_track_and_show(app: &AppHandle, window: &WebviewWindow) {
     let path = state_path(app);
 
-    let saved_state = match load(&path) {
-        Ok(Some(saved)) if saved.version == STATE_VERSION => Some(saved),
-        Ok(Some(_)) => {
-            logging::write_app_log(
-                app,
-                "warn",
-                "window-state",
-                "Ignoring unsupported window state version",
-                None,
-            );
-            None
-        }
-        Ok(None) => None,
-        Err(error) => {
-            logging::write_app_log(
-                app,
-                "warn",
-                "window-state",
-                "Ignoring invalid saved window state",
-                Some(&serde_json::json!({ "error": error })),
-            );
-            None
-        }
-    };
-
     let worker_app = app.clone();
     let worker_window = window.clone();
     let detection_window = window.clone();
@@ -126,7 +99,7 @@ pub(crate) fn restore_track_and_show(app: &AppHandle, window: &WebviewWindow) {
     thread::spawn(move || {
         match detection_receiver.recv_timeout(MONITOR_DETECTION_TIMEOUT) {
             Ok(Ok(snapshot)) => {
-                apply_initial_bounds(&worker_app, &worker_window, saved_state, snapshot);
+                apply_initial_bounds(&worker_app, &worker_window, snapshot);
             }
             Err(RecvTimeoutError::Timeout) => logging::write_app_log(
                 &worker_app,
@@ -187,53 +160,35 @@ pub(crate) fn recover_if_unreachable(window: &WebviewWindow) {
     let _ = window.set_position(PhysicalPosition::new(recovered.x, recovered.y));
 }
 
-fn apply_initial_bounds(
-    app: &AppHandle,
-    window: &WebviewWindow,
-    saved: Option<PersistedWindowState>,
-    snapshot: MonitorSnapshot,
-) {
-    let bounds = match saved {
-        Some(saved) => {
-            let Some(bounds) = restored_bounds(&saved, &snapshot.work_areas, snapshot.primary)
-            else {
-                logging::write_app_log(
-                    app,
-                    "warn",
-                    "window-state",
-                    "Ignoring implausible saved window bounds",
-                    Some(&serde_json::json!({
-                        "bounds": saved.bounds,
-                        "scaleFactor": saved.scale_factor,
-                    })),
-                );
-                return apply_default_bounds(window, snapshot);
-            };
-            bounds
-        }
-        None => return apply_default_bounds(window, snapshot),
+fn apply_initial_bounds(app: &AppHandle, window: &WebviewWindow, snapshot: MonitorSnapshot) {
+    let Some(primary) = snapshot.primary else {
+        logging::write_app_log(
+            app,
+            "warn",
+            "window-state",
+            "No primary monitor found; keeping configured window bounds",
+            None,
+        );
+        return;
     };
 
-    set_bounds(app, window, bounds, "restore");
+    set_bounds(app, window, screen_bounds(primary), "startup-screen");
 }
 
 fn detect_monitors(window: &WebviewWindow) -> tauri::Result<MonitorSnapshot> {
-    let monitors = window.available_monitors()?;
     let primary = window.primary_monitor()?;
     Ok(MonitorSnapshot {
-        work_areas: monitors.iter().map(WorkArea::from).collect(),
         primary: primary.as_ref().map(WorkArea::from),
     })
 }
 
-fn apply_default_bounds(window: &WebviewWindow, snapshot: MonitorSnapshot) {
-    let (Ok(size), Some(primary)) = (window.inner_size(), snapshot.primary) else {
-        return;
-    };
-    let margin = (f64::from(DEFAULT_WINDOW_MARGIN) * primary.scale_factor).round() as u32;
-    let bounds = default_bounds(size, primary, margin);
-    let _ = window.set_size(PhysicalSize::new(bounds.width, bounds.height));
-    let _ = window.set_position(PhysicalPosition::new(bounds.x, bounds.y));
+fn screen_bounds(area: WorkArea) -> WindowBounds {
+    WindowBounds {
+        x: area.x,
+        y: area.y,
+        width: area.width,
+        height: area.height,
+    }
 }
 
 fn set_bounds(app: &AppHandle, window: &WebviewWindow, bounds: WindowBounds, action: &str) {
@@ -384,6 +339,7 @@ fn state_path(app: &AppHandle) -> PathBuf {
         .join(STATE_FILE_NAME)
 }
 
+#[cfg(test)]
 fn load(path: &Path) -> Result<Option<PersistedWindowState>, String> {
     match fs::read(path) {
         Ok(bytes) => serde_json::from_slice(&bytes)
@@ -403,6 +359,7 @@ fn persist(path: &Path, state: &PersistedWindowState) -> Result<(), String> {
     fs::write(path, bytes).map_err(|error| error.to_string())
 }
 
+#[cfg(test)]
 fn safe_restored_bounds(
     saved: WindowBounds,
     work_areas: &[WorkArea],
@@ -422,6 +379,7 @@ fn safe_restored_bounds(
     primary.map(|area| centered_bounds(saved, area))
 }
 
+#[cfg(test)]
 fn restored_bounds(
     saved: &PersistedWindowState,
     work_areas: &[WorkArea],
@@ -439,6 +397,7 @@ fn restored_bounds(
     safe_restored_bounds(bounds, work_areas, primary)
 }
 
+#[cfg(test)]
 fn rescale_size(
     mut bounds: WindowBounds,
     saved_scale_factor: f64,
@@ -484,6 +443,7 @@ fn title_bar_intersection(bounds: WindowBounds, area: WorkArea) -> (i64, i64) {
     (width, height)
 }
 
+#[cfg(test)]
 fn fit_oversized_window(mut bounds: WindowBounds, area: WorkArea) -> WindowBounds {
     if bounds.width > area.width {
         bounds.width = area.width;
@@ -506,20 +466,6 @@ fn centered_bounds(mut bounds: WindowBounds, area: WorkArea) -> WindowBounds {
     bounds
 }
 
-fn default_bounds(size: PhysicalSize<u32>, area: WorkArea, margin: u32) -> WindowBounds {
-    let available_width = area.width.saturating_sub(margin.saturating_mul(2));
-    let available_height = area.height.saturating_sub(margin.saturating_mul(2));
-    centered_bounds(
-        WindowBounds {
-            x: area.x,
-            y: area.y,
-            width: size.width.min(available_width.max(MIN_WIDTH)),
-            height: size.height.min(available_height.max(MIN_HEIGHT)),
-        },
-        area,
-    )
-}
-
 fn i64_to_i32(value: i64) -> i32 {
     value.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
 }
@@ -528,11 +474,9 @@ fn i64_to_i32(value: i64) -> i32 {
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use tauri::PhysicalSize;
-
     use super::{
-        default_bounds, has_reachable_title_bar, load, persist, restored_bounds,
-        safe_restored_bounds, PersistedWindowState, WindowBounds, WorkArea, MIN_HEIGHT, MIN_WIDTH,
+        has_reachable_title_bar, load, persist, restored_bounds, safe_restored_bounds,
+        screen_bounds, PersistedWindowState, WindowBounds, WorkArea, MIN_HEIGHT, MIN_WIDTH,
         STATE_VERSION,
     };
 
@@ -545,6 +489,19 @@ mod tests {
         height: 1080,
         scale_factor: 1.0,
     };
+
+    #[test]
+    fn startup_bounds_match_the_current_screen_work_area() {
+        assert_eq!(
+            screen_bounds(PRIMARY),
+            WindowBounds {
+                x: 0,
+                y: 0,
+                width: 1920,
+                height: 1080,
+            }
+        );
+    }
 
     #[test]
     fn preserves_reachable_bounds() {
@@ -600,40 +557,6 @@ mod tests {
         assert_eq!(
             safe_restored_bounds(saved, &[PRIMARY, secondary], Some(PRIMARY)),
             Some(saved)
-        );
-    }
-
-    #[test]
-    fn default_size_leaves_a_margin_on_a_small_display() {
-        let area = WorkArea {
-            x: -1366,
-            y: 20,
-            width: 1366,
-            height: 748,
-            scale_factor: 1.0,
-        };
-
-        assert_eq!(
-            default_bounds(PhysicalSize::new(1280, 860), area, 48),
-            WindowBounds {
-                x: -1318,
-                y: 68,
-                width: 1270,
-                height: 652,
-            }
-        );
-    }
-
-    #[test]
-    fn default_size_does_not_grow_on_a_large_display() {
-        assert_eq!(
-            default_bounds(PhysicalSize::new(1280, 860), PRIMARY, 48),
-            WindowBounds {
-                x: 320,
-                y: 110,
-                width: 1280,
-                height: 860,
-            }
         );
     }
 
