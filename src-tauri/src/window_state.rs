@@ -65,6 +65,7 @@ struct WorkArea {
 
 #[derive(Debug)]
 struct MonitorSnapshot {
+    work_areas: Vec<WorkArea>,
     primary: Option<WorkArea>,
 }
 
@@ -88,6 +89,30 @@ enum PersistSignal {
 
 pub(crate) fn restore_track_and_show(app: &AppHandle, window: &WebviewWindow) {
     let path = state_path(app);
+    let saved_state = match load(&path) {
+        Ok(Some(saved)) if saved.version == STATE_VERSION => Some(saved),
+        Ok(Some(_)) => {
+            logging::write_app_log(
+                app,
+                "warn",
+                "window-state",
+                "Ignoring unsupported window state version",
+                None,
+            );
+            None
+        }
+        Ok(None) => None,
+        Err(error) => {
+            logging::write_app_log(
+                app,
+                "warn",
+                "window-state",
+                "Ignoring invalid saved window state",
+                Some(&serde_json::json!({ "error": error })),
+            );
+            None
+        }
+    };
 
     let worker_app = app.clone();
     let worker_window = window.clone();
@@ -97,28 +122,34 @@ pub(crate) fn restore_track_and_show(app: &AppHandle, window: &WebviewWindow) {
         let _ = detection_sender.send(detect_monitors(&detection_window));
     });
     thread::spawn(move || {
-        match detection_receiver.recv_timeout(MONITOR_DETECTION_TIMEOUT) {
+        let should_maximize = match detection_receiver.recv_timeout(MONITOR_DETECTION_TIMEOUT) {
             Ok(Ok(snapshot)) => {
-                apply_initial_bounds(&worker_app, &worker_window, snapshot);
+                apply_initial_bounds(&worker_app, &worker_window, saved_state, snapshot)
             }
-            Err(RecvTimeoutError::Timeout) => logging::write_app_log(
-                &worker_app,
-                "warn",
-                "window-state",
-                "Display detection timed out; using configured window bounds",
-                Some(&serde_json::json!({
-                    "timeoutMs": MONITOR_DETECTION_TIMEOUT.as_millis()
-                })),
-            ),
-            Ok(Err(error)) => logging::write_app_log(
-                &worker_app,
-                "warn",
-                "window-state",
-                "Failed to detect displays; using configured window bounds",
-                Some(&serde_json::json!({ "error": error.to_string() })),
-            ),
-            Err(RecvTimeoutError::Disconnected) => {}
-        }
+            Err(RecvTimeoutError::Timeout) => {
+                logging::write_app_log(
+                    &worker_app,
+                    "warn",
+                    "window-state",
+                    "Display detection timed out; using the default maximized window",
+                    Some(&serde_json::json!({
+                        "timeoutMs": MONITOR_DETECTION_TIMEOUT.as_millis()
+                    })),
+                );
+                true
+            }
+            Ok(Err(error)) => {
+                logging::write_app_log(
+                    &worker_app,
+                    "warn",
+                    "window-state",
+                    "Failed to detect displays; using the default maximized window",
+                    Some(&serde_json::json!({ "error": error.to_string() })),
+                );
+                true
+            }
+            Err(RecvTimeoutError::Disconnected) => true,
+        };
 
         if let Err(error) = worker_window.show() {
             logging::write_app_log(
@@ -128,6 +159,9 @@ pub(crate) fn restore_track_and_show(app: &AppHandle, window: &WebviewWindow) {
                 "Failed to show the main window",
                 Some(&serde_json::json!({ "error": error.to_string() })),
             );
+        }
+        if should_maximize {
+            maximize_without_fullscreen(&worker_app, &worker_window);
         }
         track(&worker_app, &worker_window, path);
     });
@@ -160,24 +194,88 @@ pub(crate) fn recover_if_unreachable(window: &WebviewWindow) {
     let _ = window.set_position(PhysicalPosition::new(recovered.x, recovered.y));
 }
 
-fn apply_initial_bounds(app: &AppHandle, window: &WebviewWindow, snapshot: MonitorSnapshot) {
-    let Some(primary) = snapshot.primary else {
+fn apply_initial_bounds(
+    app: &AppHandle,
+    window: &WebviewWindow,
+    saved: Option<PersistedWindowState>,
+    snapshot: MonitorSnapshot,
+) -> bool {
+    let Some(_primary) = snapshot.primary else {
         logging::write_app_log(
             app,
             "warn",
             "window-state",
-            "No primary monitor found; keeping configured window bounds",
+            "No primary monitor found; using the default maximized window",
             None,
         );
-        return;
+        return true;
     };
 
-    set_bounds(app, window, screen_bounds(primary), "startup-screen");
+    if let Some(saved) = saved {
+        match restored_bounds(&saved, &snapshot.work_areas, snapshot.primary) {
+            Some(bounds) if !is_full_work_area(bounds, &snapshot.work_areas) => {
+                set_bounds(app, window, bounds, "restore");
+                return false;
+            }
+            Some(_) => {
+                logging::write_app_log(
+                    app,
+                    "info",
+                    "window-state",
+                    "Treating a legacy full-work-area state as the default maximized window",
+                    None,
+                );
+            }
+            None => {
+                logging::write_app_log(
+                    app,
+                    "warn",
+                    "window-state",
+                    "Ignoring implausible saved window bounds",
+                    Some(&serde_json::json!({
+                        "bounds": saved.bounds,
+                        "scaleFactor": saved.scale_factor,
+                    })),
+                );
+            }
+        }
+    }
+
+    true
+}
+
+fn maximize_without_fullscreen(app: &AppHandle, window: &WebviewWindow) {
+    // A maximized window uses the current display work area. Fullscreen is a
+    // separate macOS mode that hides the title bar and moves the app to a
+    // dedicated Space, so explicitly leave it before requesting maximize.
+    if matches!(window.is_fullscreen(), Ok(true)) {
+        if let Err(error) = window.set_fullscreen(false) {
+            logging::write_app_log(
+                app,
+                "warn",
+                "window-state",
+                "Failed to leave fullscreen before maximizing the main window",
+                Some(&serde_json::json!({ "error": error.to_string() })),
+            );
+        }
+    }
+
+    if let Err(error) = window.maximize() {
+        logging::write_app_log(
+            app,
+            "warn",
+            "window-state",
+            "Failed to maximize the main window",
+            Some(&serde_json::json!({ "error": error.to_string() })),
+        );
+    }
 }
 
 fn detect_monitors(window: &WebviewWindow) -> tauri::Result<MonitorSnapshot> {
+    let monitors = window.available_monitors()?;
     let primary = window.primary_monitor()?;
     Ok(MonitorSnapshot {
+        work_areas: monitors.iter().map(WorkArea::from).collect(),
         primary: primary.as_ref().map(WorkArea::from),
     })
 }
@@ -189,6 +287,13 @@ fn screen_bounds(area: WorkArea) -> WindowBounds {
         width: area.width,
         height: area.height,
     }
+}
+
+fn is_full_work_area(bounds: WindowBounds, work_areas: &[WorkArea]) -> bool {
+    work_areas
+        .iter()
+        .copied()
+        .any(|area| screen_bounds(area) == bounds)
 }
 
 fn set_bounds(app: &AppHandle, window: &WebviewWindow, bounds: WindowBounds, action: &str) {
@@ -339,7 +444,6 @@ fn state_path(app: &AppHandle) -> PathBuf {
         .join(STATE_FILE_NAME)
 }
 
-#[cfg(test)]
 fn load(path: &Path) -> Result<Option<PersistedWindowState>, String> {
     match fs::read(path) {
         Ok(bytes) => serde_json::from_slice(&bytes)
@@ -359,7 +463,6 @@ fn persist(path: &Path, state: &PersistedWindowState) -> Result<(), String> {
     fs::write(path, bytes).map_err(|error| error.to_string())
 }
 
-#[cfg(test)]
 fn safe_restored_bounds(
     saved: WindowBounds,
     work_areas: &[WorkArea],
@@ -379,7 +482,6 @@ fn safe_restored_bounds(
     primary.map(|area| centered_bounds(saved, area))
 }
 
-#[cfg(test)]
 fn restored_bounds(
     saved: &PersistedWindowState,
     work_areas: &[WorkArea],
@@ -397,7 +499,6 @@ fn restored_bounds(
     safe_restored_bounds(bounds, work_areas, primary)
 }
 
-#[cfg(test)]
 fn rescale_size(
     mut bounds: WindowBounds,
     saved_scale_factor: f64,
@@ -443,7 +544,6 @@ fn title_bar_intersection(bounds: WindowBounds, area: WorkArea) -> (i64, i64) {
     (width, height)
 }
 
-#[cfg(test)]
 fn fit_oversized_window(mut bounds: WindowBounds, area: WorkArea) -> WindowBounds {
     if bounds.width > area.width {
         bounds.width = area.width;
@@ -475,9 +575,9 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::{
-        has_reachable_title_bar, load, persist, restored_bounds, safe_restored_bounds,
-        screen_bounds, PersistedWindowState, WindowBounds, WorkArea, MIN_HEIGHT, MIN_WIDTH,
-        STATE_VERSION,
+        has_reachable_title_bar, is_full_work_area, load, persist, restored_bounds,
+        safe_restored_bounds, screen_bounds, PersistedWindowState, WindowBounds, WorkArea,
+        MIN_HEIGHT, MIN_WIDTH, STATE_VERSION,
     };
 
     static TEMP_FILE_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
@@ -501,6 +601,20 @@ mod tests {
                 height: 1080,
             }
         );
+    }
+
+    #[test]
+    fn identifies_legacy_full_work_area_state() {
+        assert!(is_full_work_area(screen_bounds(PRIMARY), &[PRIMARY]));
+        assert!(!is_full_work_area(
+            WindowBounds {
+                x: 100,
+                y: 80,
+                width: 1280,
+                height: 800,
+            },
+            &[PRIMARY]
+        ));
     }
 
     #[test]
