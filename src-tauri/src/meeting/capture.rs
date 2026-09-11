@@ -171,6 +171,14 @@ impl CaptureShared {
             .reset(Instant::now());
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_elapsed_for_test(&self, elapsed: Duration) {
+        self.active_timer
+            .lock()
+            .expect("capture active timer poisoned")
+            .reset(Instant::now() - elapsed);
+    }
+
     pub(crate) fn should_stop(&self) -> bool {
         self.stop.load(Ordering::SeqCst)
     }
