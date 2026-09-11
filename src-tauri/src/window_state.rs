@@ -20,7 +20,6 @@ const STATE_FILE_NAME: &str = "window-state.json";
 const STATE_VERSION: u8 = 2;
 const WRITE_DEBOUNCE: Duration = Duration::from_millis(300);
 const MONITOR_DETECTION_TIMEOUT: Duration = Duration::from_millis(150);
-const DEFAULT_WINDOW_MARGIN: u32 = 48;
 const MIN_WIDTH: u32 = 960;
 const MIN_HEIGHT: u32 = 640;
 const MAX_DIMENSION: u32 = 32_768;
@@ -90,7 +89,6 @@ enum PersistSignal {
 
 pub(crate) fn restore_track_and_show(app: &AppHandle, window: &WebviewWindow) {
     let path = state_path(app);
-
     let saved_state = match load(&path) {
         Ok(Some(saved)) if saved.version == STATE_VERSION => Some(saved),
         Ok(Some(_)) => {
@@ -124,28 +122,34 @@ pub(crate) fn restore_track_and_show(app: &AppHandle, window: &WebviewWindow) {
         let _ = detection_sender.send(detect_monitors(&detection_window));
     });
     thread::spawn(move || {
-        match detection_receiver.recv_timeout(MONITOR_DETECTION_TIMEOUT) {
+        let should_maximize = match detection_receiver.recv_timeout(MONITOR_DETECTION_TIMEOUT) {
             Ok(Ok(snapshot)) => {
-                apply_initial_bounds(&worker_app, &worker_window, saved_state, snapshot);
+                apply_initial_bounds(&worker_app, &worker_window, saved_state, snapshot)
             }
-            Err(RecvTimeoutError::Timeout) => logging::write_app_log(
-                &worker_app,
-                "warn",
-                "window-state",
-                "Display detection timed out; using configured window bounds",
-                Some(&serde_json::json!({
-                    "timeoutMs": MONITOR_DETECTION_TIMEOUT.as_millis()
-                })),
-            ),
-            Ok(Err(error)) => logging::write_app_log(
-                &worker_app,
-                "warn",
-                "window-state",
-                "Failed to detect displays; using configured window bounds",
-                Some(&serde_json::json!({ "error": error.to_string() })),
-            ),
-            Err(RecvTimeoutError::Disconnected) => {}
-        }
+            Err(RecvTimeoutError::Timeout) => {
+                logging::write_app_log(
+                    &worker_app,
+                    "warn",
+                    "window-state",
+                    "Display detection timed out; using the default maximized window",
+                    Some(&serde_json::json!({
+                        "timeoutMs": MONITOR_DETECTION_TIMEOUT.as_millis()
+                    })),
+                );
+                true
+            }
+            Ok(Err(error)) => {
+                logging::write_app_log(
+                    &worker_app,
+                    "warn",
+                    "window-state",
+                    "Failed to detect displays; using the default maximized window",
+                    Some(&serde_json::json!({ "error": error.to_string() })),
+                );
+                true
+            }
+            Err(RecvTimeoutError::Disconnected) => true,
+        };
 
         if let Err(error) = worker_window.show() {
             logging::write_app_log(
@@ -155,6 +159,9 @@ pub(crate) fn restore_track_and_show(app: &AppHandle, window: &WebviewWindow) {
                 "Failed to show the main window",
                 Some(&serde_json::json!({ "error": error.to_string() })),
             );
+        }
+        if should_maximize {
+            maximize_without_fullscreen(&worker_app, &worker_window);
         }
         track(&worker_app, &worker_window, path);
     });
@@ -192,11 +199,34 @@ fn apply_initial_bounds(
     window: &WebviewWindow,
     saved: Option<PersistedWindowState>,
     snapshot: MonitorSnapshot,
-) {
-    let bounds = match saved {
-        Some(saved) => {
-            let Some(bounds) = restored_bounds(&saved, &snapshot.work_areas, snapshot.primary)
-            else {
+) -> bool {
+    let Some(_primary) = snapshot.primary else {
+        logging::write_app_log(
+            app,
+            "warn",
+            "window-state",
+            "No primary monitor found; using the default maximized window",
+            None,
+        );
+        return true;
+    };
+
+    if let Some(saved) = saved {
+        match restored_bounds(&saved, &snapshot.work_areas, snapshot.primary) {
+            Some(bounds) if !is_full_work_area(bounds, &snapshot.work_areas) => {
+                set_bounds(app, window, bounds, "restore");
+                return false;
+            }
+            Some(_) => {
+                logging::write_app_log(
+                    app,
+                    "info",
+                    "window-state",
+                    "Treating a legacy full-work-area state as the default maximized window",
+                    None,
+                );
+            }
+            None => {
                 logging::write_app_log(
                     app,
                     "warn",
@@ -207,14 +237,38 @@ fn apply_initial_bounds(
                         "scaleFactor": saved.scale_factor,
                     })),
                 );
-                return apply_default_bounds(window, snapshot);
-            };
-            bounds
+            }
         }
-        None => return apply_default_bounds(window, snapshot),
-    };
+    }
 
-    set_bounds(app, window, bounds, "restore");
+    true
+}
+
+fn maximize_without_fullscreen(app: &AppHandle, window: &WebviewWindow) {
+    // A maximized window uses the current display work area. Fullscreen is a
+    // separate macOS mode that hides the title bar and moves the app to a
+    // dedicated Space, so explicitly leave it before requesting maximize.
+    if matches!(window.is_fullscreen(), Ok(true)) {
+        if let Err(error) = window.set_fullscreen(false) {
+            logging::write_app_log(
+                app,
+                "warn",
+                "window-state",
+                "Failed to leave fullscreen before maximizing the main window",
+                Some(&serde_json::json!({ "error": error.to_string() })),
+            );
+        }
+    }
+
+    if let Err(error) = window.maximize() {
+        logging::write_app_log(
+            app,
+            "warn",
+            "window-state",
+            "Failed to maximize the main window",
+            Some(&serde_json::json!({ "error": error.to_string() })),
+        );
+    }
 }
 
 fn detect_monitors(window: &WebviewWindow) -> tauri::Result<MonitorSnapshot> {
@@ -226,14 +280,20 @@ fn detect_monitors(window: &WebviewWindow) -> tauri::Result<MonitorSnapshot> {
     })
 }
 
-fn apply_default_bounds(window: &WebviewWindow, snapshot: MonitorSnapshot) {
-    let (Ok(size), Some(primary)) = (window.inner_size(), snapshot.primary) else {
-        return;
-    };
-    let margin = (f64::from(DEFAULT_WINDOW_MARGIN) * primary.scale_factor).round() as u32;
-    let bounds = default_bounds(size, primary, margin);
-    let _ = window.set_size(PhysicalSize::new(bounds.width, bounds.height));
-    let _ = window.set_position(PhysicalPosition::new(bounds.x, bounds.y));
+fn screen_bounds(area: WorkArea) -> WindowBounds {
+    WindowBounds {
+        x: area.x,
+        y: area.y,
+        width: area.width,
+        height: area.height,
+    }
+}
+
+fn is_full_work_area(bounds: WindowBounds, work_areas: &[WorkArea]) -> bool {
+    work_areas
+        .iter()
+        .copied()
+        .any(|area| screen_bounds(area) == bounds)
 }
 
 fn set_bounds(app: &AppHandle, window: &WebviewWindow, bounds: WindowBounds, action: &str) {
@@ -506,20 +566,6 @@ fn centered_bounds(mut bounds: WindowBounds, area: WorkArea) -> WindowBounds {
     bounds
 }
 
-fn default_bounds(size: PhysicalSize<u32>, area: WorkArea, margin: u32) -> WindowBounds {
-    let available_width = area.width.saturating_sub(margin.saturating_mul(2));
-    let available_height = area.height.saturating_sub(margin.saturating_mul(2));
-    centered_bounds(
-        WindowBounds {
-            x: area.x,
-            y: area.y,
-            width: size.width.min(available_width.max(MIN_WIDTH)),
-            height: size.height.min(available_height.max(MIN_HEIGHT)),
-        },
-        area,
-    )
-}
-
 fn i64_to_i32(value: i64) -> i32 {
     value.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
 }
@@ -528,12 +574,10 @@ fn i64_to_i32(value: i64) -> i32 {
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use tauri::PhysicalSize;
-
     use super::{
-        default_bounds, has_reachable_title_bar, load, persist, restored_bounds,
-        safe_restored_bounds, PersistedWindowState, WindowBounds, WorkArea, MIN_HEIGHT, MIN_WIDTH,
-        STATE_VERSION,
+        has_reachable_title_bar, is_full_work_area, load, persist, restored_bounds,
+        safe_restored_bounds, screen_bounds, PersistedWindowState, WindowBounds, WorkArea,
+        MIN_HEIGHT, MIN_WIDTH, STATE_VERSION,
     };
 
     static TEMP_FILE_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
@@ -545,6 +589,33 @@ mod tests {
         height: 1080,
         scale_factor: 1.0,
     };
+
+    #[test]
+    fn startup_bounds_match_the_current_screen_work_area() {
+        assert_eq!(
+            screen_bounds(PRIMARY),
+            WindowBounds {
+                x: 0,
+                y: 0,
+                width: 1920,
+                height: 1080,
+            }
+        );
+    }
+
+    #[test]
+    fn identifies_legacy_full_work_area_state() {
+        assert!(is_full_work_area(screen_bounds(PRIMARY), &[PRIMARY]));
+        assert!(!is_full_work_area(
+            WindowBounds {
+                x: 100,
+                y: 80,
+                width: 1280,
+                height: 800,
+            },
+            &[PRIMARY]
+        ));
+    }
 
     #[test]
     fn preserves_reachable_bounds() {
@@ -600,40 +671,6 @@ mod tests {
         assert_eq!(
             safe_restored_bounds(saved, &[PRIMARY, secondary], Some(PRIMARY)),
             Some(saved)
-        );
-    }
-
-    #[test]
-    fn default_size_leaves_a_margin_on_a_small_display() {
-        let area = WorkArea {
-            x: -1366,
-            y: 20,
-            width: 1366,
-            height: 748,
-            scale_factor: 1.0,
-        };
-
-        assert_eq!(
-            default_bounds(PhysicalSize::new(1280, 860), area, 48),
-            WindowBounds {
-                x: -1318,
-                y: 68,
-                width: 1270,
-                height: 652,
-            }
-        );
-    }
-
-    #[test]
-    fn default_size_does_not_grow_on_a_large_display() {
-        assert_eq!(
-            default_bounds(PhysicalSize::new(1280, 860), PRIMARY, 48),
-            WindowBounds {
-                x: 320,
-                y: 110,
-                width: 1280,
-                height: 860,
-            }
         );
     }
 

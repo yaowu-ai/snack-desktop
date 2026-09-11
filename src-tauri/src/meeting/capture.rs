@@ -14,6 +14,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
@@ -93,6 +94,51 @@ pub(crate) struct CaptureShared {
     pub(crate) recorded_samples: AtomicU64,
     discard_pending: AtomicBool,
     write_gate: Mutex<()>,
+    active_timer: Mutex<ActiveTimer>,
+}
+
+#[derive(Debug)]
+struct ActiveTimer {
+    started_at: Instant,
+    paused_at: Option<Instant>,
+    paused_duration: Duration,
+}
+
+impl ActiveTimer {
+    fn new(started_at: Instant) -> Self {
+        Self {
+            started_at,
+            paused_at: None,
+            paused_duration: Duration::ZERO,
+        }
+    }
+
+    fn set_paused(&mut self, paused: bool, now: Instant) {
+        if paused {
+            if self.paused_at.is_none() {
+                self.paused_at = Some(now);
+            }
+        } else if let Some(paused_at) = self.paused_at.take() {
+            self.paused_duration += now.saturating_duration_since(paused_at);
+        }
+    }
+
+    fn reset(&mut self, started_at: Instant) {
+        self.started_at = started_at;
+        self.paused_at = None;
+        self.paused_duration = Duration::ZERO;
+    }
+
+    fn elapsed_millis(&self, now: Instant) -> u64 {
+        let paused_duration = self.paused_duration
+            + self
+                .paused_at
+                .map(|paused_at| now.saturating_duration_since(paused_at))
+                .unwrap_or_default();
+        now.saturating_duration_since(self.started_at)
+            .saturating_sub(paused_duration)
+            .as_millis() as u64
+    }
 }
 
 impl CaptureShared {
@@ -105,11 +151,24 @@ impl CaptureShared {
             recorded_samples: AtomicU64::new(0),
             discard_pending: AtomicBool::new(false),
             write_gate: Mutex::new(()),
+            active_timer: Mutex::new(ActiveTimer::new(Instant::now())),
         })
     }
 
     pub(crate) fn request_stop(&self) {
-        self.stop.store(true, Ordering::SeqCst);
+        if !self.stop.swap(true, Ordering::SeqCst) {
+            self.active_timer
+                .lock()
+                .expect("capture active timer poisoned")
+                .set_paused(true, Instant::now());
+        }
+    }
+
+    pub(crate) fn reset_elapsed_timer(&self) {
+        self.active_timer
+            .lock()
+            .expect("capture active timer poisoned")
+            .reset(Instant::now());
     }
 
     pub(crate) fn should_stop(&self) -> bool {
@@ -131,7 +190,13 @@ impl CaptureShared {
         // Serialize the state transition with WAV writes so no in-flight
         // chunk can extend the recording after pause() returns.
         let _write_guard = self.write_gate.lock().expect("capture write gate poisoned");
-        self.paused.store(paused, Ordering::SeqCst);
+        let previously_paused = self.paused.swap(paused, Ordering::SeqCst);
+        if paused != previously_paused {
+            self.active_timer
+                .lock()
+                .expect("capture active timer poisoned")
+                .set_paused(paused, Instant::now());
+        }
         if paused {
             self.discard_pending.store(true, Ordering::SeqCst);
             self.mic_live.store(false, Ordering::SeqCst);
@@ -157,8 +222,18 @@ impl CaptureShared {
     }
 
     pub(crate) fn elapsed_millis(&self) -> u64 {
-        self.recorded_samples.load(Ordering::SeqCst) * 1_000
-            / u64::from(crate::meeting::audio::TARGET_SAMPLE_RATE)
+        self.active_timer
+            .lock()
+            .expect("capture active timer poisoned")
+            .elapsed_millis(Instant::now())
+    }
+
+    pub(crate) fn samples_due(&self) -> u64 {
+        let target_samples = self
+            .elapsed_millis()
+            .saturating_mul(u64::from(crate::meeting::audio::TARGET_SAMPLE_RATE))
+            / 1_000;
+        target_samples.saturating_sub(self.recorded_samples.load(Ordering::SeqCst))
     }
 }
 
@@ -315,9 +390,23 @@ pub(crate) fn resample_to_target(samples: &[f32], source_rate: u32) -> Vec<f32> 
     out
 }
 
-/// Mix two f32 chunk buffers into i16 samples (public for the backends).
-pub(crate) fn mix_chunks(mic: &[f32], system: &[f32]) -> Vec<i16> {
-    mix_samples(mic, system)
+/// Consume one fixed-size timeline window from both asynchronous sources.
+/// Missing samples are silence, so callback timing cannot create extra WAV time.
+pub(crate) fn mix_timeline_chunk(
+    mic_buffer: &mut Vec<f32>,
+    system_buffer: &mut Vec<f32>,
+    sample_count: usize,
+) -> Vec<i16> {
+    fn take_padded(buffer: &mut Vec<f32>, sample_count: usize) -> Vec<f32> {
+        let take = buffer.len().min(sample_count);
+        let mut chunk: Vec<f32> = buffer.drain(..take).collect();
+        chunk.resize(sample_count, 0.0);
+        chunk
+    }
+
+    let mic = take_padded(mic_buffer, sample_count);
+    let system = take_padded(system_buffer, sample_count);
+    mix_samples(&mic, &system)
 }
 
 pub(crate) fn write_mixed_samples(
@@ -339,9 +428,11 @@ pub(crate) fn write_mixed_samples(
 
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, Instant};
+
     use super::{
-        downmix_f32, pcm_bytes_to_f32_mono, prepare_audio_output, resample_to_target,
-        CaptureShared, Recorder,
+        downmix_f32, mix_timeline_chunk, pcm_bytes_to_f32_mono, prepare_audio_output,
+        resample_to_target, ActiveTimer, CaptureShared, Recorder, CAPTURE_CHUNK_SAMPLES,
     };
 
     #[test]
@@ -360,16 +451,48 @@ mod tests {
     }
 
     #[test]
-    fn elapsed_time_counts_only_recorded_samples() {
-        let shared = CaptureShared::new(123);
-        shared.record_samples(16_000);
-        assert_eq!(shared.elapsed_millis(), 1_000);
+    fn elapsed_time_excludes_paused_duration() {
+        let started_at = Instant::now();
+        let mut timer = ActiveTimer::new(started_at);
+
+        assert_eq!(
+            timer.elapsed_millis(started_at + Duration::from_secs(1)),
+            1_000
+        );
+        timer.set_paused(true, started_at + Duration::from_secs(1));
+        assert_eq!(
+            timer.elapsed_millis(started_at + Duration::from_secs(4)),
+            1_000
+        );
+        timer.set_paused(false, started_at + Duration::from_secs(4));
+        assert_eq!(
+            timer.elapsed_millis(started_at + Duration::from_secs(5)),
+            2_000
+        );
+    }
+
+    #[test]
+    fn pause_stops_accepting_audio_and_discards_buffered_chunks() {
+        let shared = CaptureShared::new(0);
+
         shared.set_paused(true);
+
         assert!(shared.is_paused());
         assert!(!shared.accepts_audio());
         assert!(shared.take_discard_pending());
         assert!(!shared.take_discard_pending());
-        assert_eq!(shared.elapsed_millis(), 1_000);
+    }
+
+    #[test]
+    fn timeline_mix_writes_one_window_when_sources_arrive_at_different_times() {
+        let mut mic = vec![0.25; CAPTURE_CHUNK_SAMPLES];
+        let mut system = vec![0.5; CAPTURE_CHUNK_SAMPLES / 2];
+
+        let mixed = mix_timeline_chunk(&mut mic, &mut system, CAPTURE_CHUNK_SAMPLES);
+
+        assert_eq!(mixed.len(), CAPTURE_CHUNK_SAMPLES);
+        assert!(mic.is_empty());
+        assert!(system.is_empty());
     }
 
     #[test]
