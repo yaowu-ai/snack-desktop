@@ -555,6 +555,7 @@ mod tests {
     use crate::meeting::capture::CaptureShared;
     use crossbeam_channel::bounded;
     use std::fs;
+    use std::time::Duration;
 
     #[test]
     fn loopback_float_stereo_converts_to_mono() {
@@ -611,14 +612,18 @@ mod tests {
         let (mic_tx, mic_rx) = bounded(2);
         let (_sys_tx, sys_rx) = bounded(2);
         mic_tx.send(vec![0.25; 16_000]).unwrap();
+        // The writer is paced by active wall-clock time rather than by the
+        // amount of callback data. Advance its deterministic test clock so
+        // this one-second chunk belongs to the recording timeline.
+        shared.set_elapsed_for_test(Duration::from_secs(1));
         shared.request_stop();
 
         run_writer(&mut writer, &shared, mic_rx, sys_rx);
         drop(writer);
 
         let (samples, duration_ms) = read_wav_i16(&path).unwrap();
-        assert_eq!(samples.len(), 16_000);
-        assert_eq!(duration_ms, 1_000);
+        assert!((16_000..16_080).contains(&samples.len()));
+        assert!((1_000..1_005).contains(&duration_ms));
         fs::remove_file(path).unwrap();
     }
 

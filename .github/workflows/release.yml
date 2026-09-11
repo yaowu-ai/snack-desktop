@@ -28,7 +28,10 @@ jobs:
             release_arch_suffix: arm64
             artifact_label: apple-silicon
           - name: Intel
-            runner: macos-26-intel
+            # screencapturekit 1.5.x builds its native Swift bridge during the
+            # Tauri build and is not reliable with the Xcode 26 Intel image.
+            # Keep Intel releases on the stable Xcode/macOS 15 toolchain.
+            runner: macos-15-intel
             target: x86_64-apple-darwin
             rust_target: x86_64-apple-darwin
             dmg_arch_suffix: intel
