@@ -182,6 +182,11 @@ impl ReminderRuntime {
     }
 
     fn should_probe(&mut self) -> bool {
+        // This optional legacy monitor must never request screen access in the
+        // background. Meeting recording itself now uses a Core Audio tap.
+        if !core_graphics::access::ScreenCaptureAccess.preflight() {
+            return false;
+        }
         if !self.enabled || self.recording_active {
             return false;
         }
@@ -460,7 +465,7 @@ fn is_dedicated_meeting_bundle(bundle: &str) -> bool {
 }
 
 fn audio_signal(sample: &CMSampleBuffer) -> Option<AudioSignal> {
-    let samples = super::capture_macos::sample_buffer_to_f32_mono(sample)?;
+    let samples = sample_buffer_to_f32_mono(sample)?;
     if samples.is_empty() {
         return None;
     }
@@ -589,5 +594,47 @@ mod tests {
         assert_eq!(COOLDOWN, Duration::from_secs(10 * 60));
         assert_eq!(AUDIO_RMS_THRESHOLD, 0.002);
         assert_eq!(ACTIVE_AUDIO_TRIGGER_SECONDS, 3.0);
+    }
+}
+
+/// Extract f32 mono samples from an SCK audio sample buffer.
+fn sample_buffer_to_f32_mono(sample: &CMSampleBuffer) -> Option<Vec<f32>> {
+    let num_samples = usize::try_from(sample.num_samples()).ok()?;
+    if num_samples == 0 {
+        return None;
+    }
+    let list = sample.audio_buffer_list()?;
+    let mut mono = Vec::with_capacity(num_samples);
+    for index in 0..list.num_buffers() {
+        let buffer = list.get(index)?;
+        let data = buffer.data();
+        if data.is_empty() {
+            continue;
+        }
+        let bytes_per_sample = data.len() / num_samples;
+        if bytes_per_sample == 0 {
+            continue;
+        }
+        mono.extend(super::capture::pcm_bytes_to_f32_mono(data, bytes_per_sample));
+    }
+    if mono.is_empty() {
+        return None;
+    }
+    // With channel_count = 1 the OS delivers deinterleaved mono float32; if
+    // more buffers arrive, average them frame-wise.
+    let channels = list.num_buffers().max(1);
+    if channels > 1 {
+        let frames = mono.len() / channels;
+        let mut mixed = Vec::with_capacity(frames);
+        for frame in 0..frames {
+            let mut sum = 0.0f32;
+            for channel in 0..channels {
+                sum += mono[frame * channels + channel];
+            }
+            mixed.push(sum / channels as f32);
+        }
+        Some(mixed)
+    } else {
+        Some(mono)
     }
 }

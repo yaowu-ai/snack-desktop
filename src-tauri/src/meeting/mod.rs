@@ -720,26 +720,9 @@ pub(crate) async fn start_quick_recording(app: AppHandle) -> Result<(), String> 
         return start_recording(app, Some("zh".to_string()), true);
     }
 
-    // CoreGraphics can report a stale false value after the Screen & System
-    // Audio Recording switch is enabled. Let the actual ScreenCaptureKit
-    // recorder make the definitive check only after the user presses Record.
-    if current_microphone == PermissionAccess::Granted
-        && current_system_audio == PermissionAccess::Unknown
-    {
-        match start_recording(app.clone(), Some("zh".to_string()), true) {
-            Ok(()) => return Ok(()),
-            Err(error) if is_system_audio_permission_error(&error) => {}
-            Err(error) => return Err(error),
-        }
-    }
-
     let (microphone, system_audio) = request_capture_permissions(&app).await?;
     ensure_quick_recording_permissions(&app, microphone, system_audio)?;
     start_recording(app, Some("zh".to_string()), true)
-}
-
-fn is_system_audio_permission_error(error: &str) -> bool {
-    error.contains("系统音频") || error.contains("屏幕与系统录音")
 }
 
 fn current_permission_statuses() -> Result<(PermissionAccess, PermissionAccess), String> {
@@ -749,8 +732,7 @@ fn current_permission_statuses() -> Result<(PermissionAccess, PermissionAccess),
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let (microphone, system_audio) =
-            check_capture_permissions().map_err(|error| error.to_string())?;
+        let (microphone, system_audio) = check_capture_permissions()?;
         Ok((
             PermissionAccess::from_granted(microphone),
             PermissionAccess::from_granted(system_audio),
@@ -784,16 +766,14 @@ async fn request_capture_permissions(
 }
 
 fn ensure_quick_recording_permissions(
-    app: &AppHandle,
+    _app: &AppHandle,
     microphone: PermissionAccess,
     system_audio: PermissionAccess,
 ) -> Result<(), String> {
     if microphone != PermissionAccess::Granted {
-        open_permission_settings(app, "microphone")?;
         return Err("请在系统设置中允许 Snack 使用麦克风".to_string());
     }
-    if system_audio != PermissionAccess::Granted {
-        open_permission_settings(app, "system_audio")?;
+    if !cfg!(target_os = "macos") && system_audio != PermissionAccess::Granted {
         return Err("请在系统设置中允许 Snack 录制屏幕与系统音频".to_string());
     }
     Ok(())
@@ -888,11 +868,6 @@ fn start_recording(
             task.error = Some(error.message.clone());
             store.save_task(&task)?;
             emit_state(&app, store);
-            if error.kind == capture::CaptureErrorKind::PermissionDenied {
-                if let Some(permission) = error.missing_permission {
-                    let _ = open_permission_settings(&app, permission);
-                }
-            }
             Err(error.message)
         }
     }

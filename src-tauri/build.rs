@@ -52,5 +52,49 @@ fn main() {
     #[cfg(target_os = "macos")]
     println!("cargo:rustc-link-arg=-Wl,-rpath,/usr/lib/swift");
 
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
+        build_audio_tap();
+    }
     tauri_build::build()
+}
+
+fn build_audio_tap() {
+    use std::{path::PathBuf, process::Command};
+    let out = PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR"));
+    let arch = match std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() {
+        Ok("aarch64") => "arm64",
+        Ok("x86_64") => "x86_64",
+        other => panic!("unsupported macOS architecture: {other:?}"),
+    };
+    println!("cargo:rerun-if-changed=src/meeting/audio_tap.m");
+    let object = out.join("audio_tap.o");
+    assert!(Command::new("xcrun")
+        .args([
+            "clang",
+            "-fobjc-arc",
+            "-fblocks",
+            "-arch",
+            arch,
+            "-mmacosx-version-min=12.3",
+            "-Wall",
+            "-Werror",
+            "-c",
+            "src/meeting/audio_tap.m",
+            "-o",
+        ])
+        .arg(&object)
+        .status()
+        .expect("compile Core Audio tap")
+        .success());
+    assert!(Command::new("xcrun")
+        .args(["ar", "crs"])
+        .arg(out.join("libsnack_audio_tap.a"))
+        .arg(object)
+        .status()
+        .expect("archive Core Audio tap")
+        .success());
+    println!("cargo:rustc-link-search=native={}", out.display());
+    println!("cargo:rustc-link-lib=static=snack_audio_tap");
+    println!("cargo:rustc-link-lib=framework=CoreAudio");
+    println!("cargo:rustc-link-lib=framework=Foundation");
 }

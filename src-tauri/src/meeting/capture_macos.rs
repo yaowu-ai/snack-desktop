@@ -1,12 +1,12 @@
 //! macOS capture backend.
 //!
-//! - System audio: ScreenCaptureKit audio stream (16 kHz mono), which requires
-//!   the Screen Recording permission on macOS 12.3+.
+//! - System audio: Core Audio process tap (macOS 14.2+), resampled to 16 kHz mono.
+//!   Uses system-audio-only authorization, without Screen Recording permission.
 //! - Microphone: cpal (CoreAudio), which triggers the standard microphone
 //!   permission prompt on first use.
 //!
 //! The whole session (stream creation + writer loop) runs on one dedicated
-//! thread because cpal streams and SCStream are not `Send`.
+//! thread because cpal streams and the native tap are not `Send`.
 
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
@@ -15,21 +15,16 @@ use std::thread;
 use std::time::Duration;
 
 use crossbeam_channel::{bounded, Receiver, Sender};
-use screencapturekit::cm::CMSampleBuffer;
-use screencapturekit::prelude::{
-    SCContentFilter, SCShareableContent, SCStream, SCStreamConfiguration, SCStreamOutputType,
-};
 
 use crate::meeting::audio::WavWriter;
 use crate::meeting::capture::{
-    downmix_f32, mix_timeline_chunk, pcm_bytes_to_f32_mono, prepare_audio_output,
-    resample_to_target, write_mixed_samples, CaptureError, CaptureShared, Recorder,
-    CAPTURE_CHUNK_SAMPLES,
+    downmix_f32, mix_timeline_chunk, prepare_audio_output, resample_to_target, write_mixed_samples,
+    CaptureError, CaptureShared, Recorder, CAPTURE_CHUNK_SAMPLES,
 };
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
 const CHANNEL_CAPACITY: usize = 256;
-const START_TIMEOUT: Duration = Duration::from_secs(20);
+const START_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Probe whether macOS capture permissions are granted.
 /// Returns (microphone, system_audio).
@@ -52,7 +47,7 @@ pub(crate) fn start_macos_capture(
     let session = thread::Builder::new()
         .name("snack-capture-session".to_string())
         .spawn(move || {
-            let start_result = (|| -> Result<(Option<cpal::Stream>, SCStream), CaptureError> {
+            let start_result = (|| -> Result<(Option<cpal::Stream>, SystemAudioTap), CaptureError> {
                 let mic_stream = if crate::meeting::permissions::check_mac_permissions().0 {
                     match start_mac_mic(mic_tx.clone(), &shared_for_thread) {
                         Ok(stream) => Some(stream),
@@ -95,7 +90,7 @@ pub(crate) fn start_macos_capture(
         }
         Err(_) => {
             shared.request_stop();
-            // A platform API may be stuck inside CoreAudio/ScreenCaptureKit.
+            // A platform API may be stuck inside CoreAudio.
             // Dropping the handle detaches that thread so the command can
             // return the timeout instead of blocking the UI indefinitely.
             drop(session);
@@ -208,112 +203,86 @@ fn push_mic_chunk(
     let _ = tx.try_send(resampled);
 }
 
+struct TapContext {
+    tx: Sender<Vec<f32>>,
+    shared: Arc<CaptureShared>,
+}
+
+struct SystemAudioTap {
+    handle: std::ptr::NonNull<std::ffi::c_void>,
+    // Must outlive all callbacks. Drop stops the IOProc before releasing this.
+    _context: Box<TapContext>,
+}
+
+extern "C" {
+    fn snack_audio_tap_start(
+        callback: extern "C" fn(*const f32, usize, f64, *mut std::ffi::c_void),
+        context: *mut std::ffi::c_void,
+        error: *mut i32,
+        stage: *mut u32,
+    ) -> *mut std::ffi::c_void;
+    fn snack_audio_tap_stop(handle: *mut std::ffi::c_void);
+}
+
+impl Drop for SystemAudioTap {
+    fn drop(&mut self) {
+        // CoreAudio stops and unregisters the callback before context is freed.
+        unsafe { snack_audio_tap_stop(self.handle.as_ptr()) };
+    }
+}
+
+extern "C" fn receive_system_audio(
+    samples: *const f32,
+    count: usize,
+    sample_rate: f64,
+    context: *mut std::ffi::c_void,
+) {
+    // Never unwind across the native audio callback boundary.
+    let _ = std::panic::catch_unwind(|| {
+        if samples.is_null() || context.is_null() || count == 0 {
+            return;
+        }
+        let context = unsafe { &*(context as *const TapContext) };
+        if !context.shared.accepts_audio() {
+            return;
+        }
+        let data = unsafe { std::slice::from_raw_parts(samples, count) };
+        let mono = resample_to_target(data, sample_rate.round() as u32);
+        context.shared.system_live.store(true, Ordering::SeqCst);
+        let _ = context.tx.try_send(mono);
+    });
+}
+
 fn start_mac_system_audio(
     tx: Sender<Vec<f32>>,
     shared: &Arc<CaptureShared>,
-) -> Result<SCStream, CaptureError> {
-    let content = std::panic::catch_unwind(SCShareableContent::get)
-        .map_err(|_| CaptureError::permission("system_audio", "获取系统音频权限状态失败"))?
-        .map_err(|error| {
-            let message = error.to_string();
-            let normalized = message.to_ascii_lowercase();
-            if normalized.contains("not allowed")
-                || normalized.contains("notallowed")
-                || normalized.contains("denied")
-                || normalized.contains("tcc")
-                || message.contains("用户拒绝")
-            {
-                CaptureError::permission(
-                    "system_audio",
-                    "当前 Snack 未获得系统音频权限，请允许屏幕与系统录音后完全退出并重新打开 Snack",
-                )
-            } else {
-                CaptureError::start_failed(format!("无法访问系统音频: {message}"))
-            }
-        })?;
-
-    let display = content
-        .displays()
-        .first()
-        .ok_or_else(|| CaptureError::start_failed("没有可用的显示器"))?
-        .clone();
-    let filter = SCContentFilter::create()
-        .with_display(&display)
-        .with_excluding_windows(&[])
-        .build();
-    let config = SCStreamConfiguration::new()
-        .with_captures_audio(true)
-        .with_sample_rate(16_000)
-        .with_channel_count(1)
-        .with_excludes_current_process_audio(false);
-
-    let mut stream = SCStream::new(&filter, &config);
-    let tx_for_handler = tx.clone();
-    let shared_for_handler = Arc::clone(shared);
-    let handler_id = stream.add_output_handler(
-        move |sample: CMSampleBuffer, _output_type| {
-            if !shared_for_handler.accepts_audio() {
-                return;
-            }
-            if let Some(samples) = sample_buffer_to_f32_mono(&sample) {
-                if !samples.is_empty() {
-                    shared_for_handler.system_live.store(true, Ordering::SeqCst);
-                    let _ = tx_for_handler.try_send(samples);
-                }
-            }
-        },
-        SCStreamOutputType::Audio,
-    );
-    if handler_id.is_none() {
-        return Err(CaptureError::start_failed("无法注册系统音频采集回调"));
-    }
-
-    stream
-        .start_capture()
-        .map_err(|error| CaptureError::start_failed(format!("无法启动系统音频采集: {error}")))?;
-    Ok(stream)
-}
-
-/// Extract f32 mono samples from an SCK audio sample buffer.
-pub(super) fn sample_buffer_to_f32_mono(sample: &CMSampleBuffer) -> Option<Vec<f32>> {
-    let num_samples = usize::try_from(sample.num_samples()).ok()?;
-    if num_samples == 0 {
-        return None;
-    }
-    let list = sample.audio_buffer_list()?;
-    let mut mono = Vec::with_capacity(num_samples);
-    for index in 0..list.num_buffers() {
-        let buffer = list.get(index)?;
-        let data = buffer.data();
-        if data.is_empty() {
-            continue;
+) -> Result<SystemAudioTap, CaptureError> {
+    let mut context = Box::new(TapContext {
+        tx,
+        shared: Arc::clone(shared),
+    });
+    let mut error = 0;
+    let mut stage = 0;
+    let handle = unsafe {
+        snack_audio_tap_start(
+            receive_system_audio,
+            (&mut *context as *mut TapContext).cast(),
+            &mut error,
+            &mut stage,
+        )
+    };
+    let handle = std::ptr::NonNull::new(handle).ok_or_else(|| {
+        eprintln!("snack Core Audio tap failed: stage={stage} status={error}");
+        if stage == 0 {
+            CaptureError::start_failed("系统音频录制需要 macOS 14.2 或更新版本")
+        } else {
+            CaptureError::start_failed("无法启动系统音频录制。如已拒绝授权，请在系统设置中允许 Snack 的“仅系统录音”后重试。")
         }
-        let bytes_per_sample = data.len() / num_samples;
-        if bytes_per_sample == 0 {
-            continue;
-        }
-        mono.extend(pcm_bytes_to_f32_mono(data, bytes_per_sample));
-    }
-    if mono.is_empty() {
-        return None;
-    }
-    // With channel_count = 1 the OS delivers deinterleaved mono float32; if
-    // more buffers arrive, average them frame-wise.
-    let channels = list.num_buffers().max(1);
-    if channels > 1 {
-        let frames = mono.len() / channels;
-        let mut mixed = Vec::with_capacity(frames);
-        for frame in 0..frames {
-            let mut sum = 0.0f32;
-            for channel in 0..channels {
-                sum += mono[frame * channels + channel];
-            }
-            mixed.push(sum / channels as f32);
-        }
-        Some(mixed)
-    } else {
-        Some(mono)
-    }
+    })?;
+    Ok(SystemAudioTap {
+        handle,
+        _context: context,
+    })
 }
 
 /// Writer loop: drain mic + system chunks, mix, append to WAV until stopped.
@@ -376,4 +345,67 @@ fn run_writer(
         }
     }
     let _ = writer.finalize();
+}
+
+#[cfg(test)]
+mod tap_tests {
+    use super::*;
+
+    #[test]
+    fn tap_callback_resamples_into_existing_mix_queue() {
+        let (tx, rx) = bounded(2);
+        let shared = CaptureShared::new(0);
+        let mut context = TapContext {
+            tx,
+            shared: shared.clone(),
+        };
+        let samples = vec![0.25f32; 480];
+        receive_system_audio(
+            samples.as_ptr(),
+            samples.len(),
+            48_000.0,
+            (&mut context as *mut TapContext).cast(),
+        );
+        let chunk = rx.try_recv().unwrap();
+        assert_eq!(chunk.len(), 160);
+        assert!(chunk.iter().all(|sample| (*sample - 0.25).abs() < 0.001));
+        assert!(shared.system_live.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn stopped_capture_discards_late_tap_callback() {
+        let (tx, rx) = bounded(2);
+        let shared = CaptureShared::new(0);
+        shared.request_stop();
+        let mut context = TapContext {
+            tx,
+            shared: shared.clone(),
+        };
+        receive_system_audio(
+            [0.5f32; 160].as_ptr(),
+            160,
+            16_000.0,
+            (&mut context as *mut TapContext).cast(),
+        );
+        assert!(rx.try_recv().is_err());
+        assert!(!shared.system_live.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn full_tap_queue_drops_chunk_without_blocking_audio_thread() {
+        let (tx, rx) = bounded(1);
+        tx.try_send(vec![0.1]).unwrap();
+        let mut context = TapContext {
+            tx,
+            shared: CaptureShared::new(0),
+        };
+        receive_system_audio(
+            [0.5f32; 160].as_ptr(),
+            160,
+            16_000.0,
+            (&mut context as *mut TapContext).cast(),
+        );
+        assert_eq!(rx.try_recv().unwrap(), vec![0.1]);
+        assert!(rx.try_recv().is_err());
+    }
 }

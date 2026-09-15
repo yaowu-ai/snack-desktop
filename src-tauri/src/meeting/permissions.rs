@@ -2,9 +2,8 @@
 //!
 //! - Microphone: `AVCaptureDevice authorizationStatusForMediaType:` — exact,
 //!   non-prompting status (notDetermined/restricted/denied/authorized).
-//! - Screen recording (required for system audio capture): CoreGraphics
-//!   preflight/request APIs, which avoid turning an ordinary status check into
-//!   a user-visible privacy request during app startup.
+//! - System audio: Core Audio checks authorization when recording starts.
+//!   No screen permission query or private TCC API is used for recording.
 
 #[cfg(target_os = "macos")]
 use tauri::AppHandle;
@@ -56,16 +55,10 @@ pub(crate) fn check_mac_permission_statuses() -> (PermissionAccess, PermissionAc
         None => PermissionAccess::Denied,
     };
 
-    let system_audio = {
-        use core_graphics::access::ScreenCaptureAccess;
-        if ScreenCaptureAccess.preflight() {
-            PermissionAccess::Granted
-        } else {
-            // CoreGraphics does not distinguish not-yet-requested from a
-            // previous denial until a request is made.
-            PermissionAccess::Unknown
-        }
-    };
+    // Core Audio taps have no public non-prompting TCC status query. A screen
+    // recording preflight is a different permission and must not gate audio.
+    // The OS checks system-audio authorization when the user starts the tap.
+    let system_audio = PermissionAccess::Unknown;
 
     (microphone, system_audio)
 }
@@ -91,7 +84,7 @@ pub(crate) async fn request_mac_permissions(
 
     // Do not call CGRequestScreenCaptureAccess here. On some macOS releases it
     // displays a prompt even when the privacy switch is already enabled. The
-    // ScreenCaptureKit recorder performs the definitive check only after the
+    // Core Audio tap performs the definitive check only after the
     // user explicitly starts a recording.
     Ok((microphone, system_audio))
 }
@@ -120,7 +113,7 @@ async fn request_microphone_permission(app: &AppHandle) -> Result<PermissionAcce
         }
     })
     .map_err(|error| format!("无法请求麦克风权限: {error}"))?;
-    match tokio::time::timeout(std::time::Duration::from_secs(15), receiver).await {
+    match tokio::time::timeout(std::time::Duration::from_secs(120), receiver).await {
         Ok(Ok(granted)) => Ok(granted),
         Ok(Err(_)) => Err("麦克风权限请求未完成".to_string()),
         Err(_) => Ok(PermissionAccess::Denied),
