@@ -709,21 +709,15 @@ pub(crate) async fn meeting_start_recording(
     window: WebviewWindow,
     language: Option<String>,
     consented: bool,
-    allow_microphone_only: Option<bool>,
 ) -> Result<(), String> {
     require_allowed_window(&window)?;
-    start_recording(
-        app,
-        language,
-        consented,
-        allow_microphone_only.unwrap_or(false),
-    )
+    start_recording(app, language, consented)
 }
 
 pub(crate) async fn start_quick_recording(app: AppHandle) -> Result<(), String> {
     let (current_microphone, current_system_audio) = current_permission_statuses()?;
     if can_attempt_recording_without_permission_request(current_microphone, current_system_audio) {
-        return start_recording(app, Some("zh".to_string()), true, false);
+        return start_recording(app, Some("zh".to_string()), true);
     }
 
     // CoreGraphics can report a stale false value after the Screen & System
@@ -732,7 +726,7 @@ pub(crate) async fn start_quick_recording(app: AppHandle) -> Result<(), String> 
     if current_microphone == PermissionAccess::Granted
         && current_system_audio == PermissionAccess::Unknown
     {
-        match start_recording(app.clone(), Some("zh".to_string()), true, false) {
+        match start_recording(app.clone(), Some("zh".to_string()), true) {
             Ok(()) => return Ok(()),
             Err(error) if is_system_audio_permission_error(&error) => {}
             Err(error) => return Err(error),
@@ -741,7 +735,7 @@ pub(crate) async fn start_quick_recording(app: AppHandle) -> Result<(), String> 
 
     let (microphone, system_audio) = request_capture_permissions(&app).await?;
     ensure_quick_recording_permissions(&app, microphone, system_audio)?;
-    start_recording(app, Some("zh".to_string()), true, false)
+    start_recording(app, Some("zh".to_string()), true)
 }
 
 fn is_system_audio_permission_error(error: &str) -> bool {
@@ -809,7 +803,6 @@ fn start_recording(
     app: AppHandle,
     language: Option<String>,
     consented: bool,
-    allow_microphone_only: bool,
 ) -> Result<(), String> {
     if !consented {
         return Err("请先确认已获得参会者同意".to_string());
@@ -843,7 +836,7 @@ fn start_recording(
 
     // 4. Permissions.
     let (mic, sys) = check_capture_permissions().map_err(|error| error.to_string())?;
-    if !mic && (allow_microphone_only || !cfg!(target_os = "macos")) {
+    if !mic && !cfg!(target_os = "macos") {
         return Err("麦克风权限未授权，请在系统设置中允许后重试".to_string());
     }
     if !sys && !cfg!(target_os = "macos") {
@@ -871,7 +864,7 @@ fn start_recording(
     let audio_path = store.audio_path(&recording_id);
     let started_millis = unix_millis();
     state.reminder.set_recording_active(true);
-    match capture::start_recording(audio_path.clone(), started_millis, allow_microphone_only) {
+    match capture::start_recording(audio_path.clone(), started_millis) {
         Ok(recorder) => {
             *state.recorder.lock().expect("recorder poisoned") = Some(recorder);
             let mut task = store.load_task().ok_or("任务丢失")?;

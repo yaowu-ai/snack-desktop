@@ -41,7 +41,6 @@ pub(crate) fn check_mac_capture_permissions() -> Result<(bool, bool), String> {
 pub(crate) fn start_macos_capture(
     audio_path: PathBuf,
     started_millis: u64,
-    allow_microphone_only: bool,
 ) -> Result<Recorder, CaptureError> {
     let shared = CaptureShared::new(started_millis);
     let (mic_tx, mic_rx) = bounded::<Vec<f32>>(CHANNEL_CAPACITY);
@@ -53,7 +52,7 @@ pub(crate) fn start_macos_capture(
     let session = thread::Builder::new()
         .name("snack-capture-session".to_string())
         .spawn(move || {
-            let start_result = (|| -> Result<(Option<cpal::Stream>, Option<SCStream>), CaptureError> {
+            let start_result = (|| -> Result<(Option<cpal::Stream>, SCStream), CaptureError> {
                 let mic_stream = if crate::meeting::permissions::check_mac_permissions().0 {
                     match start_mac_mic(mic_tx.clone(), &shared_for_thread) {
                         Ok(stream) => Some(stream),
@@ -66,22 +65,7 @@ pub(crate) fn start_macos_capture(
                     eprintln!("snack meeting microphone permission unavailable, continuing with system audio");
                     None
                 };
-                // Standard notes can capture microphone audio without requesting screen access.
-                // Existing meeting callers retain the full system-audio capture behavior.
-                let capture_system = !allow_microphone_only
-                    || crate::meeting::permissions::check_mac_permissions().1;
-                let sc_stream = if capture_system {
-                    match start_mac_system_audio(sys_tx.clone(), &shared_for_thread) {
-                        Ok(stream) => Some(stream),
-                        Err(_) if allow_microphone_only && mic_stream.is_some() => None,
-                        Err(error) => return Err(error),
-                    }
-                } else {
-                    None
-                };
-                if mic_stream.is_none() && sc_stream.is_none() {
-                    return Err(CaptureError::start_failed("麦克风不可用，请检查输入设备后重试"));
-                }
+                let sc_stream = start_mac_system_audio(sys_tx.clone(), &shared_for_thread)?;
                 prepare_audio_output(&audio_for_thread)?;
                 Ok((mic_stream, sc_stream))
             })();
