@@ -709,15 +709,21 @@ pub(crate) async fn meeting_start_recording(
     window: WebviewWindow,
     language: Option<String>,
     consented: bool,
+    allow_microphone_only: Option<bool>,
 ) -> Result<(), String> {
     require_allowed_window(&window)?;
-    start_recording(app, language, consented)
+    start_recording(
+        app,
+        language,
+        consented,
+        allow_microphone_only.unwrap_or(false),
+    )
 }
 
 pub(crate) async fn start_quick_recording(app: AppHandle) -> Result<(), String> {
     let (current_microphone, current_system_audio) = current_permission_statuses()?;
     if can_attempt_recording_without_permission_request(current_microphone, current_system_audio) {
-        return start_recording(app, Some("zh".to_string()), true);
+        return start_recording(app, Some("zh".to_string()), true, false);
     }
 
     // CoreGraphics can report a stale false value after the Screen & System
@@ -726,7 +732,7 @@ pub(crate) async fn start_quick_recording(app: AppHandle) -> Result<(), String> 
     if current_microphone == PermissionAccess::Granted
         && current_system_audio == PermissionAccess::Unknown
     {
-        match start_recording(app.clone(), Some("zh".to_string()), true) {
+        match start_recording(app.clone(), Some("zh".to_string()), true, false) {
             Ok(()) => return Ok(()),
             Err(error) if is_system_audio_permission_error(&error) => {}
             Err(error) => return Err(error),
@@ -735,7 +741,7 @@ pub(crate) async fn start_quick_recording(app: AppHandle) -> Result<(), String> 
 
     let (microphone, system_audio) = request_capture_permissions(&app).await?;
     ensure_quick_recording_permissions(&app, microphone, system_audio)?;
-    start_recording(app, Some("zh".to_string()), true)
+    start_recording(app, Some("zh".to_string()), true, false)
 }
 
 fn is_system_audio_permission_error(error: &str) -> bool {
@@ -803,6 +809,7 @@ fn start_recording(
     app: AppHandle,
     language: Option<String>,
     consented: bool,
+    allow_microphone_only: bool,
 ) -> Result<(), String> {
     if !consented {
         return Err("请先确认已获得参会者同意".to_string());
@@ -836,7 +843,7 @@ fn start_recording(
 
     // 4. Permissions.
     let (mic, sys) = check_capture_permissions().map_err(|error| error.to_string())?;
-    if !mic && !cfg!(target_os = "macos") {
+    if !mic && (allow_microphone_only || !cfg!(target_os = "macos")) {
         return Err("麦克风权限未授权，请在系统设置中允许后重试".to_string());
     }
     if !sys && !cfg!(target_os = "macos") {
@@ -864,7 +871,7 @@ fn start_recording(
     let audio_path = store.audio_path(&recording_id);
     let started_millis = unix_millis();
     state.reminder.set_recording_active(true);
-    match capture::start_recording(audio_path.clone(), started_millis) {
+    match capture::start_recording(audio_path.clone(), started_millis, allow_microphone_only) {
         Ok(recorder) => {
             *state.recorder.lock().expect("recorder poisoned") = Some(recorder);
             let mut task = store.load_task().ok_or("任务丢失")?;
@@ -1790,14 +1797,14 @@ pub(crate) fn meeting_open_local_file(
         .ok_or_else(|| "没有找到本地录音".to_string())?;
     let path = match kind.as_str() {
         "transcript" => task.transcript_path.map(PathBuf::from),
-        "audio" => task.audio_path.map(PathBuf::from),
+        "audio" | "audio_folder" => task.audio_path.map(PathBuf::from),
         _ => return Err("不支持的本地文件类型".to_string()),
     }
     .ok_or_else(|| "本地文件不存在".to_string())?;
     if !path.exists() {
         return Err("本地文件不存在".to_string());
     }
-    if kind == "transcript" {
+    if kind == "transcript" || kind == "audio_folder" {
         crate::platform::reveal_path(&path)
     } else {
         crate::platform::open_path(&path)
@@ -2394,6 +2401,13 @@ fn open_permission_settings(_app: &AppHandle, permission: &str) -> Result<(), St
                 "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone"
             } else {
                 "ms-settings:privacy-microphone"
+            }
+        }
+        "notifications" => {
+            if cfg!(target_os = "macos") {
+                "x-apple.systempreferences:com.apple.Notifications-Settings.extension"
+            } else {
+                "ms-settings:notifications"
             }
         }
         "system_audio" => {

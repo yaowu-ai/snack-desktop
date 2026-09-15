@@ -308,18 +308,24 @@ impl Drop for Recorder {
 pub(crate) fn start_recording(
     audio_path: PathBuf,
     started_millis: u64,
+    allow_microphone_only: bool,
 ) -> Result<Recorder, CaptureError> {
     #[cfg(target_os = "macos")]
     {
-        crate::meeting::capture_macos::start_macos_capture(audio_path, started_millis)
+        crate::meeting::capture_macos::start_macos_capture(
+            audio_path,
+            started_millis,
+            allow_microphone_only,
+        )
     }
     #[cfg(target_os = "windows")]
     {
+        let _ = allow_microphone_only;
         crate::meeting::capture_windows::start_windows_capture(audio_path, started_millis)
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
-        let _ = (audio_path, started_millis);
+        let _ = (audio_path, started_millis, allow_microphone_only);
         Err(CaptureError::start_failed(
             "会议录音仅支持 macOS 和 Windows",
         ))
