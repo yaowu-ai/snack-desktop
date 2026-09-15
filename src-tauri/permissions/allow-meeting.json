@@ -37,6 +37,7 @@
           "meeting_retry_submit",
           "meeting_retranscribe",
           "meeting_start_recording",
+          "meeting_set_inline_recording",
           "meeting_set_notes_activity",
           "meeting_set_recording_auto_notes",
           "meeting_set_recording_file_name",

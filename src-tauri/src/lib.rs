@@ -88,6 +88,7 @@ pub fn run() {
             meeting::meeting_retry_submit,
             meeting::meeting_retranscribe,
             meeting::meeting_start_recording,
+            meeting::meeting_set_inline_recording,
             meeting::meeting_set_notes_activity,
             meeting::meeting_set_recording_auto_notes,
             meeting::meeting_set_recording_file_name,
