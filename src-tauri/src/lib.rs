@@ -7,6 +7,7 @@ mod download;
 mod logging;
 mod meeting;
 mod navigation;
+mod notification_permission;
 mod platform;
 mod record_import;
 mod site;
