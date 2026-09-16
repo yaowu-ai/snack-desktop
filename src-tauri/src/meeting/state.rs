@@ -826,7 +826,12 @@ fn insert_scanned_audio(candidates: &mut HashMap<PathBuf, u64>, entry: fs::DirEn
 fn protected_audio_paths(tasks: &[MeetingTask]) -> HashSet<PathBuf> {
     tasks
         .iter()
-        .filter(|task| task.state.is_active() || task.state == TaskState::AwaitingTranscription || !task.audio_file_owned)
+        .filter(|task| {
+            task.state.is_active()
+                || task.state == TaskState::AwaitingTranscription
+                || (task.defer_transcription && task.state == TaskState::NoAudioDetected)
+                || !task.audio_file_owned
+        })
         .filter_map(|task| task.audio_path.as_deref().map(PathBuf::from))
         .collect()
 }
@@ -1499,6 +1504,46 @@ mod tests {
 
         assert_eq!(store.prune_recording_audio(0).unwrap(), 0);
         assert!(audio_path.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn audio_retention_protects_deferred_silence_and_keeps_legacy_policy() {
+        let root = std::env::temp_dir().join(format!(
+            "snack-meeting-silent-audio-{}",
+            super::unix_millis()
+        ));
+        let state_root = root.join("state");
+        let audio_root = root.join("recordings").join(super::AUDIO_DIR_NAME);
+        fs::create_dir_all(state_root.join(super::TASKS_DIR_NAME)).unwrap();
+        fs::create_dir_all(&audio_root).unwrap();
+        let store = MeetingStore {
+            root: state_root,
+            default_recordings_root: root.join("recordings"),
+        };
+        for (recording_id, deferred) in [("deferred", true), ("legacy", false)] {
+            let audio_path = audio_root.join(format!("{recording_id}.wav"));
+            fs::write(&audio_path, b"audio").unwrap();
+            let mut task = MeetingTask::new(recording_id.into(), "zh".into());
+            task.state = TaskState::NoAudioDetected;
+            task.defer_transcription = deferred;
+            task.audio_path = Some(audio_path.to_string_lossy().into_owned());
+            store.save_task_record(&task).unwrap();
+        }
+
+        assert_eq!(store.prune_recording_audio(0).unwrap(), 1);
+        assert!(audio_root.join("deferred.wav").exists());
+        assert!(store
+            .load_task_record("deferred")
+            .unwrap()
+            .audio_path
+            .is_some());
+        assert!(!audio_root.join("legacy.wav").exists());
+        assert!(store
+            .load_task_record("legacy")
+            .unwrap()
+            .audio_path
+            .is_none());
         fs::remove_dir_all(root).unwrap();
     }
 

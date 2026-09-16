@@ -129,16 +129,25 @@ pub(crate) fn read_wav_samples(path: &Path) -> Result<Vec<f32>, String> {
 /// useful for speech recognition. This prevents local ASR engines from
 /// hallucinating text for silent recordings while keeping the WAV untouched.
 pub(crate) fn has_audio_signal(samples: &[f32]) -> bool {
-    if samples.is_empty() {
+    normalized_samples_have_audio_signal(samples.iter().copied())
+}
+
+/// Check decoded PCM directly without allocating another recording-sized buffer.
+pub(crate) fn has_audio_signal_i16(samples: &[i16]) -> bool {
+    normalized_samples_have_audio_signal(samples.iter().map(|sample| f32::from(*sample) / 32768.0))
+}
+
+fn normalized_samples_have_audio_signal(samples: impl ExactSizeIterator<Item = f32> + Clone) -> bool {
+    let sample_count = samples.len();
+    if sample_count == 0 {
         return false;
     }
     let active_samples = samples
-        .iter()
+        .clone()
         .filter(|sample| sample.abs() >= MIN_SIGNAL_AMPLITUDE)
         .count();
-    let minimum_active = ((samples.len() as f32 * MIN_ACTIVE_SAMPLE_RATIO).ceil() as usize).max(1);
-    let rms =
-        (samples.iter().map(|sample| sample * sample).sum::<f32>() / samples.len() as f32).sqrt();
+    let minimum_active = ((sample_count as f32 * MIN_ACTIVE_SAMPLE_RATIO).ceil() as usize).max(1);
+    let rms = (samples.map(|sample| sample * sample).sum::<f32>() / sample_count as f32).sqrt();
     active_samples >= minimum_active && rms >= MIN_SIGNAL_RMS
 }
 
@@ -364,8 +373,8 @@ fn soft_clip(sample: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        decode_wav_i16, disk_has_room, has_audio_signal, mix_samples, repair_wav_header,
-        sha256_file, WavWriter, TARGET_SAMPLE_RATE,
+        decode_wav_i16, disk_has_room, has_audio_signal, has_audio_signal_i16, mix_samples,
+        repair_wav_header, sha256_file, WavWriter, TARGET_SAMPLE_RATE,
     };
     use std::fs;
     use std::path::PathBuf;
@@ -392,6 +401,33 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert!(has_audio_signal(&samples));
+    }
+
+    #[test]
+    fn pcm_audio_signal_matches_float_thresholds_without_a_conversion_buffer() {
+        let mut spike = vec![0; TARGET_SAMPLE_RATE as usize];
+        spike[100] = 26_000;
+        let quiet_speech = (0..TARGET_SAMPLE_RATE as usize)
+            .map(|index| {
+                let time = index as f32 / TARGET_SAMPLE_RATE as f32;
+                ((time * 220.0 * std::f32::consts::TAU).sin() * 0.005 * 32768.0) as i16
+            })
+            .collect::<Vec<_>>();
+        for (samples, expected) in [
+            (vec![], false),
+            (vec![0; 16_000], false),
+            (spike, false),
+            (vec![32; 16_000], false),
+            (vec![33; 16_000], true),
+            (quiet_speech, true),
+        ] {
+            let normalized = samples
+                .iter()
+                .map(|sample| f32::from(*sample) / 32768.0)
+                .collect::<Vec<_>>();
+            assert_eq!(has_audio_signal_i16(&samples), expected);
+            assert_eq!(has_audio_signal_i16(&samples), has_audio_signal(&normalized));
+        }
     }
 
     #[test]

@@ -1514,15 +1514,16 @@ fn finalize_recording(app: AppHandle, store: MeetingStore, recorder: Recorder) {
         fail_finalize(&app, &store, "音频路径丢失".to_string());
         return;
     };
-    let duration_ms = match audio::read_wav_i16(&audio_path) {
-        Ok((_, duration_ms)) => duration_ms,
+    let (samples, duration_ms) = match audio::read_wav_i16(&audio_path) {
+        Ok(decoded) => decoded,
         Err(message) => {
             fail_finalize(&app, &store, format!("录音文件校验失败: {message}"));
             return;
         }
     };
 
-    task.state = finalized_recording_state(task.defer_transcription);
+    task.state = finalized_recording_state(task.defer_transcription, &samples);
+    drop(samples);
     task.duration_ms = Some(duration_ms);
     task.ended_at = Some(now_rfc3339());
     task.audio_bytes = fs::metadata(&audio_path).ok().map(|meta| meta.len());
@@ -1561,8 +1562,14 @@ fn validate_recording_resource(resource: ResourceState, deferred: bool) -> Resul
     Ok(())
 }
 
-fn finalized_recording_state(deferred: bool) -> TaskState {
-    if deferred { TaskState::AwaitingTranscription } else { TaskState::TranscribingLocal }
+fn finalized_recording_state(deferred: bool, samples: &[i16]) -> TaskState {
+    if !deferred {
+        TaskState::TranscribingLocal
+    } else if audio::has_audio_signal_i16(samples) {
+        TaskState::AwaitingTranscription
+    } else {
+        TaskState::NoAudioDetected
+    }
 }
 
 fn fail_finalize(app: &AppHandle, store: &MeetingStore, message: String) {
@@ -2508,9 +2515,30 @@ mod tests {
         assert!(validate_recording_resource(ResourceState::Downloading, true).is_ok());
         assert!(validate_recording_resource(ResourceState::NotInstalled, false).is_err());
         assert!(validate_recording_resource(ResourceState::Ready, false).is_ok());
-        assert_eq!(finalized_recording_state(true), TaskState::AwaitingTranscription);
-        assert_eq!(finalized_recording_state(false), TaskState::TranscribingLocal);
+        assert_eq!(
+            finalized_recording_state(true, &[100; 160]),
+            TaskState::AwaitingTranscription
+        );
+        assert_eq!(
+            finalized_recording_state(false, &[100; 160]),
+            TaskState::TranscribingLocal
+        );
         assert!(!TaskState::AwaitingTranscription.blocks_recording());
+    }
+
+    #[test]
+    fn deferred_silence_is_detected_at_finalize_regardless_of_duration() {
+        for seconds in [0, 1, 10, 11, 30] {
+            let silence = vec![0; super::audio::TARGET_SAMPLE_RATE as usize * seconds];
+            assert_eq!(
+                finalized_recording_state(true, &silence),
+                TaskState::NoAudioDetected
+            );
+            assert_eq!(
+                finalized_recording_state(false, &silence),
+                TaskState::TranscribingLocal
+            );
+        }
     }
 
     #[test]
