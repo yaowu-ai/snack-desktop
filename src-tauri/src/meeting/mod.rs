@@ -2439,35 +2439,49 @@ fn generate_recording_id() -> String {
     format!("rec-{}-{}-{}", unix_millis(), process, counter)
 }
 
-fn open_permission_settings(_app: &AppHandle, permission: &str) -> Result<(), String> {
-    let url = match permission {
+fn open_permission_settings(app: &AppHandle, permission: &str) -> Result<(), String> {
+    let url = permission_settings_url(app, permission)?;
+    let parsed = url
+        .parse::<tauri::Url>()
+        .map_err(|_| "无法打开系统设置".to_string())?;
+    crate::platform::open_system_settings_url(&parsed)
+}
+
+fn permission_settings_url(app: &AppHandle, permission: &str) -> Result<String, String> {
+    match permission {
         "microphone" => {
             if cfg!(target_os = "macos") {
-                "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone"
+                Ok(
+                    "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone"
+                        .into(),
+                )
             } else {
-                "ms-settings:privacy-microphone"
+                Ok("ms-settings:privacy-microphone".into())
             }
         }
         "notifications" => {
             if cfg!(target_os = "macos") {
-                "x-apple.systempreferences:com.apple.Notifications-Settings.extension"
+                Ok(notification_settings_url(&app.config().identifier))
             } else {
-                "ms-settings:notifications"
+                Ok("ms-settings:notifications".into())
             }
         }
         "system_audio" => {
             if cfg!(target_os = "macos") {
-                "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture"
+                Ok(
+                    "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture"
+                        .into(),
+                )
             } else {
-                "ms-settings:sound"
+                Ok("ms-settings:sound".into())
             }
         }
-        _ => return Err("未知的权限类型".to_string()),
-    };
-    let parsed = url
-        .parse::<tauri::Url>()
-        .map_err(|_| "无法打开系统设置".to_string())?;
-    crate::platform::open_external_url(&parsed)
+        _ => Err("未知的权限类型".to_string()),
+    }
+}
+
+fn notification_settings_url(identifier: &str) -> String {
+    format!("x-apple.systempreferences:com.apple.Notifications-Settings.extension?id={identifier}")
 }
 
 #[cfg(test)]
@@ -2480,9 +2494,10 @@ mod tests {
         has_desktop_update_blocking_state, has_site_switch_blocking_state, imported_audio_task,
         is_valid_session_id, next_transcription_pause_state, normalize_chat_handoff_state,
         normalize_recording_projects, normalize_transcript_asset_upload_state,
-        recover_txt_audio_file, rename_transcript_text_file, should_automatically_generate_notes,
-        site_switch_is_blocked_by_state, task_with_state, MeetingCapabilities, MeetingSettings,
-        MeetingTask, TaskState, Transcript, TranscriptAssetState,
+        notification_settings_url, recover_txt_audio_file, rename_transcript_text_file,
+        should_automatically_generate_notes, site_switch_is_blocked_by_state, task_with_state,
+        MeetingCapabilities, MeetingSettings, MeetingTask, TaskState, Transcript,
+        TranscriptAssetState,
     };
     use crate::meeting::audio::WavWriter;
     use std::fs;
@@ -2529,6 +2544,14 @@ mod tests {
         assert_eq!(value["transcriptionTaskControls"], true);
         assert_eq!(value["transcriptProjectAssets"], true);
         assert_eq!(value["inlineRecording"], true);
+    }
+
+    #[test]
+    fn notification_settings_target_the_current_app_identifier() {
+        assert_eq!(
+            notification_settings_url("cn.yaowutech.snack"),
+            "x-apple.systempreferences:com.apple.Notifications-Settings.extension?id=cn.yaowutech.snack"
+        );
     }
 
     #[test]
