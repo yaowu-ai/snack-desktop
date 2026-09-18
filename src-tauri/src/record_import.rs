@@ -8,7 +8,7 @@ use crate::web::is_allowed_web_origin;
 
 const RECORD_METADATA_TYPE: &str = "cn.yaowutech.snack.record-handoff+json";
 const RECORD_IMPORT_READY_EVENT: &str = "snack-record-import-ready";
-const MAX_TRANSCRIPT_BYTES: usize = 5 * 1024 * 1024;
+const MAX_TRANSCRIPT_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Debug, PartialEq)]
 struct MeetingNavigationTarget {
@@ -451,10 +451,10 @@ fn build_meeting_import(
     project_name: Option<String>,
 ) -> Result<PendingRecordImport, String> {
     if prompt.trim().is_empty() || prompt.len() > MAX_TRANSCRIPT_BYTES {
-        return Err("会议纪要 Prompt 为空或超过 5 MB".to_string());
+        return Err("会议纪要 Prompt 为空或超过 4 MB".to_string());
     }
     if attachment_name.trim().is_empty() || attachment_text.len() > MAX_TRANSCRIPT_BYTES {
-        return Err("会议转写文件无效或超过 5 MB".to_string());
+        return Err("会议转写文件无效或超过 4 MB".to_string());
     }
     if project_id
         .as_deref()
