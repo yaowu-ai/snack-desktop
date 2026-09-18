@@ -13,7 +13,6 @@ mod capture_macos;
 mod capture_windows;
 mod catalog;
 mod install;
-mod network;
 mod notifications;
 pub(crate) mod overlay;
 mod permissions;
@@ -2147,7 +2146,7 @@ fn spawn_transcription(app: AppHandle, store: MeetingStore, recording_id: String
                 None => return,
                 Some(_) => return,
             };
-            if let Err(message) = network::persist_transcript(&store, &mut task, transcript) {
+            if let Err(message) = persist_transcript(&store, &mut task, transcript) {
                 task.state = TaskState::TranscriptionFailed;
                 task.error = Some(message.clone());
                 let _ = store.save_task_progress(&task);
@@ -2184,6 +2183,24 @@ fn spawn_transcription(app: AppHandle, store: MeetingStore, recording_id: String
             format!("无法启动本地转写线程: {error}"),
         );
     }
+}
+
+/// Persist the native transcript and its plain-text export for the Web handoff.
+fn persist_transcript(
+    store: &MeetingStore,
+    task: &mut MeetingTask,
+    transcript: Transcript,
+) -> Result<(), String> {
+    state::persist_json_atomic(&store.transcript_path(&task.recording_id), &transcript)?;
+    let text_path = store.available_transcript_text_path(task);
+    if let Some(parent) = text_path.parent() {
+        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    fs::write(&text_path, state::transcript_text(&transcript))
+        .map_err(|error| error.to_string())?;
+    task.transcript = Some(transcript);
+    task.transcript_path = Some(text_path.to_string_lossy().into_owned());
+    Ok(())
 }
 
 fn fail_transcription_task(
@@ -2374,23 +2391,15 @@ fn generate_notes(app: AppHandle, store: MeetingStore, recording_id: String) -> 
     ) {
         return Err("当前记录不能生成会议纪要".to_string());
     }
-    task.state = TaskState::GeneratingNotes;
+    // Keep note generation in the authenticated Web flow; the native client only owns capture and transcription.
+    open_notes_in_chat(&app, &recording_id, true)?;
+    task.state = TaskState::TranscriptReady;
     task.error = None;
+    task.next_retry_at = None;
+    task.submission.last_error = None;
     task.updated_at = now_rfc3339();
     store.save_task_progress(&task)?;
     emit_state(&app, &store);
-    tauri::async_runtime::spawn(async move {
-        if let Err(message) = network::run_submission_pipeline(&app, &store, &recording_id).await {
-            if let Some(mut task) = store.load_task_record(&recording_id) {
-                if task.state == TaskState::GeneratingNotes {
-                    task.state = TaskState::WaitingForNetwork;
-                    task.error = Some(message);
-                    let _ = store.save_task_progress(&task);
-                    emit_state(&app, &store);
-                }
-            }
-        }
-    });
     Ok(())
 }
 
