@@ -4,6 +4,7 @@
 #import <CoreAudio/CoreAudio.h>
 #import <CoreAudio/AudioHardwareTapping.h>
 #import <CoreAudio/CATapDescription.h>
+#import <dlfcn.h>
 
 typedef void (*SnackAudioCallback)(const float *, size_t, double, void *);
 typedef struct {
@@ -15,6 +16,20 @@ typedef struct {
     SnackAudioCallback callback;
     void *context;
 } SnackAudioTap;
+
+// Core Audio has no public authorization-status API for process taps. Query
+// the matching TCC service dynamically so this remains an optional capability
+// and never falls back to the unrelated screen-recording preflight.
+int32_t snack_audio_capture_permission_status(void) {
+    typedef int (*TCCAccessPreflightFn)(CFStringRef, CFDictionaryRef);
+    void *handle = dlopen("/System/Library/PrivateFrameworks/TCC.framework/Versions/A/TCC", RTLD_NOW);
+    if (!handle) return -1;
+    TCCAccessPreflightFn preflight = (TCCAccessPreflightFn)dlsym(handle, "TCCAccessPreflight");
+    if (!preflight) { dlclose(handle); return -1; }
+    int result = preflight(CFSTR("kTCCServiceAudioCapture"), NULL);
+    dlclose(handle);
+    return result;
+}
 
 // The mono tap delivers packed Float32 samples. The callback borrows the buffer
 // only for this invocation; Rust copies/resamples into its bounded audio queue.

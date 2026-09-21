@@ -55,12 +55,24 @@ pub(crate) fn check_mac_permission_statuses() -> (PermissionAccess, PermissionAc
         None => PermissionAccess::Denied,
     };
 
-    // Core Audio taps have no public non-prompting TCC status query. A screen
-    // recording preflight is a different permission and must not gate audio.
-    // The OS checks system-audio authorization when the user starts the tap.
-    let system_audio = PermissionAccess::Unknown;
+    let system_audio = system_audio_access_from_preflight(unsafe {
+        snack_audio_capture_permission_status()
+    });
 
     (microphone, system_audio)
+}
+
+fn system_audio_access_from_preflight(status: i32) -> PermissionAccess {
+    match status {
+        0 => PermissionAccess::Granted,
+        1 => PermissionAccess::Denied,
+        _ => PermissionAccess::Unknown,
+    }
+}
+
+#[cfg(target_os = "macos")]
+extern "C" {
+    fn snack_audio_capture_permission_status() -> i32;
 }
 
 #[cfg(target_os = "macos")]
@@ -134,12 +146,20 @@ pub(crate) async fn request_mac_permissions(
 
 #[cfg(test)]
 mod tests {
-    use super::PermissionAccess;
+    use super::{system_audio_access_from_preflight, PermissionAccess};
 
     #[test]
     fn permission_access_serializes_each_state_without_losing_denials() {
         assert_eq!(PermissionAccess::from_granted(true).as_str(), "granted");
         assert_eq!(PermissionAccess::from_granted(false).as_str(), "denied");
         assert_eq!(PermissionAccess::Unknown.as_str(), "unknown");
+    }
+
+    #[test]
+    fn core_audio_tcc_preflight_maps_known_spi_results() {
+        assert_eq!(system_audio_access_from_preflight(0), PermissionAccess::Granted);
+        assert_eq!(system_audio_access_from_preflight(1), PermissionAccess::Denied);
+        assert_eq!(system_audio_access_from_preflight(-1), PermissionAccess::Unknown);
+        assert_eq!(system_audio_access_from_preflight(2), PermissionAccess::Unknown);
     }
 }
