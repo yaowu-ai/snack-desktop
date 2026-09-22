@@ -213,18 +213,9 @@ fn apply_initial_bounds(
 
     if let Some(saved) = saved {
         match restored_bounds(&saved, &snapshot.work_areas, snapshot.primary) {
-            Some(bounds) if !is_full_work_area(bounds, &snapshot.work_areas) => {
+            Some(bounds) => {
                 set_bounds(app, window, bounds, "restore");
                 return false;
-            }
-            Some(_) => {
-                logging::write_app_log(
-                    app,
-                    "info",
-                    "window-state",
-                    "Treating a legacy full-work-area state as the default maximized window",
-                    None,
-                );
             }
             None => {
                 logging::write_app_log(
@@ -280,6 +271,7 @@ fn detect_monitors(window: &WebviewWindow) -> tauri::Result<MonitorSnapshot> {
     })
 }
 
+#[cfg(test)]
 fn screen_bounds(area: WorkArea) -> WindowBounds {
     WindowBounds {
         x: area.x,
@@ -287,13 +279,6 @@ fn screen_bounds(area: WorkArea) -> WindowBounds {
         width: area.width,
         height: area.height,
     }
-}
-
-fn is_full_work_area(bounds: WindowBounds, work_areas: &[WorkArea]) -> bool {
-    work_areas
-        .iter()
-        .copied()
-        .any(|area| screen_bounds(area) == bounds)
 }
 
 fn set_bounds(app: &AppHandle, window: &WebviewWindow, bounds: WindowBounds, action: &str) {
@@ -575,9 +560,9 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::{
-        has_reachable_title_bar, is_full_work_area, load, persist, restored_bounds,
-        safe_restored_bounds, screen_bounds, PersistedWindowState, WindowBounds, WorkArea,
-        MIN_HEIGHT, MIN_WIDTH, STATE_VERSION,
+        has_reachable_title_bar, load, persist, restored_bounds, safe_restored_bounds,
+        screen_bounds, PersistedWindowState, WindowBounds, WorkArea, MIN_HEIGHT, MIN_WIDTH,
+        STATE_VERSION,
     };
 
     static TEMP_FILE_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
@@ -604,20 +589,6 @@ mod tests {
     }
 
     #[test]
-    fn identifies_legacy_full_work_area_state() {
-        assert!(is_full_work_area(screen_bounds(PRIMARY), &[PRIMARY]));
-        assert!(!is_full_work_area(
-            WindowBounds {
-                x: 100,
-                y: 80,
-                width: 1280,
-                height: 800,
-            },
-            &[PRIMARY]
-        ));
-    }
-
-    #[test]
     fn preserves_reachable_bounds() {
         let saved = WindowBounds {
             x: 100,
@@ -629,6 +600,20 @@ mod tests {
         assert_eq!(
             safe_restored_bounds(saved, &[PRIMARY], Some(PRIMARY)),
             Some(saved)
+        );
+    }
+
+    #[test]
+    fn preserves_saved_full_work_area_bounds() {
+        let saved = PersistedWindowState {
+            version: STATE_VERSION,
+            bounds: screen_bounds(PRIMARY),
+            scale_factor: PRIMARY.scale_factor,
+        };
+
+        assert_eq!(
+            restored_bounds(&saved, &[PRIMARY], Some(PRIMARY)),
+            Some(screen_bounds(PRIMARY))
         );
     }
 
