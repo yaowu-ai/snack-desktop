@@ -1,6 +1,10 @@
 use std::path::Path;
 use std::process::Command;
 
+#[cfg(target_os = "macos")]
+use objc2_app_kit::NSWorkspace;
+#[cfg(target_os = "macos")]
+use objc2_foundation::{NSString, NSURL};
 use tauri::Url;
 
 pub(crate) fn open_path(path: &Path) -> Result<(), String> {
@@ -13,6 +17,23 @@ pub(crate) fn reveal_path(path: &Path) -> Result<(), String> {
 
 pub(crate) fn open_external_url(url: &Url) -> Result<(), String> {
     run_open_command(build_open_url_command(url.as_str()))
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn open_system_settings_url(url: &Url) -> Result<(), String> {
+    let value = NSString::from_str(url.as_str());
+    let native_url =
+        NSURL::URLWithString(&value).ok_or_else(|| "failed to open URL".to_string())?;
+    if NSWorkspace::sharedWorkspace().openURL(&native_url) {
+        Ok(())
+    } else {
+        Err("failed to open URL".to_string())
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn open_system_settings_url(url: &Url) -> Result<(), String> {
+    open_external_url(url)
 }
 
 fn run_open_command(mut command: Command) -> Result<(), String> {

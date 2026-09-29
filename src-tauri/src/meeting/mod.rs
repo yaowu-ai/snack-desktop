@@ -13,7 +13,6 @@ mod capture_macos;
 mod capture_windows;
 mod catalog;
 mod install;
-mod network;
 mod notifications;
 pub(crate) mod overlay;
 mod permissions;
@@ -55,6 +54,8 @@ pub(crate) struct MeetingManagerState {
     pub(crate) recorder: Mutex<Option<Recorder>>,
     recording_task_update: Mutex<()>,
     recording_projects: Mutex<Vec<overlay::RecordingProjectOption>>,
+    recording_overlay_enabled: AtomicBool,
+    inline_recording_mode: AtomicBool,
     pub(crate) reminder: reminder::RecordingReminderMonitor,
     background_notes_active: AtomicBool,
 }
@@ -135,6 +136,8 @@ pub(crate) struct MeetingSnapshot {
 struct MeetingCapabilities {
     transcript_project_assets: bool,
     transcription_task_controls: bool,
+    inline_recording: bool,
+    deferred_transcription: bool,
 }
 
 impl MeetingCapabilities {
@@ -142,6 +145,8 @@ impl MeetingCapabilities {
         Self {
             transcript_project_assets: true,
             transcription_task_controls: true,
+            inline_recording: true,
+            deferred_transcription: true,
         }
     }
 }
@@ -170,7 +175,22 @@ pub(crate) fn build_snapshot(store: &MeetingStore) -> MeetingSnapshot {
 
 pub(crate) fn emit_state(app: &AppHandle, store: &MeetingStore) {
     let snapshot = build_snapshot(store);
+    allow_recording_audio(app, &snapshot);
     let _ = app.emit(STATE_EVENT, snapshot);
+}
+
+// Grant only concrete audio files already known to the native recording store.
+// An empty static asset scope keeps other local files inaccessible; Tauri supplies
+// byte-range responses for playback and full responses for cloud upload.
+fn allow_recording_audio(app: &AppHandle, snapshot: &MeetingSnapshot) {
+    let scope = app.asset_protocol_scope();
+    for task in snapshot.tasks.iter().chain(snapshot.task.iter()) {
+        if let Some(path) = &task.audio_path {
+            if std::path::Path::new(path).is_file() {
+                let _ = scope.allow_file(path);
+            }
+        }
+    }
 }
 
 pub(crate) fn desktop_update_block_reason(app: &AppHandle) -> Option<String> {
@@ -253,6 +273,8 @@ pub(crate) fn initialize(app: &AppHandle) -> Result<(), String> {
         recorder: Mutex::new(None),
         recording_task_update: Mutex::new(()),
         recording_projects: Mutex::new(Vec::new()),
+        recording_overlay_enabled: AtomicBool::new(true),
+        inline_recording_mode: AtomicBool::new(false),
         reminder,
         background_notes_active: AtomicBool::new(false),
     });
@@ -438,7 +460,9 @@ pub(crate) fn meeting_get_snapshot(
 ) -> Result<MeetingSnapshot, String> {
     require_allowed_window(&window)?;
     let state = app.state::<MeetingManagerState>();
-    Ok(build_snapshot(&state.store))
+    let snapshot = build_snapshot(&state.store);
+    allow_recording_audio(&app, &snapshot);
+    Ok(snapshot)
 }
 
 #[tauri::command]
@@ -709,37 +733,40 @@ pub(crate) async fn meeting_start_recording(
     window: WebviewWindow,
     language: Option<String>,
     consented: bool,
+    show_overlay: Option<bool>,
+    defer_transcription: Option<bool>,
 ) -> Result<(), String> {
     require_allowed_window(&window)?;
-    start_recording(app, language, consented)
+    let inline = app.state::<MeetingManagerState>().inline_recording_mode.load(Ordering::SeqCst);
+    start_recording(app, language, consented, recording_overlay_presentation(inline, show_overlay), defer_transcription.unwrap_or(false))
+}
+
+/// Inline presentation wins over legacy callers requesting a floating overlay.
+fn recording_overlay_presentation(inline: bool, requested: Option<bool>) -> bool {
+    !inline && requested.unwrap_or(true)
+}
+
+/// The authenticated Web shell owns tenant presentation; this flag is not an authorization grant.
+#[tauri::command]
+pub(crate) fn meeting_set_inline_recording(app: AppHandle, window: WebviewWindow, enabled: bool) -> Result<(), String> {
+    require_allowed_window(&window)?;
+    app.state::<MeetingManagerState>().inline_recording_mode.store(enabled, Ordering::SeqCst);
+    Ok(())
 }
 
 pub(crate) async fn start_quick_recording(app: AppHandle) -> Result<(), String> {
+    if app.state::<MeetingManagerState>().inline_recording_mode.load(Ordering::SeqCst) {
+        crate::app_menu::show_main_window(&app);
+        return app.emit("meeting-note-entry", ()).map_err(|error| error.to_string());
+    }
     let (current_microphone, current_system_audio) = current_permission_statuses()?;
     if can_attempt_recording_without_permission_request(current_microphone, current_system_audio) {
-        return start_recording(app, Some("zh".to_string()), true);
-    }
-
-    // CoreGraphics can report a stale false value after the Screen & System
-    // Audio Recording switch is enabled. Let the actual ScreenCaptureKit
-    // recorder make the definitive check only after the user presses Record.
-    if current_microphone == PermissionAccess::Granted
-        && current_system_audio == PermissionAccess::Unknown
-    {
-        match start_recording(app.clone(), Some("zh".to_string()), true) {
-            Ok(()) => return Ok(()),
-            Err(error) if is_system_audio_permission_error(&error) => {}
-            Err(error) => return Err(error),
-        }
+        return start_recording(app, Some("zh".to_string()), true, true, false);
     }
 
     let (microphone, system_audio) = request_capture_permissions(&app).await?;
     ensure_quick_recording_permissions(&app, microphone, system_audio)?;
-    start_recording(app, Some("zh".to_string()), true)
-}
-
-fn is_system_audio_permission_error(error: &str) -> bool {
-    error.contains("系统音频") || error.contains("屏幕与系统录音")
+    start_recording(app, Some("zh".to_string()), true, true, false)
 }
 
 fn current_permission_statuses() -> Result<(PermissionAccess, PermissionAccess), String> {
@@ -749,8 +776,7 @@ fn current_permission_statuses() -> Result<(PermissionAccess, PermissionAccess),
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let (microphone, system_audio) =
-            check_capture_permissions().map_err(|error| error.to_string())?;
+        let (microphone, system_audio) = check_capture_permissions()?;
         Ok((
             PermissionAccess::from_granted(microphone),
             PermissionAccess::from_granted(system_audio),
@@ -784,16 +810,14 @@ async fn request_capture_permissions(
 }
 
 fn ensure_quick_recording_permissions(
-    app: &AppHandle,
+    _app: &AppHandle,
     microphone: PermissionAccess,
     system_audio: PermissionAccess,
 ) -> Result<(), String> {
     if microphone != PermissionAccess::Granted {
-        open_permission_settings(app, "microphone")?;
         return Err("请在系统设置中允许 Snack 使用麦克风".to_string());
     }
-    if system_audio != PermissionAccess::Granted {
-        open_permission_settings(app, "system_audio")?;
+    if !cfg!(target_os = "macos") && system_audio != PermissionAccess::Granted {
         return Err("请在系统设置中允许 Snack 录制屏幕与系统音频".to_string());
     }
     Ok(())
@@ -803,6 +827,8 @@ fn start_recording(
     app: AppHandle,
     language: Option<String>,
     consented: bool,
+    show_overlay: bool,
+    defer_transcription: bool,
 ) -> Result<(), String> {
     if !consented {
         return Err("请先确认已获得参会者同意".to_string());
@@ -810,18 +836,18 @@ fn start_recording(
     let state = app.state::<MeetingManagerState>();
     let store = &state.store;
 
-    // 1. Model must be ready.
+    // 1. Manual-transcription recordings need only capture permissions and disk space.
     let resource = store.load_resource();
-    if resource.state != ResourceState::Ready {
-        return Err("本地模型未就绪，无法开始录音".to_string());
-    }
+    validate_recording_resource(resource.state, defer_transcription)?;
 
     // 2. Clicking record again while a recording is active restores a minimized overlay.
     if let Some(task) = store.load_task() {
         if task.state == TaskState::Recording
             && state.recorder.lock().expect("recorder poisoned").is_some()
         {
-            overlay::restore_overlay(&app)?;
+            if state.recording_overlay_enabled.load(Ordering::SeqCst) {
+                overlay::restore_overlay(&app)?;
+            }
             return Ok(());
         }
         if task.state.blocks_recording() {
@@ -857,7 +883,8 @@ fn start_recording(
     let mut task = MeetingTask::new(recording_id.clone(), language);
     task.state = TaskState::Checking;
     task.started_at = Some(now_rfc3339());
-    task.auto_generate_notes_enabled = Some(store.load_settings().auto_generate_notes_enabled);
+    task.defer_transcription = defer_transcription;
+    task.auto_generate_notes_enabled = Some(!defer_transcription && store.load_settings().auto_generate_notes_enabled);
     store.save_task(&task)?;
     emit_state(&app, store);
 
@@ -871,10 +898,15 @@ fn start_recording(
             task.state = TaskState::Recording;
             task.audio_path = Some(audio_path.to_string_lossy().to_string());
             store.save_task(&task)?;
+            state.recording_overlay_enabled.store(show_overlay, Ordering::SeqCst);
             emit_state(&app, store);
-            let status = current_live_capture_status(&state)?;
-            overlay::show_overlay(&app, build_overlay_state(&state, &task, status))?;
-            spawn_overlay_updater(app.clone(), recording_id);
+            if show_overlay {
+                let status = current_live_capture_status(&state)?;
+                overlay::show_overlay(&app, build_overlay_state(&state, &task, status))?;
+                spawn_overlay_updater(app.clone(), recording_id);
+            } else {
+                overlay::hide_overlay(&app);
+            }
             Ok(())
         }
         Err(error) => {
@@ -888,11 +920,6 @@ fn start_recording(
             task.error = Some(error.message.clone());
             store.save_task(&task)?;
             emit_state(&app, store);
-            if error.kind == capture::CaptureErrorKind::PermissionDenied {
-                if let Some(permission) = error.missing_permission {
-                    let _ = open_permission_settings(&app, permission);
-                }
-            }
             Err(error.message)
         }
     }
@@ -1368,6 +1395,9 @@ fn clear_missing_recording_project(app: &AppHandle) -> Result<(), String> {
 }
 
 fn refresh_recording_overlay(app: &AppHandle) {
+    if !app.state::<MeetingManagerState>().recording_overlay_enabled.load(Ordering::SeqCst) {
+        return;
+    }
     let Some(window) = app.get_webview_window(overlay::OVERLAY_LABEL) else {
         return;
     };
@@ -1483,15 +1513,16 @@ fn finalize_recording(app: AppHandle, store: MeetingStore, recorder: Recorder) {
         fail_finalize(&app, &store, "音频路径丢失".to_string());
         return;
     };
-    let duration_ms = match audio::read_wav_i16(&audio_path) {
-        Ok((_, duration_ms)) => duration_ms,
+    let (samples, duration_ms) = match audio::read_wav_i16(&audio_path) {
+        Ok(decoded) => decoded,
         Err(message) => {
             fail_finalize(&app, &store, format!("录音文件校验失败: {message}"));
             return;
         }
     };
 
-    task.state = TaskState::TranscribingLocal;
+    task.state = finalized_recording_state(task.defer_transcription, &samples);
+    drop(samples);
     task.duration_ms = Some(duration_ms);
     task.ended_at = Some(now_rfc3339());
     task.audio_bytes = fs::metadata(&audio_path).ok().map(|meta| meta.len());
@@ -1515,10 +1546,29 @@ fn finalize_recording(app: AppHandle, store: MeetingStore, recorder: Recorder) {
         &app,
         "info",
         "meeting-finalize",
-        "recording finalized and transcription started",
+        "recording finalized",
         Some(&serde_json::json!({ "recordingId": task.recording_id })),
     );
-    spawn_transcription(app, store, task.recording_id);
+    if !task.defer_transcription {
+        spawn_transcription(app, store, task.recording_id);
+    }
+}
+
+fn validate_recording_resource(resource: ResourceState, deferred: bool) -> Result<(), String> {
+    if !deferred && resource != ResourceState::Ready {
+        return Err("本地模型未就绪，无法开始录音".to_string());
+    }
+    Ok(())
+}
+
+fn finalized_recording_state(deferred: bool, samples: &[i16]) -> TaskState {
+    if !deferred {
+        TaskState::TranscribingLocal
+    } else if audio::has_audio_signal_i16(samples) {
+        TaskState::AwaitingTranscription
+    } else {
+        TaskState::NoAudioDetected
+    }
 }
 
 fn fail_finalize(app: &AppHandle, store: &MeetingStore, message: String) {
@@ -1790,14 +1840,14 @@ pub(crate) fn meeting_open_local_file(
         .ok_or_else(|| "没有找到本地录音".to_string())?;
     let path = match kind.as_str() {
         "transcript" => task.transcript_path.map(PathBuf::from),
-        "audio" => task.audio_path.map(PathBuf::from),
+        "audio" | "audio_folder" => task.audio_path.map(PathBuf::from),
         _ => return Err("不支持的本地文件类型".to_string()),
     }
     .ok_or_else(|| "本地文件不存在".to_string())?;
     if !path.exists() {
         return Err("本地文件不存在".to_string());
     }
-    if kind == "transcript" {
+    if kind == "transcript" || kind == "audio_folder" {
         crate::platform::reveal_path(&path)
     } else {
         crate::platform::open_path(&path)
@@ -1911,6 +1961,13 @@ pub(crate) fn meeting_retranscribe(
     let mut task = store
         .load_task_record(&recording_id)
         .ok_or_else(|| "没有找到本地录音".to_string())?;
+    if task.state.blocks_recording() {
+        return Err("请先结束录音并等待文件保存完成".to_string());
+    }
+    if task.state == TaskState::TranscribingLocal { return Ok(()); }
+    if store.load_resource().state != ResourceState::Ready {
+        return Err("请先下载并安装本地转写模型".to_string());
+    }
     let audio_path = task
         .audio_path
         .as_deref()
@@ -2089,7 +2146,7 @@ fn spawn_transcription(app: AppHandle, store: MeetingStore, recording_id: String
                 None => return,
                 Some(_) => return,
             };
-            if let Err(message) = network::persist_transcript(&store, &mut task, transcript) {
+            if let Err(message) = persist_transcript(&store, &mut task, transcript) {
                 task.state = TaskState::TranscriptionFailed;
                 task.error = Some(message.clone());
                 let _ = store.save_task_progress(&task);
@@ -2126,6 +2183,24 @@ fn spawn_transcription(app: AppHandle, store: MeetingStore, recording_id: String
             format!("无法启动本地转写线程: {error}"),
         );
     }
+}
+
+/// Persist the native transcript and its plain-text export for the Web handoff.
+fn persist_transcript(
+    store: &MeetingStore,
+    task: &mut MeetingTask,
+    transcript: Transcript,
+) -> Result<(), String> {
+    state::persist_json_atomic(&store.transcript_path(&task.recording_id), &transcript)?;
+    let text_path = store.available_transcript_text_path(task);
+    if let Some(parent) = text_path.parent() {
+        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    fs::write(&text_path, state::transcript_text(&transcript))
+        .map_err(|error| error.to_string())?;
+    task.transcript = Some(transcript);
+    task.transcript_path = Some(text_path.to_string_lossy().into_owned());
+    Ok(())
 }
 
 fn fail_transcription_task(
@@ -2316,23 +2391,15 @@ fn generate_notes(app: AppHandle, store: MeetingStore, recording_id: String) -> 
     ) {
         return Err("当前记录不能生成会议纪要".to_string());
     }
-    task.state = TaskState::GeneratingNotes;
+    // Keep note generation in the authenticated Web flow; the native client only owns capture and transcription.
+    open_notes_in_chat(&app, &recording_id, true)?;
+    task.state = TaskState::TranscriptReady;
     task.error = None;
+    task.next_retry_at = None;
+    task.submission.last_error = None;
     task.updated_at = now_rfc3339();
     store.save_task_progress(&task)?;
     emit_state(&app, &store);
-    tauri::async_runtime::spawn(async move {
-        if let Err(message) = network::run_submission_pipeline(&app, &store, &recording_id).await {
-            if let Some(mut task) = store.load_task_record(&recording_id) {
-                if task.state == TaskState::GeneratingNotes {
-                    task.state = TaskState::WaitingForNetwork;
-                    task.error = Some(message);
-                    let _ = store.save_task_progress(&task);
-                    emit_state(&app, &store);
-                }
-            }
-        }
-    });
     Ok(())
 }
 
@@ -2351,6 +2418,7 @@ fn spawn_overlay_updater(app: AppHandle, recording_id: String) {
                 }
             };
             let state = app.state::<MeetingManagerState>();
+            if !state.recording_overlay_enabled.load(Ordering::SeqCst) { return; }
             if !state.store.load_task().is_some_and(|task| {
                 task.recording_id == recording_id && task.state == TaskState::Recording
             }) {
@@ -2387,45 +2455,124 @@ fn generate_recording_id() -> String {
     format!("rec-{}-{}-{}", unix_millis(), process, counter)
 }
 
-fn open_permission_settings(_app: &AppHandle, permission: &str) -> Result<(), String> {
-    let url = match permission {
+fn open_permission_settings(app: &AppHandle, permission: &str) -> Result<(), String> {
+    let url = permission_settings_url(app, permission)?;
+    let parsed = url
+        .parse::<tauri::Url>()
+        .map_err(|_| "无法打开系统设置".to_string())?;
+    crate::platform::open_system_settings_url(&parsed)
+}
+
+fn permission_settings_url(app: &AppHandle, permission: &str) -> Result<String, String> {
+    match permission {
         "microphone" => {
             if cfg!(target_os = "macos") {
-                "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone"
+                Ok(
+                    "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone"
+                        .into(),
+                )
             } else {
-                "ms-settings:privacy-microphone"
+                Ok("ms-settings:privacy-microphone".into())
+            }
+        }
+        "notifications" => {
+            if cfg!(target_os = "macos") {
+                Ok(notification_settings_url(&app.config().identifier))
+            } else {
+                Ok("ms-settings:notifications".into())
             }
         }
         "system_audio" => {
             if cfg!(target_os = "macos") {
-                "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture"
+                Ok(
+                    "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture"
+                        .into(),
+                )
             } else {
-                "ms-settings:sound"
+                Ok("ms-settings:sound".into())
             }
         }
-        _ => return Err("未知的权限类型".to_string()),
-    };
-    let parsed = url
-        .parse::<tauri::Url>()
-        .map_err(|_| "无法打开系统设置".to_string())?;
-    crate::platform::open_external_url(&parsed)
+        _ => Err("未知的权限类型".to_string()),
+    }
+}
+
+fn notification_settings_url(identifier: &str) -> String {
+    format!("x-apple.systempreferences:com.apple.Notifications-Settings.extension?id={identifier}")
 }
 
 #[cfg(test)]
 mod tests {
     use super::permissions::PermissionAccess;
+    use super::{validate_recording_resource, finalized_recording_state, ResourceState};
     use super::{
         apply_transcript_project, can_attempt_recording_without_permission_request,
         claim_transcript_asset_upload, complete_transcript_asset_upload,
         has_desktop_update_blocking_state, has_site_switch_blocking_state, imported_audio_task,
         is_valid_session_id, next_transcription_pause_state, normalize_chat_handoff_state,
         normalize_recording_projects, normalize_transcript_asset_upload_state,
-        recover_txt_audio_file, rename_transcript_text_file, should_automatically_generate_notes,
-        site_switch_is_blocked_by_state, task_with_state, MeetingCapabilities, MeetingSettings,
-        MeetingTask, TaskState, Transcript, TranscriptAssetState,
+        notification_settings_url, recover_txt_audio_file, rename_transcript_text_file,
+        should_automatically_generate_notes, site_switch_is_blocked_by_state, task_with_state,
+        MeetingCapabilities, MeetingSettings, MeetingTask, TaskState, Transcript,
+        TranscriptAssetState,
     };
     use crate::meeting::audio::WavWriter;
     use std::fs;
+
+    #[test]
+    fn deferred_recording_needs_no_model_and_waits_after_finalize() {
+        assert!(validate_recording_resource(ResourceState::NotInstalled, true).is_ok());
+        assert!(validate_recording_resource(ResourceState::Downloading, true).is_ok());
+        assert!(validate_recording_resource(ResourceState::NotInstalled, false).is_err());
+        assert!(validate_recording_resource(ResourceState::Ready, false).is_ok());
+        assert_eq!(
+            finalized_recording_state(true, &[100; 160]),
+            TaskState::AwaitingTranscription
+        );
+        assert_eq!(
+            finalized_recording_state(false, &[100; 160]),
+            TaskState::TranscribingLocal
+        );
+        assert!(!TaskState::AwaitingTranscription.blocks_recording());
+    }
+
+    #[test]
+    fn deferred_silence_is_detected_at_finalize_regardless_of_duration() {
+        for seconds in [0, 1, 10, 11, 30] {
+            let silence = vec![0; super::audio::TARGET_SAMPLE_RATE as usize * seconds];
+            assert_eq!(
+                finalized_recording_state(true, &silence),
+                TaskState::NoAudioDetected
+            );
+            assert_eq!(
+                finalized_recording_state(false, &silence),
+                TaskState::TranscribingLocal
+            );
+        }
+    }
+
+    #[test]
+    fn deferred_policy_survives_task_storage_and_legacy_defaults() {
+        let mut task = MeetingTask::new("deferred-test".into(), "zh".into());
+        task.defer_transcription = true;
+        task.state = TaskState::AwaitingTranscription;
+        let mut value = serde_json::to_value(&task).unwrap();
+        let restored: MeetingTask = serde_json::from_value(value.clone()).unwrap();
+        assert!(restored.defer_transcription);
+        assert_eq!(restored.state, TaskState::AwaitingTranscription);
+        value.as_object_mut().unwrap().remove("deferTranscription");
+        assert!(!serde_json::from_value::<MeetingTask>(value).unwrap().defer_transcription);
+        assert_eq!(serde_json::to_value(MeetingCapabilities::current()).unwrap()["deferredTranscription"], true);
+    }
+
+    #[test]
+    fn inline_tenant_never_opens_an_overlay_and_legacy_entry_keeps_its_default() {
+        assert!(!super::recording_overlay_presentation(true, None));
+        assert!(!super::recording_overlay_presentation(true, Some(true)));
+        assert!(!super::recording_overlay_presentation(true, Some(false)));
+        assert!(super::recording_overlay_presentation(false, None));
+        assert!(super::recording_overlay_presentation(false, Some(true)));
+        assert!(!super::recording_overlay_presentation(false, Some(false)));
+    }
 
     #[test]
     fn snapshot_capabilities_are_explicit_even_for_local_versioned_builds() {
@@ -2433,6 +2580,15 @@ mod tests {
 
         assert_eq!(value["transcriptionTaskControls"], true);
         assert_eq!(value["transcriptProjectAssets"], true);
+        assert_eq!(value["inlineRecording"], true);
+    }
+
+    #[test]
+    fn notification_settings_target_the_current_app_identifier() {
+        assert_eq!(
+            notification_settings_url("cn.yaowutech.snack"),
+            "x-apple.systempreferences:com.apple.Notifications-Settings.extension?id=cn.yaowutech.snack"
+        );
     }
 
     #[test]

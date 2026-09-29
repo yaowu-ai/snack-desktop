@@ -26,14 +26,24 @@ struct BridgeMethodRegistration {
     handler: BridgeHandler,
 }
 
-const METHODS: &[BridgeMethodRegistration] = &[BridgeMethodRegistration {
-    descriptor: BridgeMethodDescriptor {
-        method: "bridge.info",
-        introduced_contract_revision: 1,
-        api_versions: &[1],
+const METHODS: &[BridgeMethodRegistration] = &[
+    BridgeMethodRegistration {
+        descriptor: BridgeMethodDescriptor {
+            method: "bridge.info",
+            introduced_contract_revision: 1,
+            api_versions: &[1],
+        },
+        handler: bridge_info_handler,
     },
-    handler: bridge_info_handler,
-}];
+    BridgeMethodRegistration {
+        descriptor: BridgeMethodDescriptor {
+            method: "notifications.permission",
+            introduced_contract_revision: 1,
+            api_versions: &[1],
+        },
+        handler: notification_permission_handler,
+    },
+];
 
 pub(crate) fn descriptors() -> Vec<BridgeMethodDescriptor> {
     METHODS
@@ -84,7 +94,23 @@ fn validate_empty_payload(payload: &serde_json::Value) -> Result<(), BridgeHandl
     }
     Err(BridgeHandlerError {
         code: "INVALID_PAYLOAD",
-        message: "bridge.info does not accept payload fields".to_string(),
+        message: "this method does not accept payload fields".to_string(),
+    })
+}
+
+fn notification_permission_handler(
+    context: BridgeContext,
+    payload: serde_json::Value,
+) -> BridgeHandlerFuture {
+    Box::pin(async move {
+        validate_empty_payload(&payload)?;
+        let permission = crate::notification_permission::current(&context.app)
+            .await
+            .map_err(|message| BridgeHandlerError {
+                code: "NOTIFICATION_PERMISSION_UNAVAILABLE",
+                message,
+            })?;
+        Ok(serde_json::json!({ "permission": permission }))
     })
 }
 
@@ -94,7 +120,7 @@ mod tests {
 
     #[test]
     fn registry_exposes_only_explicit_methods() {
-        assert_eq!(descriptors().len(), 1);
+        assert_eq!(descriptors().len(), 2);
         assert_eq!(descriptors()[0].method, "bridge.info");
         assert!(find("meeting_start_recording").is_none());
     }
@@ -102,6 +128,8 @@ mod tests {
     #[test]
     fn support_requires_a_registered_api_version() {
         assert!(supports(&request("bridge.info", 1)));
+        assert!(supports(&request("notifications.permission", 1)));
+        assert!(!supports(&request("notifications.permission", 2)));
         assert!(!supports(&request("bridge.info", 2)));
         assert!(!supports(&request("bridge.missing", 1)));
     }

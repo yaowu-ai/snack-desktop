@@ -2,9 +2,8 @@
 //!
 //! - Microphone: `AVCaptureDevice authorizationStatusForMediaType:` — exact,
 //!   non-prompting status (notDetermined/restricted/denied/authorized).
-//! - Screen recording (required for system audio capture): CoreGraphics
-//!   preflight/request APIs, which avoid turning an ordinary status check into
-//!   a user-visible privacy request during app startup.
+//! - System audio: Core Audio checks authorization when recording starts.
+//!   No screen permission query or private TCC API is used for recording.
 
 #[cfg(target_os = "macos")]
 use tauri::AppHandle;
@@ -56,18 +55,24 @@ pub(crate) fn check_mac_permission_statuses() -> (PermissionAccess, PermissionAc
         None => PermissionAccess::Denied,
     };
 
-    let system_audio = {
-        use core_graphics::access::ScreenCaptureAccess;
-        if ScreenCaptureAccess.preflight() {
-            PermissionAccess::Granted
-        } else {
-            // CoreGraphics does not distinguish not-yet-requested from a
-            // previous denial until a request is made.
-            PermissionAccess::Unknown
-        }
-    };
+    let system_audio = system_audio_access_from_preflight(unsafe {
+        snack_audio_capture_permission_status()
+    });
 
     (microphone, system_audio)
+}
+
+fn system_audio_access_from_preflight(status: i32) -> PermissionAccess {
+    match status {
+        0 => PermissionAccess::Granted,
+        1 => PermissionAccess::Denied,
+        _ => PermissionAccess::Unknown,
+    }
+}
+
+#[cfg(target_os = "macos")]
+extern "C" {
+    fn snack_audio_capture_permission_status() -> i32;
 }
 
 #[cfg(target_os = "macos")]
@@ -91,7 +96,7 @@ pub(crate) async fn request_mac_permissions(
 
     // Do not call CGRequestScreenCaptureAccess here. On some macOS releases it
     // displays a prompt even when the privacy switch is already enabled. The
-    // ScreenCaptureKit recorder performs the definitive check only after the
+    // Core Audio tap performs the definitive check only after the
     // user explicitly starts a recording.
     Ok((microphone, system_audio))
 }
@@ -120,7 +125,7 @@ async fn request_microphone_permission(app: &AppHandle) -> Result<PermissionAcce
         }
     })
     .map_err(|error| format!("无法请求麦克风权限: {error}"))?;
-    match tokio::time::timeout(std::time::Duration::from_secs(15), receiver).await {
+    match tokio::time::timeout(std::time::Duration::from_secs(120), receiver).await {
         Ok(Ok(granted)) => Ok(granted),
         Ok(Err(_)) => Err("麦克风权限请求未完成".to_string()),
         Err(_) => Ok(PermissionAccess::Denied),
@@ -141,12 +146,20 @@ pub(crate) async fn request_mac_permissions(
 
 #[cfg(test)]
 mod tests {
-    use super::PermissionAccess;
+    use super::{system_audio_access_from_preflight, PermissionAccess};
 
     #[test]
     fn permission_access_serializes_each_state_without_losing_denials() {
         assert_eq!(PermissionAccess::from_granted(true).as_str(), "granted");
         assert_eq!(PermissionAccess::from_granted(false).as_str(), "denied");
         assert_eq!(PermissionAccess::Unknown.as_str(), "unknown");
+    }
+
+    #[test]
+    fn core_audio_tcc_preflight_maps_known_spi_results() {
+        assert_eq!(system_audio_access_from_preflight(0), PermissionAccess::Granted);
+        assert_eq!(system_audio_access_from_preflight(1), PermissionAccess::Denied);
+        assert_eq!(system_audio_access_from_preflight(-1), PermissionAccess::Unknown);
+        assert_eq!(system_audio_access_from_preflight(2), PermissionAccess::Unknown);
     }
 }

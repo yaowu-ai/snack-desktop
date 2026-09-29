@@ -1,7 +1,7 @@
 //! Local audio capture: microphone + system audio, mixed into one WAV.
 //!
 //! Platform backends:
-//! - macOS: ScreenCaptureKit for system audio (16 kHz mono), cpal for mic.
+//! - macOS: Core Audio process tap for system audio (16 kHz mono), cpal for mic.
 //! - Windows: WASAPI loopback for system audio, cpal for mic.
 //!
 //! Every capture session runs inside a dedicated thread that owns the audio

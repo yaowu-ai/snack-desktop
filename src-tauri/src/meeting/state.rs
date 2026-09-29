@@ -172,6 +172,7 @@ pub(crate) enum TaskState {
     Checking,
     Recording,
     Finalizing,
+    AwaitingTranscription,
     TranscribingLocal,
     TranscriptionPaused,
     NoAudioDetected,
@@ -289,6 +290,9 @@ pub(crate) struct MeetingTask {
     pub(crate) display_name: Option<String>,
     #[serde(default)]
     pub(crate) auto_generate_notes_enabled: Option<bool>,
+    /// Captured at recording start; legacy records continue automatic transcription.
+    #[serde(default)]
+    pub(crate) defer_transcription: bool,
     #[serde(default)]
     pub(crate) notes_project_id: Option<String>,
     #[serde(default)]
@@ -332,6 +336,7 @@ impl MeetingTask {
             recording_id,
             display_name: None,
             auto_generate_notes_enabled: None,
+            defer_transcription: false,
             notes_project_id: None,
             notes_project_name: None,
             transcript_project_id: None,
@@ -821,7 +826,12 @@ fn insert_scanned_audio(candidates: &mut HashMap<PathBuf, u64>, entry: fs::DirEn
 fn protected_audio_paths(tasks: &[MeetingTask]) -> HashSet<PathBuf> {
     tasks
         .iter()
-        .filter(|task| task.state.is_active() || !task.audio_file_owned)
+        .filter(|task| {
+            task.state.is_active()
+                || task.state == TaskState::AwaitingTranscription
+                || (task.defer_transcription && task.state == TaskState::NoAudioDetected)
+                || !task.audio_file_owned
+        })
         .filter_map(|task| task.audio_path.as_deref().map(PathBuf::from))
         .collect()
 }
@@ -995,12 +1005,23 @@ fn meeting_task_local_date(task: &MeetingTask) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::protected_audio_paths;
+    use std::path::PathBuf;
     use super::{
         now_rfc3339, parse_rfc3339_millis, validate_meeting_settings, DownloadProgress,
         MeetingSettings, MeetingStore, MeetingTask, ResourceState, ResourceStatus,
         ServerSubmission, TaskState, TranscriptAssetState, DEFAULT_MEETING_NOTES_PROMPT,
     };
     use std::fs;
+
+    #[test]
+    fn awaiting_transcription_audio_is_protected_from_pruning() {
+        let mut task = MeetingTask::new("pending".into(), "zh".into());
+        task.state = TaskState::AwaitingTranscription;
+        task.audio_path = Some("/tmp/pending.wav".into());
+        let protected = protected_audio_paths(&[task]);
+        assert!(protected.contains(&PathBuf::from("/tmp/pending.wav")));
+    }
 
     #[test]
     fn resource_defaults_to_not_installed() {
@@ -1483,6 +1504,46 @@ mod tests {
 
         assert_eq!(store.prune_recording_audio(0).unwrap(), 0);
         assert!(audio_path.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn audio_retention_protects_deferred_silence_and_keeps_legacy_policy() {
+        let root = std::env::temp_dir().join(format!(
+            "snack-meeting-silent-audio-{}",
+            super::unix_millis()
+        ));
+        let state_root = root.join("state");
+        let audio_root = root.join("recordings").join(super::AUDIO_DIR_NAME);
+        fs::create_dir_all(state_root.join(super::TASKS_DIR_NAME)).unwrap();
+        fs::create_dir_all(&audio_root).unwrap();
+        let store = MeetingStore {
+            root: state_root,
+            default_recordings_root: root.join("recordings"),
+        };
+        for (recording_id, deferred) in [("deferred", true), ("legacy", false)] {
+            let audio_path = audio_root.join(format!("{recording_id}.wav"));
+            fs::write(&audio_path, b"audio").unwrap();
+            let mut task = MeetingTask::new(recording_id.into(), "zh".into());
+            task.state = TaskState::NoAudioDetected;
+            task.defer_transcription = deferred;
+            task.audio_path = Some(audio_path.to_string_lossy().into_owned());
+            store.save_task_record(&task).unwrap();
+        }
+
+        assert_eq!(store.prune_recording_audio(0).unwrap(), 1);
+        assert!(audio_root.join("deferred.wav").exists());
+        assert!(store
+            .load_task_record("deferred")
+            .unwrap()
+            .audio_path
+            .is_some());
+        assert!(!audio_root.join("legacy.wav").exists());
+        assert!(store
+            .load_task_record("legacy")
+            .unwrap()
+            .audio_path
+            .is_none());
         fs::remove_dir_all(root).unwrap();
     }
 

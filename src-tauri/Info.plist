@@ -6,6 +6,8 @@
 	<true/>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>Snack 需要使用麦克风录制现场声音并在本地生成会议转写。</string>
+	<key>NSAudioCaptureUsageDescription</key>
+	<string>Snack 需要录制电脑播放的会议声音，与麦克风声音一起生成会议记录。</string>
 	<key>NSScreenCaptureUsageDescription</key>
 	<string>Snack 需要在本机检测会议应用的音频活动，或录制系统音频并生成本地会议转写。</string>
 	<key>NSSupportsAutomaticGraphicsSwitching</key>

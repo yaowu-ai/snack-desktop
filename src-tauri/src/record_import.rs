@@ -8,7 +8,7 @@ use crate::web::is_allowed_web_origin;
 
 const RECORD_METADATA_TYPE: &str = "cn.yaowutech.snack.record-handoff+json";
 const RECORD_IMPORT_READY_EVENT: &str = "snack-record-import-ready";
-const MAX_TRANSCRIPT_BYTES: usize = 5 * 1024 * 1024;
+const MAX_TRANSCRIPT_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Debug, PartialEq)]
 struct MeetingNavigationTarget {
@@ -213,7 +213,12 @@ pub(crate) fn queue_background_with_attachment(
 }
 
 pub(crate) fn handle_open_url(app: &AppHandle, url: &tauri::Url) {
-    if let Some(target) = meeting_navigation_target(url) {
+    if let Some(target) = project_note_navigation_target(url) {
+        show_main_window(app);
+        if let Some(window) = app.get_webview_window("main") {
+            let _ = window.navigate(target);
+        }
+    } else if let Some(target) = meeting_navigation_target(url) {
         open_meeting_target(app, target);
     } else if is_clipboard_import_url(url) {
         handle_clipboard_import(app);
@@ -342,6 +347,39 @@ fn is_clipboard_import_url(url: &tauri::Url) -> bool {
             .any(|(key, value)| key == "source" && value == "clipboard")
 }
 
+/// Only an allowlisted Web origin and numeric resource IDs can reach the note page.
+fn project_note_navigation_target(url: &tauri::Url) -> Option<tauri::Url> {
+    if url.scheme() != "snack" || url.host_str() != Some("note") {
+        return None;
+    }
+    let pairs: Vec<_> = url.query_pairs().collect();
+    let value = |name: &str| {
+        let values: Vec<_> = pairs.iter().filter(|(key, _)| key == name).collect();
+        (values.len() == 1).then(|| values[0].1.to_string())
+    };
+    let note_id = value("noteId")?;
+    let project_id = value("projectId")?;
+    let tenant_key = value("tenantKey")?;
+    if !valid_note_resource_id(&note_id) || !valid_note_resource_id(&project_id)
+        || tenant_key.is_empty() || tenant_key.len() > 200 {
+        return None;
+    }
+    let mut target = tauri::Url::parse(&value("origin")?).ok()?;
+    if !is_allowed_web_origin(&target) || !target.username().is_empty() || target.password().is_some() {
+        return None;
+    }
+    target.set_path(&format!("/notes/project/{note_id}"));
+    target.set_query(None);
+    target.set_fragment(None);
+    target.query_pairs_mut().append_pair("projectId", &project_id).append_pair("tenantKey", &tenant_key);
+    Some(target)
+}
+
+fn valid_note_resource_id(value: &str) -> bool {
+    !value.starts_with('0') && value.bytes().all(|byte| byte.is_ascii_digit())
+        && value.parse::<i64>().is_ok_and(|id| id > 0)
+}
+
 fn meeting_navigation_target(url: &tauri::Url) -> Option<MeetingNavigationTarget> {
     if url.scheme() != "snack" || url.host_str() != Some("meeting") {
         return None;
@@ -413,10 +451,10 @@ fn build_meeting_import(
     project_name: Option<String>,
 ) -> Result<PendingRecordImport, String> {
     if prompt.trim().is_empty() || prompt.len() > MAX_TRANSCRIPT_BYTES {
-        return Err("会议纪要 Prompt 为空或超过 5 MB".to_string());
+        return Err("会议纪要 Prompt 为空或超过 4 MB".to_string());
     }
     if attachment_name.trim().is_empty() || attachment_text.len() > MAX_TRANSCRIPT_BYTES {
-        return Err("会议转写文件无效或超过 5 MB".to_string());
+        return Err("会议转写文件无效或超过 4 MB".to_string());
     }
     if project_id
         .as_deref()
@@ -591,6 +629,23 @@ mod tests {
         build_meeting_import, is_clipboard_import_url, meeting_navigation_target,
         MeetingNavigationTarget, PendingRecordImport, RecordImportDeliveryState,
     };
+
+    #[test]
+    fn project_note_links_validate_origin_ids_and_tenant() {
+        let parse = |url: &str| super::project_note_navigation_target(&url.parse().unwrap());
+        let link = "snack://note?noteId=9&projectId=20&tenantKey=standard-a&origin=https%3A%2F%2Fqasnack.mechlabs.cn";
+        assert_eq!(parse(link).unwrap().as_str(), "https://qasnack.mechlabs.cn/notes/project/9?projectId=20&tenantKey=standard-a");
+        for invalid in [
+            link.replace("noteId=9", "noteId=rec-device"),
+            link.replace("noteId=9", "noteId=9223372036854775808"),
+            link.replace("projectId=20", "projectId=0"),
+            link.replace("tenantKey=standard-a", "tenantKey="),
+            link.replace("qasnack.mechlabs.cn", "evil.example"),
+            link.replace("noteId=9", "noteId=9&noteId=10"),
+        ] {
+            assert!(parse(&invalid).is_none(), "{invalid}");
+        }
+    }
 
     #[test]
     fn accepts_only_the_v1_clipboard_link() {
