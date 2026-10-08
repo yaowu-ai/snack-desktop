@@ -1,0 +1,8 @@
+{
+  "version": "1.0.0",
+  "source": "h-snack-website/src/lib/i18n",
+  "files": {
+    "en.json": "6b9f7087d42e946a893d29989f22df8af09716ea49f3d08edd930410b3710b4c",
+    "zh.json": "51c561377d349939fd5f12cfb506c47bb8d6e5b4e3ebbe223eca77500fb890d1"
+  }
+}

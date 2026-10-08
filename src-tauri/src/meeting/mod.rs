@@ -15,6 +15,7 @@ mod catalog;
 mod install;
 mod notifications;
 pub(crate) mod overlay;
+pub(crate) mod overlay_locale;
 mod permissions;
 mod python_runtime;
 pub(crate) mod quick_access;

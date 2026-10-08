@@ -24,6 +24,15 @@ dotenv.config({
   override: false,
 });
 
+const localeRegion = process.env.SNACK_REGION || "domestic";
+if (!["domestic", "global"].includes(localeRegion)) {
+  throw new Error("SNACK_REGION must be domestic or global");
+}
+dotenv.config({ path: path.join(repoRoot, `.env.${localeRegion}`), override: false });
+if (!["zh", "en"].includes(process.env.NEXT_PUBLIC_DEFAULT_LOCALE)) {
+  throw new Error("NEXT_PUBLIC_DEFAULT_LOCALE must be zh or en");
+}
+
 const operationMap = {
   dev: { command: "dev", disableUpdater: true, localSigning: false },
   build: { command: "build", disableUpdater: false, localSigning: false },

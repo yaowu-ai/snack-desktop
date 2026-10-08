@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8" />
+<title data-i18n="reminderWindowTitle"></title>
+<style>
+  :root { color-scheme: light; }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { width: 100%; height: 100%; overflow: hidden; background: transparent; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif;
+    color: #0f172a;
+    user-select: none; -webkit-user-select: none;
+  }
+  .card {
+    position: relative; display: flex; align-items: center; gap: 12px;
+    width: 100%; height: 100%; padding: 18px; overflow: hidden;
+    border: 1px solid #fee5d0; border-radius: 14px;
+    background: rgba(255, 255, 255, .98);
+  }
+  .icon {
+    display: flex; width: 38px; height: 38px; flex: 0 0 auto; align-items: center; justify-content: center;
+    border-radius: 12px; background: #fff2e8; color: #fe720a; font-size: 20px;
+  }
+  .content { min-width: 0; flex: 1; }
+  .title { font-size: 14px; font-weight: 700; line-height: 20px; }
+  .description { margin-top: 3px; color: #64748b; font-size: 11px; line-height: 16px; }
+  .error { display: none; margin-top: 3px; color: #dc2626; font-size: 10px; line-height: 14px; }
+  .start {
+    flex: 0 0 auto; border: 0; border-radius: 9px; padding: 9px 12px;
+    background: #fe720a; color: white; cursor: pointer; font-size: 11px; font-weight: 650;
+  }
+  .start:hover { background: #e96608; }
+  .start:disabled { cursor: default; opacity: .6; }
+  .close {
+    position: absolute; top: 6px; right: 8px; width: 22px; height: 22px;
+    border: 0; background: transparent; color: #94a3b8; cursor: pointer; font-size: 17px;
+  }
+</style>
+</head>
+<body>
+  <div class="card">
+    <div class="icon" aria-hidden="true">●</div>
+    <div class="content">
+      <div class="title" data-i18n="reminderTitle"></div>
+      <div class="description" id="description" data-i18n="reminderDescription"></div>
+      <div class="error" id="error"></div>
+    </div>
+    <button class="start" id="start" data-i18n="reminderStart"></button>
+    <button class="close" id="close" data-i18n-label="reminderClose">×</button>
+  </div>
+  <!--SNACK_LOCALE-->
+  <script>
+    (function () {
+      var t = window.snackText;
+      var status = 'reminderStart';
+      var failed = false;
+      var startButton = document.getElementById('start');
+      var closeButton = document.getElementById('close');
+      var description = document.getElementById('description');
+      var error = document.getElementById('error');
+      var dismissTimer;
+
+      function invoke(command) {
+        if (window.__TAURI__ && window.__TAURI__.core) return window.__TAURI__.core.invoke(command);
+        if (window.__TAURI_INTERNALS__ && window.__TAURI_INTERNALS__.invoke) return window.__TAURI_INTERNALS__.invoke(command);
+        return Promise.reject(new Error(t('bridgeUnavailable')));
+      }
+
+      function resetDismissTimer() {
+        clearTimeout(dismissTimer);
+        dismissTimer = setTimeout(function () {
+          invoke('dismiss_recording_reminder').catch(function () {});
+        }, 15000);
+      }
+
+      function render() {
+        description.textContent = window.snackReminderDescription();
+        startButton.textContent = t(status);
+        error.textContent = '';
+        if (failed) error.textContent = t('reminderFailed');
+      }
+      window.renderSnackLocale = render;
+      window.setSnackReminderApplication = function () {
+        error.style.display = 'none';
+        failed = false;
+        startButton.disabled = false;
+        status = 'reminderStart';
+        render();
+        resetDismissTimer();
+      };
+
+      startButton.addEventListener('click', function () {
+        if (startButton.disabled) return;
+        clearTimeout(dismissTimer);
+        startButton.disabled = true;
+        status = 'reminderStarting';
+        failed = false;
+        render();
+        error.style.display = 'none';
+        invoke('start_recording_from_reminder').catch(function (reason) {
+          startButton.disabled = false;
+          status = 'reminderRetry';
+          failed = true;
+          render();
+          console.error('[recording-reminder]', reason);
+          error.style.display = 'block';
+          resetDismissTimer();
+        });
+      });
+      closeButton.addEventListener('click', function () {
+        clearTimeout(dismissTimer);
+        invoke('dismiss_recording_reminder').catch(function () {});
+      });
+      window.setSnackReminderApplication();
+    })();
+  </script>
+</body>
+</html>

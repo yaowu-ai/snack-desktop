@@ -5,6 +5,8 @@
 //! even if the network drops or the main window is hidden, the user can still
 //! end the recording from the overlay.
 
+use super::overlay_locale;
+use crate::i18n;
 use tauri::window::Color;
 use tauri::{
     AppHandle, Emitter, LogicalSize, Manager, PhysicalPosition, WebviewUrl, WebviewWindowBuilder,
@@ -89,11 +91,12 @@ impl OverlayState {
 /// Serve the embedded overlay HTML over the custom protocol.
 pub(crate) fn serve_overlay_request(
     request: tauri::http::Request<Vec<u8>>,
+    locale: &serde_json::Value,
 ) -> tauri::http::Response<Vec<u8>> {
     let path = request.uri().path();
     let body = match path {
-        "/" | "/index.html" => OVERLAY_HTML.as_bytes().to_vec(),
-        "/reminder.html" => REMINDER_HTML.as_bytes().to_vec(),
+        "/" | "/index.html" => overlay_locale::render(OVERLAY_HTML, locale).into_bytes(),
+        "/reminder.html" => overlay_locale::render(REMINDER_HTML, locale).into_bytes(),
         _ => Vec::new(),
     };
     let status = if body.is_empty() { 404 } else { 200 };
@@ -120,14 +123,14 @@ pub(crate) fn handle_overlay_request(
     request: tauri::http::Request<Vec<u8>>,
 ) -> tauri::http::Response<Vec<u8>> {
     if request.uri().path() != "/stop" {
-        return serve_overlay_request(request);
+        return serve_overlay_request(request, &overlay_locale::app_payload(app));
     }
 
     if webview_label != OVERLAY_LABEL {
-        return text_response(403, "仅录音浮层可以结束录音");
+        return text_response(403, &i18n::t(app, "desktop.overlay.overlayOnly"));
     }
     if request.method() != tauri::http::Method::POST {
-        return text_response(405, "请使用 POST 结束录音");
+        return text_response(405, &i18n::t(app, "desktop.overlay.postRequired"));
     }
 
     match super::stop_recording_from_overlay(app.clone()) {
@@ -161,10 +164,10 @@ pub(crate) fn show_overlay(app: &AppHandle, state: OverlayState) -> Result<(), S
         WebviewUrl::CustomProtocol(
             format!("{OVERLAY_SCHEME}://localhost/index.html")
                 .parse()
-                .map_err(|_| "录音浮层地址无效".to_string())?,
+                .map_err(|_| i18n::t(app, "desktop.overlay.invalidOverlayUrl"))?,
         ),
     )
-    .title("Snack 会议录音")
+    .title(i18n::t(app, "desktop.overlay.windowTitle"))
     .inner_size(OVERLAY_WIDTH, OVERLAY_HEIGHT)
     .resizable(false)
     .decorations(false)
@@ -176,7 +179,13 @@ pub(crate) fn show_overlay(app: &AppHandle, state: OverlayState) -> Result<(), S
     .accept_first_mouse(true)
     .visible(false)
     .build()
-    .map_err(|error| format!("无法创建录音浮层: {error}"))?;
+    .map_err(|error| {
+        i18n::format(
+            app,
+            "desktop.overlay.createOverlayFailed",
+            &[("error", error.to_string())],
+        )
+    })?;
 
     if let Ok(Some(monitor)) = window.current_monitor() {
         let area = monitor.work_area();
@@ -217,12 +226,11 @@ pub(crate) fn show_recording_reminder(
     app: &AppHandle,
     application_name: &str,
 ) -> Result<(), String> {
-    let application_json = serde_json::to_string(application_name)
-        .map_err(|error| format!("无法显示录音提醒: {error}"))?;
+    overlay_locale::set_reminder_application(application_name);
+    overlay_locale::refresh(app);
     if let Some(window) = app.get_webview_window(REMINDER_LABEL) {
-        let _ = window.eval(format!(
-            "window.setSnackReminderApplication && window.setSnackReminderApplication({application_json});"
-        ));
+        let _ = window
+            .eval("window.setSnackReminderApplication && window.setSnackReminderApplication();");
         let _ = window.unminimize();
         window.show().map_err(|error| error.to_string())?;
         return Ok(());
@@ -234,10 +242,10 @@ pub(crate) fn show_recording_reminder(
         WebviewUrl::CustomProtocol(
             format!("{OVERLAY_SCHEME}://localhost/reminder.html")
                 .parse()
-                .map_err(|_| "录音提醒地址无效".to_string())?,
+                .map_err(|_| i18n::t(app, "desktop.overlay.invalidReminderUrl"))?,
         ),
     )
-    .title("Snack 录音提醒")
+    .title(i18n::t(app, "desktop.overlay.reminderWindowTitle"))
     .inner_size(REMINDER_WIDTH, REMINDER_HEIGHT)
     .resizable(false)
     .decorations(false)
@@ -249,11 +257,14 @@ pub(crate) fn show_recording_reminder(
     .accept_first_mouse(true)
     .focused(false)
     .visible(false)
-    .initialization_script(format!(
-        "window.__SNACK_REMINDER_APPLICATION__ = {application_json};"
-    ))
     .build()
-    .map_err(|error| format!("无法创建录音提醒: {error}"))?;
+    .map_err(|error| {
+        i18n::format(
+            app,
+            "desktop.overlay.createReminderFailed",
+            &[("error", error.to_string())],
+        )
+    })?;
 
     if let Ok(Some(monitor)) = window.current_monitor() {
         let area = monitor.work_area();
@@ -276,7 +287,7 @@ pub(crate) fn hide_recording_reminder(app: &AppHandle) {
 pub(crate) fn restore_overlay(app: &AppHandle) -> Result<(), String> {
     let window = app
         .get_webview_window(OVERLAY_LABEL)
-        .ok_or_else(|| "录音浮窗不存在".to_string())?;
+        .ok_or_else(|| i18n::t(app, "desktop.overlay.missingOverlay"))?;
     window.unminimize().map_err(|error| error.to_string())?;
     window.show().map_err(|error| error.to_string())?;
     window.set_focus().map_err(|error| error.to_string())
@@ -297,7 +308,7 @@ pub(crate) async fn start_recording_from_reminder(
     window: tauri::WebviewWindow,
 ) -> Result<(), String> {
     if !is_reminder_window(&window) {
-        return Err("只有录音提醒可以执行此操作".to_string());
+        return Err(i18n::t(window.app_handle(), "desktop.overlay.reminderOnly"));
     }
     super::start_quick_recording(app).await?;
     let _ = window.close();
@@ -307,7 +318,7 @@ pub(crate) async fn start_recording_from_reminder(
 #[tauri::command]
 pub(crate) fn dismiss_recording_reminder(window: tauri::WebviewWindow) -> Result<(), String> {
     if !is_reminder_window(&window) {
-        return Err("只有录音提醒可以执行此操作".to_string());
+        return Err(i18n::t(window.app_handle(), "desktop.overlay.reminderOnly"));
     }
     window.close().map_err(|error| error.to_string())
 }
@@ -315,7 +326,7 @@ pub(crate) fn dismiss_recording_reminder(window: tauri::WebviewWindow) -> Result
 #[tauri::command]
 pub(crate) fn minimize_overlay(window: tauri::WebviewWindow) -> Result<(), String> {
     if !is_overlay_window(&window) {
-        return Err("只有录音浮窗可以执行此操作".to_string());
+        return Err(i18n::t(window.app_handle(), "desktop.overlay.overlayOnly"));
     }
     // A borderless macOS utility window cannot always be restored after native
     // miniaturization. Hiding preserves the expected compact behavior and lets
@@ -326,7 +337,7 @@ pub(crate) fn minimize_overlay(window: tauri::WebviewWindow) -> Result<(), Strin
 #[tauri::command]
 pub(crate) fn dismiss_overlay(window: tauri::WebviewWindow) -> Result<(), String> {
     if !is_overlay_window(&window) {
-        return Err("只有录音浮窗可以执行此操作".to_string());
+        return Err(i18n::t(window.app_handle(), "desktop.overlay.overlayOnly"));
     }
     window.hide().map_err(|error| error.to_string())
 }
@@ -337,7 +348,7 @@ pub(crate) fn set_overlay_expanded(
     expanded: bool,
 ) -> Result<(), String> {
     if !is_overlay_window(&window) {
-        return Err("只有录音浮窗可以执行此操作".to_string());
+        return Err(i18n::t(window.app_handle(), "desktop.overlay.overlayOnly"));
     }
     let height = if expanded {
         OVERLAY_EXPANDED_HEIGHT
@@ -351,111 +362,7 @@ pub(crate) fn set_overlay_expanded(
 
 const OVERLAY_HTML: &str = include_str!("overlay.html");
 
-const REMINDER_HTML: &str = r#"<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-<meta charset="UTF-8" />
-<title>Snack 录音提醒</title>
-<style>
-  :root { color-scheme: light; }
-  * { margin: 0; padding: 0; box-sizing: border-box; }
-  html, body { width: 100%; height: 100%; overflow: hidden; background: transparent; }
-  body {
-    font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif;
-    color: #0f172a;
-    user-select: none; -webkit-user-select: none;
-  }
-  .card {
-    position: relative; display: flex; align-items: center; gap: 12px;
-    width: 100%; height: 100%; padding: 18px; overflow: hidden;
-    border: 1px solid #fee5d0; border-radius: 14px;
-    background: rgba(255, 255, 255, .98);
-  }
-  .icon {
-    display: flex; width: 38px; height: 38px; flex: 0 0 auto; align-items: center; justify-content: center;
-    border-radius: 12px; background: #fff2e8; color: #fe720a; font-size: 20px;
-  }
-  .content { min-width: 0; flex: 1; }
-  .title { font-size: 14px; font-weight: 700; line-height: 20px; }
-  .description { margin-top: 3px; color: #64748b; font-size: 11px; line-height: 16px; }
-  .error { display: none; margin-top: 3px; color: #dc2626; font-size: 10px; line-height: 14px; }
-  .start {
-    flex: 0 0 auto; border: 0; border-radius: 9px; padding: 9px 12px;
-    background: #fe720a; color: white; cursor: pointer; font-size: 11px; font-weight: 650;
-  }
-  .start:hover { background: #e96608; }
-  .start:disabled { cursor: default; opacity: .6; }
-  .close {
-    position: absolute; top: 6px; right: 8px; width: 22px; height: 22px;
-    border: 0; background: transparent; color: #94a3b8; cursor: pointer; font-size: 17px;
-  }
-</style>
-</head>
-<body>
-  <div class="card">
-    <div class="icon" aria-hidden="true">●</div>
-    <div class="content">
-      <div class="title">会议录音提醒</div>
-      <div class="description" id="description">检测到会议应用正在播放声音</div>
-      <div class="error" id="error"></div>
-    </div>
-    <button class="start" id="start">开始录音</button>
-    <button class="close" id="close" aria-label="关闭">×</button>
-  </div>
-  <script>
-    (function () {
-      var startButton = document.getElementById('start');
-      var closeButton = document.getElementById('close');
-      var description = document.getElementById('description');
-      var error = document.getElementById('error');
-      var dismissTimer;
-
-      function invoke(command) {
-        if (window.__TAURI__ && window.__TAURI__.core) return window.__TAURI__.core.invoke(command);
-        if (window.__TAURI_INTERNALS__ && window.__TAURI_INTERNALS__.invoke) return window.__TAURI_INTERNALS__.invoke(command);
-        return Promise.reject(new Error('native bridge unavailable'));
-      }
-
-      function resetDismissTimer() {
-        clearTimeout(dismissTimer);
-        dismissTimer = setTimeout(function () {
-          invoke('dismiss_recording_reminder').catch(function () {});
-        }, 15000);
-      }
-
-      window.setSnackReminderApplication = function (applicationName) {
-        var name = applicationName || '会议应用';
-        description.textContent = '检测到' + name + '正在播放声音';
-        error.style.display = 'none';
-        startButton.disabled = false;
-        startButton.textContent = '开始录音';
-        resetDismissTimer();
-      };
-
-      startButton.addEventListener('click', function () {
-        if (startButton.disabled) return;
-        clearTimeout(dismissTimer);
-        startButton.disabled = true;
-        startButton.textContent = '启动中…';
-        error.style.display = 'none';
-        invoke('start_recording_from_reminder').catch(function (reason) {
-          startButton.disabled = false;
-          startButton.textContent = '重试';
-          error.textContent = (reason && reason.message) || String(reason || '启动录音失败');
-          error.style.display = 'block';
-          resetDismissTimer();
-        });
-      });
-      closeButton.addEventListener('click', function () {
-        clearTimeout(dismissTimer);
-        invoke('dismiss_recording_reminder').catch(function () {});
-      });
-      window.setSnackReminderApplication(window.__SNACK_REMINDER_APPLICATION__);
-    })();
-  </script>
-</body>
-</html>
-"#;
+const REMINDER_HTML: &str = include_str!("reminder.html");
 
 #[cfg(test)]
 mod tests {
@@ -468,7 +375,10 @@ mod tests {
             .body(Vec::new())
             .unwrap();
 
-        let response = serve_overlay_request(request);
+        let response = serve_overlay_request(
+            request,
+            &overlay_locale::payload(i18n::Locale::Zh, i18n::Locale::Zh),
+        );
 
         assert_eq!(response.status(), 200);
         let html = String::from_utf8(response.into_body()).unwrap();
@@ -506,11 +416,11 @@ mod tests {
         assert!(!html.contains("aria-label=\"关闭\""));
         assert!(!html.contains(">麦克风<"));
         assert!(!html.contains(">系统音频<"));
-        assert!(html.contains("aria-label=\"暂停录音\""));
-        assert!(html.contains("aria-label=\"恢复录音\""));
+        assert!(html.contains("data-i18n-label=\"pause\""));
+        assert!(html.contains("data-i18n-label=\"resume\""));
         assert!(html.contains("id=\"pause-action\""));
         assert!(html.contains("id=\"resume-action\""));
-        assert!(html.contains("aria-label=\"结束录音\""));
+        assert!(html.contains("data-i18n-label=\"stop\""));
         assert!(html.contains("转写文件标题"));
         assert!(html.contains("会议自动总结"));
         assert!(!html.contains("会议归属项目"));
@@ -523,7 +433,7 @@ mod tests {
         assert!(!html.contains("普通会话"));
         assert!(html.contains("转写保存到项目"));
         assert!(html.contains("id=\"project-select\""));
-        assert!(html.contains("new Option('未保存', '')"));
+        assert!(html.contains("new Option(t('unsaved'), '')"));
         assert!(html.contains("text-align-last: right"));
         assert!(!html.contains("新建项目"));
         assert!(!html.contains("stopViaProtocol(),\n          invokeWithTimeout"));
@@ -553,7 +463,10 @@ mod tests {
             .body(Vec::new())
             .unwrap();
 
-        let response = serve_overlay_request(request);
+        let response = serve_overlay_request(
+            request,
+            &overlay_locale::payload(i18n::Locale::Zh, i18n::Locale::Zh),
+        );
 
         assert_eq!(response.status(), 404);
     }
@@ -565,7 +478,14 @@ mod tests {
             .body(Vec::new())
             .unwrap();
 
-        let html = String::from_utf8(serve_overlay_request(request).into_body()).unwrap();
+        let html = String::from_utf8(
+            serve_overlay_request(
+                request,
+                &overlay_locale::payload(i18n::Locale::Zh, i18n::Locale::Zh),
+            )
+            .into_body(),
+        )
+        .unwrap();
 
         assert!(html.contains("padding: 1px; color: #0f172a"));
         assert!(html.contains("background: transparent;"));
@@ -580,7 +500,10 @@ mod tests {
             .body(Vec::new())
             .unwrap();
 
-        let response = serve_overlay_request(request);
+        let response = serve_overlay_request(
+            request,
+            &overlay_locale::payload(i18n::Locale::Zh, i18n::Locale::Zh),
+        );
 
         assert_eq!(response.status(), 200);
         let html = String::from_utf8(response.into_body()).unwrap();
