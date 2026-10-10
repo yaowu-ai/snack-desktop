@@ -5,6 +5,9 @@ const path = require("node:path");
 const dotenv = require("dotenv");
 
 const repoRoot = path.resolve(__dirname, "..");
+// Check offline resources before invoking any development or release build.
+const resourceCheck = spawnSync(process.execPath, [path.join(repoRoot, "src-tauri/resources/i18n/verify-resources.cjs")], { stdio: "inherit" });
+if (resourceCheck.status !== 0) process.exit(resourceCheck.status || 1);
 const envPath = path.join(repoRoot, ".env");
 const tauriConfPath = path.join(repoRoot, "src-tauri", "tauri.conf.json");
 const tauriBin = path.join(

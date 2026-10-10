@@ -1,5 +1,7 @@
 {
   "common": {
+    "done": "Done",
+    "dismissKeyboard": "Dismiss keyboard",
     "emptyValue": "—",
     "cancel": "Cancel",
     "confirm": "Confirm",
