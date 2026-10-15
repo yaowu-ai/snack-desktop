@@ -75,6 +75,8 @@ pub fn run() {
             meeting::meeting_open_local_file,
             meeting::meeting_open_notes_in_chat,
             meeting::meeting_notify_notes_completed,
+            meeting::meeting_notify_note_result,
+            meeting::meeting_set_note_notification_handler,
             meeting::meeting_rename_task_record,
             meeting::meeting_mark_transcript_asset_file_uploaded,
             meeting::meeting_install_model,
@@ -161,6 +163,9 @@ pub fn run() {
                 .initialization_script(web_runtime_recovery::initialization_script())
                 .on_new_window(move |url, _features| handle_new_window_request(&app_handle, url))
                 .on_page_load(move |window, payload| {
+                    if payload.event() == PageLoadEvent::Started {
+                        meeting::reset_note_notification_handler();
+                    }
                     if payload.event() == PageLoadEvent::Finished {
                         #[cfg(any(target_os = "macos", windows))]
                         app_menu::sync_site_after_load(

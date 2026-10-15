@@ -14,6 +14,7 @@ mod capture_windows;
 mod catalog;
 mod install;
 mod notifications;
+mod note_notifications;
 pub(crate) mod overlay;
 mod permissions;
 mod python_runtime;
@@ -399,24 +400,22 @@ fn reconcile_current_task(app: &AppHandle, store: &MeetingStore) {
             match audio_path {
                 Some(path) if path.exists() => {
                     // The app crashed mid-recording: recover the on-disk WAV
-                    // (header repair) and continue with local transcription.
-                    match audio::repair_wav_header(&path) {
-                        Ok(sample_count) => {
+                    // (header repair) without bypassing the user's transcription policy.
+                    match recover_recording_state(&path, task.defer_transcription) {
+                        Ok((recovered_state, duration_ms)) => {
                             let now = now_rfc3339();
-                            task.duration_ms = Some(sample_count * 1000 / 16_000);
+                            task.duration_ms = Some(duration_ms);
                             task.ended_at.get_or_insert_with(|| now.clone());
                             task.audio_bytes = fs::metadata(&path).ok().map(|meta| meta.len());
-                            task.state = TaskState::TranscribingLocal;
+                            task.state = recovered_state;
                             task.error =
                                 Some("应用在上次录音中退出，已自动恢复录音文件".to_string());
                             task.updated_at = now;
                             let _ = store.save_task(&task);
                             emit_state(app, store);
-                            spawn_transcription(
-                                app.clone(),
-                                store.clone_for_task(),
-                                task.recording_id.clone(),
-                            );
+                            if recovered_state == TaskState::TranscribingLocal {
+                                spawn_transcription(app.clone(), store.clone_for_task(), task.recording_id.clone());
+                            }
                         }
                         Err(message) => {
                             task.state = TaskState::CaptureFailed;
@@ -1571,6 +1570,13 @@ fn finalized_recording_state(deferred: bool, samples: &[i16]) -> TaskState {
     }
 }
 
+fn recover_recording_state(path: &std::path::Path, deferred: bool) -> Result<(TaskState, u64), String> {
+    let sample_count = audio::repair_wav_header(path)?;
+    if !deferred { return Ok((TaskState::TranscribingLocal, sample_count * 1000 / 16_000)); }
+    let (samples, duration_ms) = audio::read_wav_i16(path)?;
+    Ok((finalized_recording_state(true, &samples), duration_ms))
+}
+
 fn fail_finalize(app: &AppHandle, store: &MeetingStore, message: String) {
     let Some(mut task) = store.load_task() else {
         crate::logging::write_app_log(app, "error", "meeting-finalize", &message, None);
@@ -1592,7 +1598,7 @@ fn fail_finalize(app: &AppHandle, store: &MeetingStore, message: String) {
     task.error = Some(message);
     let _ = store.save_task(&task);
     emit_state(app, store);
-    notifications::notify_transcript_failed(app, &recording_id);
+    notifications::notify_recording_save_failed(app, &recording_id);
 }
 
 #[tauri::command]
@@ -1711,6 +1717,24 @@ pub(crate) fn meeting_notify_notes_completed(
 }
 
 #[tauri::command]
+pub(crate) fn meeting_set_note_notification_handler(window: WebviewWindow, enabled: bool, handler_id: String) -> Result<(), String> {
+    require_allowed_window(&window)?;
+    if handler_id.is_empty() || handler_id.len() > 200 { return Err("invalid notification handler".into()); }
+    note_notifications::set_handler_ready(enabled, handler_id);
+    Ok(())
+}
+
+pub(crate) fn reset_note_notification_handler() {
+    note_notifications::reset_handler();
+}
+
+#[tauri::command]
+pub(crate) fn meeting_notify_note_result(app: AppHandle, window: WebviewWindow, target: note_notifications::NoteNotificationTarget) -> Result<(), String> {
+    require_allowed_window(&window)?;
+    note_notifications::show(app, target)
+}
+
+#[tauri::command]
 pub(crate) fn meeting_set_notes_activity(
     app: AppHandle,
     window: WebviewWindow,
@@ -1730,7 +1754,7 @@ fn is_valid_session_id(session_id: &str) -> bool {
 }
 
 fn handoff_completed_transcript(app: &AppHandle, recording_id: &str) {
-    notifications::notify_transcript_ready(app);
+    notifications::notify_transcript_ready(app, recording_id);
     let manager = app.state::<MeetingManagerState>();
     let settings = manager.store.load_settings();
     let task = manager.store.load_task_record(recording_id);
@@ -2517,6 +2541,25 @@ mod tests {
     };
     use crate::meeting::audio::WavWriter;
     use std::fs;
+
+    #[test]
+    fn recovered_recording_keeps_manual_transcription_policy() {
+        let root = std::env::temp_dir().join(format!("snack-recovery-{}-{}", std::process::id(), super::unix_millis()));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("recovered.wav");
+        for (deferred, samples, expected) in [
+            (true, vec![100; 160], TaskState::AwaitingTranscription),
+            (true, vec![0; 160], TaskState::NoAudioDetected),
+            (false, vec![100; 160], TaskState::TranscribingLocal),
+            (false, vec![0; 160], TaskState::TranscribingLocal),
+        ] {
+            let mut writer = WavWriter::create(&path).unwrap();
+            writer.write_samples(&samples).unwrap();
+            drop(writer);
+            assert_eq!(super::recover_recording_state(&path, deferred).unwrap(), (expected, 10));
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn deferred_recording_needs_no_model_and_waits_after_finalize() {
