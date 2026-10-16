@@ -26,6 +26,8 @@
           "meeting_mark_transcript_asset_file_uploaded",
           "meeting_open_notes_in_chat",
           "meeting_notify_notes_completed",
+          "meeting_notify_note_result",
+          "meeting_set_note_notification_handler",
           "meeting_open_permission_settings",
           "meeting_pause_install",
           "meeting_resume_install",

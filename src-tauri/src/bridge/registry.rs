@@ -1,6 +1,7 @@
 use std::future::Future;
 use std::pin::Pin;
 
+use serde::Deserialize;
 use tauri::{AppHandle, WebviewWindow};
 
 use super::protocol::{BridgeMethodDescriptor, BridgeProbeRequest};
@@ -42,6 +43,38 @@ const METHODS: &[BridgeMethodRegistration] = &[
             api_versions: &[1],
         },
         handler: notification_permission_handler,
+    },
+    BridgeMethodRegistration {
+        descriptor: BridgeMethodDescriptor {
+            method: "diagnostics.record",
+            introduced_contract_revision: 2,
+            api_versions: &[1],
+        },
+        handler: diagnostics_record_handler,
+    },
+    BridgeMethodRegistration {
+        descriptor: BridgeMethodDescriptor {
+            method: "diagnostics.snapshot",
+            introduced_contract_revision: 2,
+            api_versions: &[1],
+        },
+        handler: diagnostics_snapshot_handler,
+    },
+    BridgeMethodRegistration {
+        descriptor: BridgeMethodDescriptor {
+            method: "diagnostics.clear",
+            introduced_contract_revision: 2,
+            api_versions: &[1],
+        },
+        handler: diagnostics_clear_handler,
+    },
+    BridgeMethodRegistration {
+        descriptor: BridgeMethodDescriptor {
+            method: "diagnostics.info",
+            introduced_contract_revision: 2,
+            api_versions: &[1],
+        },
+        handler: diagnostics_info_handler,
     },
 ];
 
@@ -114,13 +147,175 @@ fn notification_permission_handler(
     })
 }
 
+fn diagnostics_record_handler(
+    context: BridgeContext,
+    payload: serde_json::Value,
+) -> BridgeHandlerFuture {
+    Box::pin(async move {
+        let request: DiagnosticsRecordRequest = parse_payload(payload)?;
+        crate::logging::record_web_event(
+            &context.app,
+            crate::logging::DiagnosticRecord {
+                scope: request.scope.scope,
+                user_id: request.scope.user_id,
+                tenant_key: request.scope.tenant_key,
+                owner_type: request.scope.owner_type,
+                session_id: request.scope.session_id,
+                event: request.event,
+            },
+        )
+        .map_err(|message| BridgeHandlerError {
+            code: "INVALID_DIAGNOSTIC_EVENT",
+            message,
+        })?;
+        Ok(serde_json::json!({ "accepted": true }))
+    })
+}
+
+fn diagnostics_snapshot_handler(
+    context: BridgeContext,
+    payload: serde_json::Value,
+) -> BridgeHandlerFuture {
+    Box::pin(async move {
+        let request: DiagnosticsSnapshotRequest = parse_payload(payload)?;
+        if request.limit == 0 || request.limit > 10000 {
+            return Err(BridgeHandlerError {
+                code: "INVALID_PAYLOAD",
+                message: "诊断日志分页参数无效".to_string(),
+            });
+        }
+        activate_diagnostics_scope(&context.app, &request.scope)?;
+        let rows = crate::logging::snapshot(
+            &context.app,
+            &request.scope.scope,
+            request.since,
+            request.limit,
+        )
+        .map_err(diagnostics_error)?;
+        serde_json::to_value(serde_json::json!({ "rows": rows })).map_err(|error| {
+            BridgeHandlerError {
+                code: "SERIALIZATION_FAILED",
+                message: error.to_string(),
+            }
+        })
+    })
+}
+
+fn diagnostics_clear_handler(
+    context: BridgeContext,
+    payload: serde_json::Value,
+) -> BridgeHandlerFuture {
+    Box::pin(async move {
+        let request: DiagnosticsScopeRequest = parse_payload(payload)?;
+        activate_diagnostics_scope(&context.app, &request.scope)?;
+        crate::logging::clear_scope(&context.app, &request.scope.scope)
+            .map_err(diagnostics_error)?;
+        Ok(serde_json::json!({ "cleared": true }))
+    })
+}
+
+fn diagnostics_info_handler(
+    context: BridgeContext,
+    payload: serde_json::Value,
+) -> BridgeHandlerFuture {
+    Box::pin(async move {
+        let request: DiagnosticsScopeRequest = parse_payload(payload)?;
+        activate_diagnostics_scope(&context.app, &request.scope)?;
+        serde_json::to_value(
+            crate::logging::info(&context.app, &request.scope.scope).map_err(diagnostics_error)?,
+        )
+        .map_err(|error| BridgeHandlerError {
+            code: "SERIALIZATION_FAILED",
+            message: error.to_string(),
+        })
+    })
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DiagnosticsScope {
+    scope: String,
+    user_id: String,
+    tenant_key: String,
+    owner_type: String,
+    session_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DiagnosticsRecordRequest {
+    #[serde(flatten)]
+    scope: DiagnosticsScope,
+    event: serde_json::Value,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DiagnosticsScopeRequest {
+    #[serde(flatten)]
+    scope: DiagnosticsScope,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DiagnosticsSnapshotRequest {
+    #[serde(flatten)]
+    scope: DiagnosticsScope,
+    since: i64,
+    #[serde(default = "default_snapshot_limit")]
+    limit: usize,
+}
+
+fn default_snapshot_limit() -> usize {
+    10000
+}
+
+fn parse_payload<T: for<'de> Deserialize<'de>>(
+    payload: serde_json::Value,
+) -> Result<T, BridgeHandlerError> {
+    serde_json::from_value(payload).map_err(|error| BridgeHandlerError {
+        code: "INVALID_PAYLOAD",
+        message: error.to_string(),
+    })
+}
+
+fn activate_diagnostics_scope(
+    app: &tauri::AppHandle,
+    scope: &DiagnosticsScope,
+) -> Result<(), BridgeHandlerError> {
+    if scope.scope.trim().is_empty() || scope.scope.len() > 256 {
+        return Err(BridgeHandlerError {
+            code: "INVALID_PAYLOAD",
+            message: "诊断日志 scope 无效".to_string(),
+        });
+    }
+    crate::logging::activate_scope(
+        app,
+        &crate::logging::DiagnosticScopeInput {
+            scope: scope.scope.clone(),
+            user_id: scope.user_id.clone(),
+            tenant_key: scope.tenant_key.clone(),
+            owner_type: scope.owner_type.clone(),
+            session_id: scope.session_id.clone(),
+        },
+    )
+    .map_err(diagnostics_error)
+}
+
+fn diagnostics_error(message: String) -> BridgeHandlerError {
+    BridgeHandlerError {
+        code: "DIAGNOSTICS_UNAVAILABLE",
+        message,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn registry_exposes_only_explicit_methods() {
-        assert_eq!(descriptors().len(), 2);
+        assert_eq!(descriptors().len(), 6);
         assert_eq!(descriptors()[0].method, "bridge.info");
         assert!(find("meeting_start_recording").is_none());
     }
@@ -129,6 +324,7 @@ mod tests {
     fn support_requires_a_registered_api_version() {
         assert!(supports(&request("bridge.info", 1)));
         assert!(supports(&request("notifications.permission", 1)));
+        assert!(supports(&request("diagnostics.info", 1)));
         assert!(!supports(&request("notifications.permission", 2)));
         assert!(!supports(&request("bridge.info", 2)));
         assert!(!supports(&request("bridge.missing", 1)));
