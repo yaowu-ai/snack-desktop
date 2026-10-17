@@ -167,6 +167,8 @@
       "notesReady": "Meeting notes ready",
       "notesReadyBody": "View your completed meeting notes.",
       "viewNotes": "View meeting notes",
+      "saveFailed": "Unable to save recording",
+      "saveFailedBody": "Check and recover the recording file.",
       "transcriptFailed": "Audio transcription failed",
       "transcriptFailedBody": "View the transcription task and try again."
     },

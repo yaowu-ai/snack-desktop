@@ -25,7 +25,8 @@ pub(crate) fn notify_model_ready(app: &AppHandle) {
 /// Notify after a local transcript is persisted successfully.
 /// Clicking it opens the audio transcription task list without duplicating the
 /// automatic meeting-notes handoff.
-pub(crate) fn notify_transcript_ready(app: &AppHandle) {
+pub(crate) fn notify_transcript_ready(app: &AppHandle, recording_id: &str) {
+    if super::note_notifications::request_owned_result(app, recording_id, "success") { return; }
     let app = app.clone();
     tauri::async_runtime::spawn_blocking(move || show_transcript_ready_notification(app));
 }
@@ -50,11 +51,19 @@ pub(crate) fn notify_completed_session(app: &AppHandle, session_id: &str) {
 /// Notify only after the local pipeline has reached a terminal failure.
 /// Clicking the notification opens the audio transcription task list.
 pub(crate) fn notify_transcript_failed(app: &AppHandle, recording_id: &str) {
+    if super::note_notifications::request_owned_result(app, recording_id, "failure") { return; }
     let app = app.clone();
     let recording_id = recording_id.to_string();
     tauri::async_runtime::spawn_blocking(move || {
-        show_transcript_failed_notification(app, recording_id)
+        show_transcript_failed_notification(app, recording_id, false)
     });
+}
+
+pub(crate) fn notify_recording_save_failed(app: &AppHandle, recording_id: &str) {
+    if super::note_notifications::request_owned_result(app, recording_id, "save_failed") { return; }
+    let app = app.clone();
+    let recording_id = recording_id.to_string();
+    tauri::async_runtime::spawn_blocking(move || show_transcript_failed_notification(app, recording_id, true));
 }
 
 fn show_model_ready_notification(app: AppHandle) {
@@ -123,11 +132,11 @@ fn show_notes_ready_notification(app: AppHandle, target_path: String) {
     });
 }
 
-fn show_transcript_failed_notification(app: AppHandle, recording_id: String) {
+fn show_transcript_failed_notification(app: AppHandle, recording_id: String, save_failed: bool) {
     configure_notification_identity(&app);
     let result = Notification::new()
-        .summary(&crate::i18n::t(&app, "desktop.notifications.transcriptFailed"))
-        .body(&crate::i18n::t(&app, "desktop.notifications.transcriptFailedBody"))
+        .summary(&crate::i18n::t(&app, if save_failed { "desktop.notifications.saveFailed" } else { "desktop.notifications.transcriptFailed" }))
+        .body(&crate::i18n::t(&app, if save_failed { "desktop.notifications.saveFailedBody" } else { "desktop.notifications.transcriptFailedBody" }))
         .action("open-meeting-records", &crate::i18n::t(&app, "desktop.notifications.viewTask"))
         .show();
 
@@ -148,7 +157,7 @@ fn show_transcript_failed_notification(app: AppHandle, recording_id: String) {
     });
 }
 
-fn configure_notification_identity(app: &AppHandle) {
+pub(super) fn configure_notification_identity(app: &AppHandle) {
     #[cfg(target_os = "macos")]
     {
         let _ = notify_rust::set_application(&app.config().identifier);

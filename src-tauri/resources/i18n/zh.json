@@ -167,6 +167,8 @@
       "notesReady": "会议纪要已生成",
       "notesReadyBody": "点击查看已完成的会议纪要。",
       "viewNotes": "查看会议纪要",
+      "saveFailed": "录音保存失败",
+      "saveFailedBody": "点击检查并恢复录音文件。",
       "transcriptFailed": "音频转写失败",
       "transcriptFailedBody": "点击查看音频转写任务并重试。"
     },

@@ -98,6 +98,11 @@ Snack_{version}_macos_x64.app.tar.gz.sig
 Bridge Kernel 之前的客户端由 Web 的通用 command-not-found updater 兜底，不维护 Desktop
 应用版本兼容表。窗口、通知、事件等与业务无关的底层 Tauri 能力可以继续使用独立权限和入口。
 
+当前 contract revision 2 提供 `diagnostics.record`、`diagnostics.snapshot`、
+`diagnostics.clear` 和 `diagnostics.info`。这些方法只负责当前账号 scope 的本地结构化日志
+收集、读取和清理；日志上传、认证、压缩分包和重试均由 Web 调用 `/api/mobile/log-bundles`
+完成，Desktop 不保存业务认证凭据，也不直接访问业务 API。
+
 ## 许可证
 
 本项目采用 [MIT License](LICENSE)。
