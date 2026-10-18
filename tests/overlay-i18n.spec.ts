@@ -6,8 +6,17 @@ const root = path.resolve(__dirname, '../src-tauri');
 const localeScript = readFileSync(path.join(root, 'src/meeting/overlay-locale.js'), 'utf8');
 
 function payload(locale: 'en' | 'zh') {
-  const messages = JSON.parse(readFileSync(path.join(root, `resources/i18n/${locale}.json`), 'utf8')).desktop.overlay;
-  return { locale, messages, reminderDescription: messages.reminderDescription.replace('{application}', 'Test Meeting') };
+  const chinese = JSON.parse(readFileSync(path.join(root, 'resources/i18n/zh.json'), 'utf8')).desktop.overlay;
+  const desktop = JSON.parse(readFileSync(path.join(root, 'resources/i18n/en.json'), 'utf8')).desktop;
+  const english = desktop.overlay;
+  const effectiveLocale = locale === 'en' && hasTranslation(desktop) ? 'en' : 'zh';
+  const messages = { ...chinese, ...(locale === 'en' ? english : {}) };
+  return { locale: effectiveLocale, messages, reminderDescription: messages.reminderDescription.replace('{application}', 'Test Meeting') };
+}
+
+function hasTranslation(value: unknown): boolean {
+  if (typeof value === 'string') return Boolean(value.trim());
+  return Boolean(value && typeof value === 'object' && Object.values(value).some(hasTranslation));
 }
 
 async function openSurface(page: Page, name: string, locale: 'en' | 'zh') {
@@ -77,7 +86,7 @@ test('native protocol can stop recording when IPC fails', async ({ page }) => {
     stopped = route.request().method() === 'POST';
     return route.fulfill({ status: 204 });
   });
-  await page.getByRole('button', { name: 'Stop recording', exact: true }).click();
+  await page.getByRole('button', { name: payload('en').messages.stop, exact: true }).click();
   await expect.poll(() => stopped).toBe(true);
   await expect(page.locator('#error')).toBeHidden();
 });

@@ -32,7 +32,7 @@ pub(crate) fn payload(locale: Locale, fallback: Locale) -> Value {
         &arguments,
     )
     .unwrap_or_else(|_| i18n::text(locale, fallback, "common.unavailable"));
-    json!({ "locale": locale, "messages": messages, "reminderDescription": description })
+    json!({ "locale": i18n::module_locale(locale, "desktop"), "messages": messages, "reminderDescription": description })
 }
 
 pub(crate) fn app_payload(app: &AppHandle) -> Value {
@@ -99,12 +99,10 @@ mod tests {
     fn payload_has_both_locales_and_a_complete_reminder_sentence() {
         let en = payload(Locale::En, Locale::Zh);
         let zh = payload(Locale::Zh, Locale::En);
-        assert_eq!(en["messages"]["pause"], "Pause recording");
+        assert_eq!(en["messages"]["pause"], i18n::text(Locale::En, Locale::Zh, "desktop.overlay.pause"));
         assert_eq!(zh["messages"]["pause"], "暂停录音");
-        assert!(en["reminderDescription"]
-            .as_str()
-            .unwrap()
-            .contains("is playing audio"));
+        assert_eq!(en["locale"], serde_json::to_value(i18n::module_locale(Locale::En, "desktop")).unwrap());
+        assert!(!en["reminderDescription"].as_str().unwrap().contains("{application}"));
         assert_eq!(
             en["messages"].as_object().unwrap().len(),
             zh["messages"].as_object().unwrap().len()

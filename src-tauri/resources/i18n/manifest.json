@@ -1,9 +1,9 @@
 {
-  "version": "1.54.2",
+  "version": "1.55.1",
   "source": "h-snack-website/src/lib/i18n",
   "target": "desktop",
   "files": {
-    "en.json": "62df36dfe8bbed448797a9d9ea8bcaa956b90afde5342ca4a71de25e819baa34",
+    "en.json": "8a8f65100d5e08f115d9671986423814af45d3b1bf384979aa5a1c5b718f4397",
     "zh.json": "f6123793b4356e9955ff15daca4d56d8aa94876b8bff9bd22967ea64ce4bd776",
     "verify-resources.cjs": "a66938783242776d6198fdec1970485d552bb4dc5e6a8f879abb1c24ca80af40"
   }

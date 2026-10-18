@@ -123,17 +123,17 @@ fn lookup(locale: Locale, key: &str) -> Option<&'static str> {
     value.as_str().filter(|value| !value.is_empty())
 }
 
-pub(crate) fn text(locale: Locale, fallback: Locale, key: &str) -> String {
+pub(crate) fn text(locale: Locale, _fallback: Locale, key: &str) -> String {
     lookup(locale, key)
-        .or_else(|| lookup(fallback, key))
-        .unwrap_or_else(|| lookup(fallback, "common.unavailable").expect("fallback resource"))
+        .or_else(|| lookup(Locale::Zh, key))
+        .unwrap_or_else(|| lookup(Locale::Zh, "common.unavailable").expect("Chinese fallback resource"))
         .to_string()
 }
 
-/// Resolve a complete native resource section using the configured default per key.
+/// Resolve a complete native resource section using Chinese per key, independent of deployment.
 pub(crate) fn resource(locale: Locale, fallback: Locale, key: &str) -> Value {
     let path = format!("/{}", key.replace('.', "/"));
-    let Some(base) = dictionary(fallback).pointer(&path) else {
+    let Some(base) = dictionary(Locale::Zh).pointer(&path) else {
         return Value::Null;
     };
     if let Some(object) = base.as_object() {
@@ -150,6 +150,28 @@ pub(crate) fn resource(locale: Locale, fallback: Locale, key: &str) -> Value {
         );
     }
     Value::String(text(locale, fallback, key))
+}
+
+/// Closed or entirely untranslated modules keep native presentation in Chinese.
+pub(crate) fn module_locale(locale: Locale, namespace: &str) -> Locale {
+    if locale == Locale::En
+        && dictionary(Locale::En)
+            .get(namespace)
+            .is_some_and(has_translation)
+    {
+        Locale::En
+    } else {
+        Locale::Zh
+    }
+}
+
+/// Empty nested objects and blank translations do not switch native presentation language.
+fn has_translation(value: &Value) -> bool {
+    match value {
+        Value::String(message) => !message.trim().is_empty(),
+        Value::Object(messages) => messages.values().any(has_translation),
+        _ => false,
+    }
 }
 
 pub(crate) fn t(app: &AppHandle, key: &str) -> String {
@@ -180,10 +202,25 @@ mod tests {
 
     #[test]
     fn menus_and_unknown_messages_use_language_resources() {
-        assert_eq!(text(Locale::En, Locale::Zh, "desktop.quit"), "Quit");
+        assert_eq!(
+            text(Locale::En, Locale::Zh, "desktop.quit"),
+            lookup(Locale::En, "desktop.quit").unwrap_or("退出")
+        );
         assert_eq!(text(Locale::Zh, Locale::En, "desktop.quit"), "退出");
         assert_eq!(
             text(Locale::En, Locale::Zh, "missing.key"),
+            lookup(Locale::Zh, "common.unavailable").unwrap()
+        );
+    }
+
+    #[test]
+    fn closed_modules_use_chinese_even_with_an_english_deployment_default() {
+        assert_eq!(module_locale(Locale::En, "untranslated"), Locale::Zh);
+        assert_eq!(module_locale(Locale::Zh, "desktop"), Locale::Zh);
+        assert!(!has_translation(&serde_json::json!({ "overlay": { "pause": " " } })));
+        assert!(has_translation(&serde_json::json!({ "quit": "Quit" })));
+        assert_eq!(
+            text(Locale::En, Locale::En, "missing.key"),
             lookup(Locale::Zh, "common.unavailable").unwrap()
         );
     }
