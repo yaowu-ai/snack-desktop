@@ -3,3 +3,7 @@
 让所有业务API有一个总体的兼容入口，低版本入口会提示升级版本
 界面、交互写到web上
 配置、常量由服务返回
+
+## 多语言资源规范
+
+共享语言资源与规范由 Website 维护，规范见 `h-snack-feat/openspec/specs/i18n-resources/spec.md`（`h-snack-feat` 等价于 `h-snack-website`）。中英文入口统一具名导出，英文未开放模块回退中文；不得在 Desktop 另设开放白名单或手改 `src-tauri/resources/i18n`。修改共享资源后必须由 Website 重新导出快照并通过 `npm run i18n:check` 验证。
