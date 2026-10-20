@@ -53,6 +53,14 @@ Tauri 代码改动后自动重编译。涉及麦克风或录屏权限时，优�
 发布工作流从 GitHub Actions Variables 读取 `SNACK_HOST` 和 `SNACK_QA_HOST`，并根据 release
 channel 将选中的地址统一作为 `SNACK_HOST` 写入桌面构建配置。对应变量未配置时构建直接失败。
 
+## URL Scheme 与深链接
+
+项目已配置系统级自定义 URL Scheme **`snack://`**（这里指 URL Scheme，而不是 JSON Schema）。
+注册配置位于 `src-tauri/tauri.conf.json` 的 `plugins.deep-link.desktop.schemes`，
+由 Tauri deep-link 插件在打包、安装时集成到系统。应用同时处理冷启动链接和运行期间收到的链接；
+单实例插件用于将 Windows 再次启动时收到的深链接转交给已运行的实例。
+
+
 ## 远端打包与发布
 
 GitHub Actions 在推送符合条件的 tag 时触发构建。tag 支持 `v*` 或 `*.*.*` 形式，但版本最终必须是 `x.y.z` 或 `vX.Y.Z`，例如 `1.2.3`、`v1.2.3`。
