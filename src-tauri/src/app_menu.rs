@@ -5,6 +5,7 @@ use std::sync::Arc;
 #[cfg(windows)]
 use std::time::Duration;
 
+use crate::i18n::{self, t, Locale};
 use tauri::{AppHandle, Manager, WebviewWindow};
 
 #[cfg(windows)]
@@ -30,26 +31,34 @@ fn navigation_back_accelerator() -> &'static str {
 
 #[cfg(any(target_os = "macos", windows))]
 pub(crate) fn setup_navigation_menu(app: &mut tauri::App) -> tauri::Result<()> {
+    install_application_menu(app.handle())
+}
+
+#[cfg(any(target_os = "macos", windows))]
+fn install_application_menu(app: &AppHandle) -> tauri::Result<()> {
     use tauri::menu::{MenuItem, Submenu};
 
     let back = MenuItem::with_id(
         app,
         NAVIGATION_MENU_BACK_ID,
-        "后退",
+        t(app, "desktop.back"),
         true,
         Some(navigation_back_accelerator()),
     )?;
-    let navigation = Submenu::with_id_and_items(app, NAVIGATION_MENU_ID, "导航", true, &[&back])?;
-    let menu = match app.menu() {
-        Some(menu) => menu,
-        None => default_app_menu(app)?,
-    };
+    let navigation = Submenu::with_id_and_items(
+        app,
+        NAVIGATION_MENU_ID,
+        t(app, "desktop.navigation"),
+        true,
+        &[&back],
+    )?;
+    let menu = default_app_menu(app)?;
     let selected_site = app
         .config()
         .app
         .windows
         .first()
-        .map(|config| crate::site::selected_site(app.handle(), &config.url))
+        .map(|config| crate::site::selected_site(app, &config.url))
         .unwrap_or_default();
     let site_menu = build_site_menu(app, Some(selected_site))?;
     menu.insert(&site_menu, site_menu_position())?;
@@ -61,7 +70,7 @@ pub(crate) fn setup_navigation_menu(app: &mut tauri::App) -> tauri::Result<()> {
 
 #[cfg(any(target_os = "macos", windows))]
 fn build_site_menu(
-    app: &tauri::App,
+    app: &AppHandle,
     selected: Option<crate::site::SiteKey>,
 ) -> tauri::Result<tauri::menu::Submenu<tauri::Wry>> {
     use tauri::menu::{CheckMenuItem, Submenu};
@@ -73,7 +82,7 @@ fn build_site_menu(
             CheckMenuItem::with_id(
                 app,
                 site.menu_id(),
-                site.display_name(),
+                site_display_name(i18n::snapshot(app).locale, site),
                 true,
                 is_selected,
                 None::<&str>,
@@ -84,7 +93,13 @@ fn build_site_menu(
         .iter()
         .map(|item| item as &dyn tauri::menu::IsMenuItem<tauri::Wry>)
         .collect::<Vec<_>>();
-    Submenu::with_id_and_items(app, crate::site::SITE_MENU_ID, "站点", true, &item_refs)
+    Submenu::with_id_and_items(
+        app,
+        crate::site::SITE_MENU_ID,
+        t(app, "desktop.site"),
+        true,
+        &item_refs,
+    )
 }
 
 #[cfg(any(target_os = "macos", windows))]
@@ -93,7 +108,7 @@ fn site_menu_position() -> usize {
 }
 
 #[cfg(any(target_os = "macos", windows))]
-fn about_metadata(app: &tauri::App) -> tauri::menu::AboutMetadata<'static> {
+fn about_metadata(app: &AppHandle) -> tauri::menu::AboutMetadata<'static> {
     let package_info = app.package_info();
     let config = app.config();
 
@@ -112,7 +127,7 @@ fn about_metadata(app: &tauri::App) -> tauri::menu::AboutMetadata<'static> {
 }
 
 #[cfg(any(target_os = "macos", windows))]
-fn default_app_menu(app: &tauri::App) -> tauri::Result<tauri::menu::Menu<tauri::Wry>> {
+fn default_app_menu(app: &AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::Wry>> {
     use tauri::menu::{Menu, PredefinedMenuItem, Submenu};
 
     let package_name = app.package_info().name.clone();
@@ -120,25 +135,29 @@ fn default_app_menu(app: &tauri::App) -> tauri::Result<tauri::menu::Menu<tauri::
     let window_menu = Submenu::with_id_and_items(
         app,
         "Window",
-        "Window",
+        t(app, "desktop.window"),
         true,
         &[
-            &PredefinedMenuItem::minimize(app, None)?,
-            &PredefinedMenuItem::maximize(app, None)?,
+            &PredefinedMenuItem::minimize(app, Some(&t(app, "desktop.minimize")))?,
+            &PredefinedMenuItem::maximize(app, Some(&t(app, "desktop.maximize")))?,
             #[cfg(target_os = "macos")]
             &PredefinedMenuItem::separator(app)?,
-            &PredefinedMenuItem::close_window(app, None)?,
+            &PredefinedMenuItem::close_window(app, Some(&t(app, "desktop.closeWindow")))?,
         ],
     )?;
 
     let help_menu = Submenu::with_id_and_items(
         app,
         "Help",
-        "Help",
+        t(app, "desktop.help"),
         true,
         &[
             #[cfg(not(target_os = "macos"))]
-            &PredefinedMenuItem::about(app, None, Some(about_metadata(app)))?,
+            &PredefinedMenuItem::about(
+                app,
+                Some(&t(app, "desktop.about")),
+                Some(about_metadata(app)),
+            )?,
         ],
     )?;
 
@@ -151,46 +170,53 @@ fn default_app_menu(app: &tauri::App) -> tauri::Result<tauri::menu::Menu<tauri::
                 package_name,
                 true,
                 &[
-                    &PredefinedMenuItem::about(app, None, Some(about_metadata(app)))?,
+                    &PredefinedMenuItem::about(
+                        app,
+                        Some(&t(app, "desktop.about")),
+                        Some(about_metadata(app)),
+                    )?,
                     &PredefinedMenuItem::separator(app)?,
-                    &PredefinedMenuItem::services(app, None)?,
+                    &PredefinedMenuItem::services(app, Some(&t(app, "desktop.services")))?,
                     &PredefinedMenuItem::separator(app)?,
-                    &PredefinedMenuItem::hide(app, None)?,
-                    &PredefinedMenuItem::hide_others(app, None)?,
+                    &PredefinedMenuItem::hide(app, Some(&t(app, "desktop.hide")))?,
+                    &PredefinedMenuItem::hide_others(app, Some(&t(app, "desktop.hideOthers")))?,
                     &PredefinedMenuItem::separator(app)?,
-                    &PredefinedMenuItem::quit(app, None)?,
+                    &PredefinedMenuItem::quit(app, Some(&t(app, "desktop.quit")))?,
                 ],
             )?,
             #[cfg(windows)]
             &Submenu::with_items(
                 app,
-                "File",
+                t(app, "desktop.file"),
                 true,
                 &[
-                    &PredefinedMenuItem::close_window(app, None)?,
-                    &PredefinedMenuItem::quit(app, None)?,
+                    &PredefinedMenuItem::close_window(app, Some(&t(app, "desktop.closeWindow")))?,
+                    &PredefinedMenuItem::quit(app, Some(&t(app, "desktop.quit")))?,
                 ],
             )?,
             &Submenu::with_items(
                 app,
-                "Edit",
+                t(app, "desktop.edit"),
                 true,
                 &[
-                    &PredefinedMenuItem::undo(app, None)?,
-                    &PredefinedMenuItem::redo(app, None)?,
+                    &PredefinedMenuItem::undo(app, Some(&t(app, "desktop.undo")))?,
+                    &PredefinedMenuItem::redo(app, Some(&t(app, "desktop.redo")))?,
                     &PredefinedMenuItem::separator(app)?,
-                    &PredefinedMenuItem::cut(app, None)?,
-                    &PredefinedMenuItem::copy(app, None)?,
-                    &PredefinedMenuItem::paste(app, None)?,
-                    &PredefinedMenuItem::select_all(app, None)?,
+                    &PredefinedMenuItem::cut(app, Some(&t(app, "desktop.cut")))?,
+                    &PredefinedMenuItem::copy(app, Some(&t(app, "desktop.copy")))?,
+                    &PredefinedMenuItem::paste(app, Some(&t(app, "desktop.paste")))?,
+                    &PredefinedMenuItem::select_all(app, Some(&t(app, "desktop.selectAll")))?,
                 ],
             )?,
             #[cfg(target_os = "macos")]
             &Submenu::with_items(
                 app,
-                "View",
+                t(app, "desktop.view"),
                 true,
-                &[&PredefinedMenuItem::fullscreen(app, None)?],
+                &[&PredefinedMenuItem::fullscreen(
+                    app,
+                    Some(&t(app, "desktop.fullscreen")),
+                )?],
             )?,
             &window_menu,
             &help_menu,
@@ -200,7 +226,6 @@ fn default_app_menu(app: &tauri::App) -> tauri::Result<tauri::menu::Menu<tauri::
 
 #[cfg(windows)]
 pub(crate) fn setup_windows_tray(app: &mut tauri::App) -> tauri::Result<()> {
-    use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
     use tauri::tray::TrayIconBuilder;
 
     let attention_state = Arc::new(DesktopAttentionState {
@@ -208,27 +233,7 @@ pub(crate) fn setup_windows_tray(app: &mut tauri::App) -> tauri::Result<()> {
     });
     app.manage(attention_state.clone());
 
-    let show = MenuItem::with_id(app, TRAY_MENU_SHOW_ID, "显示 Snack", true, None::<&str>)?;
-    let meeting = MenuItem::with_id(
-        app,
-        TRAY_MENU_MEETING_ID,
-        "开始 Snack 会议录音",
-        true,
-        None::<&str>,
-    )?;
-    let about = PredefinedMenuItem::about(app, Some("关于 Snack"), Some(about_metadata(app)))?;
-    let quit = MenuItem::with_id(app, TRAY_MENU_QUIT_ID, "退出", true, None::<&str>)?;
-    let menu = Menu::with_items(
-        app,
-        &[
-            &show,
-            &meeting,
-            &PredefinedMenuItem::separator(app)?,
-            &about,
-            &PredefinedMenuItem::separator(app)?,
-            &quit,
-        ],
-    )?;
+    let menu = build_status_menu(app.handle())?;
 
     TrayIconBuilder::with_id(TRAY_ID)
         .icon(TRAY_DEFAULT_ICON)
@@ -340,17 +345,21 @@ fn handle_site_selection(app: &AppHandle, site: crate::site::SiteKey) {
     }
     if let Some(reason) = site_switch_block_reason(app) {
         restore_site_menu_selection(app, selected);
-        show_site_switch_message("暂时无法切换站点", &reason);
+        show_site_switch_message(app, &t(app, "desktop.switchUnavailable"), &reason);
         return;
     }
-    if !confirm_site_switch(site) {
+    if !confirm_site_switch(app, site) {
         restore_site_menu_selection(app, selected);
         return;
     }
     if let Err(error) = switch_site(&window, site) {
         restore_site_menu_selection(app, selected);
         log_site_switch_failure(app, site, &error);
-        show_site_switch_message("站点切换失败", "请稍后重试");
+        show_site_switch_message(
+            app,
+            &t(app, "desktop.switchFailed"),
+            &t(app, "desktop.retry"),
+        );
         return;
     }
     restore_site_menu_selection(app, selected);
@@ -361,35 +370,43 @@ fn handle_site_selection(app: &AppHandle, site: crate::site::SiteKey) {
 fn site_switch_block_reason(app: &AppHandle) -> Option<String> {
     crate::meeting::site_switch_block_reason(app).or_else(|| {
         crate::record_import::has_pending_automatic_notes(app)
-            .then(|| "会议纪要正在生成，完成后再切换站点".to_string())
+            .then(|| t(app, "desktop.notesPending"))
     })
 }
 
 #[cfg(any(target_os = "macos", windows))]
-fn confirm_site_switch(site: crate::site::SiteKey) -> bool {
+fn confirm_site_switch(app: &AppHandle, site: crate::site::SiteKey) -> bool {
     use rfd::{MessageButtons, MessageDialog, MessageDialogResult, MessageLevel};
 
     let result = MessageDialog::new()
         .set_level(MessageLevel::Info)
-        .set_title(site_switch_confirmation_title(site))
-        .set_description(site_switch_confirmation_description())
+        .set_title(site_switch_confirmation_title(
+            site,
+            i18n::snapshot(app).locale,
+        ))
+        .set_description(site_switch_confirmation_description(
+            i18n::snapshot(app).locale,
+        ))
         .set_buttons(MessageButtons::OkCancelCustom(
-            "切换".to_string(),
-            "取消".to_string(),
+            t(app, "desktop.switchAction"),
+            t(app, "desktop.cancel"),
         ))
         .show();
     matches!(result, MessageDialogResult::Ok)
-        || matches!(result, MessageDialogResult::Custom(ref label) if label == "切换")
+        || matches!(result, MessageDialogResult::Custom(ref label) if label == &t(app, "desktop.switchAction"))
 }
 
 #[cfg(any(target_os = "macos", windows))]
-fn site_switch_confirmation_title(site: crate::site::SiteKey) -> String {
-    format!("是否切换到{}？", site.display_name())
+fn site_switch_confirmation_title(site: crate::site::SiteKey, locale: Locale) -> String {
+    let values =
+        std::collections::HashMap::from([("site".to_string(), site_display_name(locale, site))]);
+    strfmt::strfmt(&i18n::text(locale, locale, "desktop.switchTitle"), &values)
+        .unwrap_or_else(|_| i18n::text(locale, locale, "common.unavailable"))
 }
 
 #[cfg(any(target_os = "macos", windows))]
-fn site_switch_confirmation_description() -> &'static str {
-    "目标站点未登录时需要登录，当前页面未保存的内容可能丢失。"
+fn site_switch_confirmation_description(locale: Locale) -> String {
+    i18n::text(locale, locale, "desktop.switchDescription")
 }
 
 #[cfg(any(target_os = "macos", windows))]
@@ -442,12 +459,12 @@ fn restore_site_menu_selection(app: &AppHandle, selected: Option<crate::site::Si
 }
 
 #[cfg(any(target_os = "macos", windows))]
-fn show_site_switch_message(title: &str, description: &str) {
+fn show_site_switch_message(app: &AppHandle, title: &str, description: &str) {
     let _ = rfd::MessageDialog::new()
         .set_level(rfd::MessageLevel::Info)
         .set_title(title)
         .set_description(description)
-        .set_buttons(rfd::MessageButtons::OkCustom("知道了".to_string()))
+        .set_buttons(rfd::MessageButtons::OkCustom(t(app, "desktop.acknowledge")))
         .show();
 }
 
@@ -478,30 +495,9 @@ pub(crate) fn install_close_to_status_menu(_window: &WebviewWindow) {}
 
 #[cfg(target_os = "macos")]
 pub(crate) fn setup_macos_status_menu(app: &mut tauri::App) -> tauri::Result<()> {
-    use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
     use tauri::tray::TrayIconBuilder;
 
-    let show = MenuItem::with_id(app, TRAY_MENU_SHOW_ID, "显示 Snack", true, None::<&str>)?;
-    let meeting = MenuItem::with_id(
-        app,
-        TRAY_MENU_MEETING_ID,
-        "开始 Snack 会议录音",
-        true,
-        None::<&str>,
-    )?;
-    let about = PredefinedMenuItem::about(app, Some("关于 Snack"), Some(about_metadata(app)))?;
-    let quit = MenuItem::with_id(app, TRAY_MENU_QUIT_ID, "退出", true, None::<&str>)?;
-    let menu = Menu::with_items(
-        app,
-        &[
-            &show,
-            &meeting,
-            &PredefinedMenuItem::separator(app)?,
-            &about,
-            &PredefinedMenuItem::separator(app)?,
-            &quit,
-        ],
-    )?;
+    let menu = build_status_menu(app.handle())?;
 
     TrayIconBuilder::with_id(TRAY_ID)
         .icon(TRAY_DEFAULT_ICON)
@@ -538,16 +534,83 @@ mod tests {
     #[test]
     fn site_switch_confirmation_uses_the_target_site_name() {
         assert_eq!(
-            site_switch_confirmation_title(SiteKey::Yaowu),
+            site_switch_confirmation_title(SiteKey::Yaowu, crate::i18n::Locale::Zh),
             "是否切换到要务？"
         );
         assert_eq!(
-            site_switch_confirmation_title(SiteKey::Jifuwu),
+            site_switch_confirmation_title(SiteKey::Jifuwu, crate::i18n::Locale::Zh),
             "是否切换到即服务？"
         );
         assert_eq!(
-            site_switch_confirmation_description(),
+            site_switch_confirmation_description(crate::i18n::Locale::Zh),
             "目标站点未登录时需要登录，当前页面未保存的内容可能丢失。"
         );
     }
+}
+
+#[cfg(any(target_os = "macos", windows))]
+fn build_status_menu(app: &AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::Wry>> {
+    use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
+    let show = MenuItem::with_id(
+        app,
+        TRAY_MENU_SHOW_ID,
+        t(app, "desktop.show"),
+        true,
+        None::<&str>,
+    )?;
+    let meeting = MenuItem::with_id(
+        app,
+        TRAY_MENU_MEETING_ID,
+        t(app, "desktop.meeting"),
+        true,
+        None::<&str>,
+    )?;
+    let about = PredefinedMenuItem::about(
+        app,
+        Some(&t(app, "desktop.about")),
+        Some(about_metadata(app)),
+    )?;
+    let quit = MenuItem::with_id(
+        app,
+        TRAY_MENU_QUIT_ID,
+        t(app, "desktop.quit"),
+        true,
+        None::<&str>,
+    )?;
+    let menu = Menu::with_items(
+        app,
+        &[
+            &show,
+            &meeting,
+            &PredefinedMenuItem::separator(app)?,
+            &about,
+            &PredefinedMenuItem::separator(app)?,
+            &quit,
+        ],
+    )?;
+
+    Ok(menu)
+}
+
+#[cfg(any(target_os = "macos", windows))]
+pub(crate) fn refresh_localized_menus(app: &AppHandle) -> tauri::Result<()> {
+    install_application_menu(app)?;
+    if let Some(tray) = app.tray_by_id(TRAY_ID) {
+        tray.set_menu(Some(build_status_menu(app)?))?;
+    }
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
+pub(crate) fn refresh_localized_menus(_app: &AppHandle) -> tauri::Result<()> {
+    Ok(())
+}
+
+fn site_display_name(locale: Locale, site: crate::site::SiteKey) -> String {
+    let key = match site {
+        crate::site::SiteKey::Yaowu => "desktop.siteYaowu",
+        crate::site::SiteKey::Jifuwu => "desktop.siteJifuwu",
+        crate::site::SiteKey::Mechlink => "desktop.siteMechlink",
+    };
+    i18n::text(locale, locale, key)
 }

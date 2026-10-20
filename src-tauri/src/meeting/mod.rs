@@ -16,6 +16,7 @@ mod install;
 mod notifications;
 mod note_notifications;
 pub(crate) mod overlay;
+pub(crate) mod overlay_locale;
 mod permissions;
 mod python_runtime;
 pub(crate) mod quick_access;

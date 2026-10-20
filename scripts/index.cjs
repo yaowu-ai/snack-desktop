@@ -5,6 +5,9 @@ const path = require("node:path");
 const dotenv = require("dotenv");
 
 const repoRoot = path.resolve(__dirname, "..");
+// Check offline resources before invoking any development or release build.
+const resourceCheck = spawnSync(process.execPath, [path.join(repoRoot, "src-tauri/resources/i18n/verify-resources.cjs")], { stdio: "inherit" });
+if (resourceCheck.status !== 0) process.exit(resourceCheck.status || 1);
 const envPath = path.join(repoRoot, ".env");
 const tauriConfPath = path.join(repoRoot, "src-tauri", "tauri.conf.json");
 const tauriBin = path.join(
@@ -23,6 +26,15 @@ dotenv.config({
   path: envPath,
   override: false,
 });
+
+const localeRegion = process.env.SNACK_REGION || "domestic";
+if (!["domestic", "global"].includes(localeRegion)) {
+  throw new Error("SNACK_REGION must be domestic or global");
+}
+dotenv.config({ path: path.join(repoRoot, `.env.${localeRegion}`), override: false });
+if (!["zh", "en"].includes(process.env.NEXT_PUBLIC_DEFAULT_LOCALE)) {
+  throw new Error("NEXT_PUBLIC_DEFAULT_LOCALE must be zh or en");
+}
 
 const operationMap = {
   dev: { command: "dev", disableUpdater: true, localSigning: false },
