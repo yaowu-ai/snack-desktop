@@ -76,6 +76,14 @@ const METHODS: &[BridgeMethodRegistration] = &[
         },
         handler: diagnostics_info_handler,
     },
+    BridgeMethodRegistration {
+        descriptor: BridgeMethodDescriptor {
+            method: "recording.audio.read",
+            introduced_contract_revision: 3,
+            api_versions: &[1],
+        },
+        handler: recording_audio_read_handler,
+    },
 ];
 
 pub(crate) fn descriptors() -> Vec<BridgeMethodDescriptor> {
@@ -117,6 +125,25 @@ fn bridge_info_handler(context: BridgeContext, payload: serde_json::Value) -> Br
                 code: "SERIALIZATION_FAILED",
                 message: error.to_string(),
             }
+        })
+    })
+}
+
+fn recording_audio_read_handler(
+    context: BridgeContext,
+    payload: serde_json::Value,
+) -> BridgeHandlerFuture {
+    Box::pin(async move {
+        let request = parse_payload(payload)?;
+        let response = crate::meeting::audio_read::read(&context.app, request)
+            .await
+            .map_err(|error| BridgeHandlerError {
+                code: error.code,
+                message: error.message,
+            })?;
+        serde_json::to_value(response).map_err(|error| BridgeHandlerError {
+            code: "SERIALIZATION_FAILED",
+            message: error.to_string(),
         })
     })
 }
@@ -315,7 +342,7 @@ mod tests {
 
     #[test]
     fn registry_exposes_only_explicit_methods() {
-        assert_eq!(descriptors().len(), 6);
+        assert_eq!(descriptors().len(), 7);
         assert_eq!(descriptors()[0].method, "bridge.info");
         assert!(find("meeting_start_recording").is_none());
     }
@@ -325,9 +352,18 @@ mod tests {
         assert!(supports(&request("bridge.info", 1)));
         assert!(supports(&request("notifications.permission", 1)));
         assert!(supports(&request("diagnostics.info", 1)));
+        assert!(supports(&request("recording.audio.read", 1)));
+        assert!(!supports(&request("recording.audio.read", 2)));
         assert!(!supports(&request("notifications.permission", 2)));
         assert!(!supports(&request("bridge.info", 2)));
         assert!(!supports(&request("bridge.missing", 1)));
+    }
+
+    #[test]
+    fn recording_audio_read_declares_its_contract_revision() {
+        let descriptor = &find("recording.audio.read").unwrap().descriptor;
+        assert_eq!(descriptor.introduced_contract_revision, 3);
+        assert_eq!(descriptor.api_versions, &[1]);
     }
 
     fn request(method: &str, api_version: u32) -> BridgeProbeRequest {

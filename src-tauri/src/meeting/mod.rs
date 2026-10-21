@@ -6,6 +6,7 @@
 //! the native recording overlay.
 
 mod audio;
+pub(crate) mod audio_read;
 mod capture;
 #[cfg(target_os = "macos")]
 mod capture_macos;
