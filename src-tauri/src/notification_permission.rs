@@ -11,8 +11,8 @@ pub(crate) async fn current(app: &tauri::AppHandle) -> Result<&'static str, Stri
         .map_err(|error| error.to_string())?;
     tokio::time::timeout(std::time::Duration::from_secs(5), receiver)
         .await
-        .map_err(|_| "notification permission query timed out".to_string())?
-        .map_err(|_| "notification permission query was cancelled".to_string())
+        .map_err(|_| crate::i18n::t(app, "desktop.permissionTimeout"))?
+        .map_err(|_| crate::i18n::t(app, "desktop.permissionCancelled"))
 }
 
 #[cfg(target_os = "macos")]

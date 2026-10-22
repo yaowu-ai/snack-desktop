@@ -1,8 +1,8 @@
 <!DOCTYPE html>
-<html lang="zh-CN">
+<html>
 <head>
 <meta charset="UTF-8" />
-<title>Snack 会议录音</title>
+<title data-i18n="windowTitle"></title>
 <style>
   :root { color-scheme: light; }
   * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -65,15 +65,16 @@
     gap: 8px; border-bottom: 1px solid #f8fafc;
   }
   .setting-row:last-child { border-bottom: 0; }
-  .setting-label { flex: 0 0 auto; color: #475569; font-size: 12px; font-weight: 600; }
+  .setting-label { flex: 1 1 45%; min-width: 0; color: #475569; font-size: 12px; font-weight: 600; }
   .filename-input {
+    max-width: 50%;
     width: auto; min-width: 0; flex: 1; border: 1px solid transparent; border-radius: 7px;
     background: transparent; color: #0f172a; font-size: 12px; text-align: right;
     text-overflow: ellipsis; outline: none; cursor: pointer; user-select: text; -webkit-user-select: text;
   }
   .filename-input:not([readonly]) { border-color: #fdba74; padding: 5px 7px; background: #fff; cursor: text; }
   .project-select {
-    width: 126px; min-width: 0; border: 0; background: transparent; color: #0f172a;
+    width: 110px; max-width: 50%; min-width: 0; border: 0; background: transparent; color: #0f172a;
     font-size: 12px; text-align: right; text-align-last: right; text-overflow: ellipsis;
     outline: none; cursor: pointer;
   }
@@ -91,43 +92,45 @@
 </head>
 <body data-paused="false" data-expanded="false">
   <div class="card">
-    <div class="drag-region" data-tauri-drag-region><div class="drag-hint">拖动可移动</div></div>
+    <div class="drag-region" data-tauri-drag-region><div class="drag-hint" data-i18n="drag"></div></div>
     <div class="summary">
-      <button class="icon-button pause-action" id="pause-action" type="button" aria-label="暂停录音" title="暂停录音">
+      <button class="icon-button pause-action" id="pause-action" type="button" data-i18n-label="pause">
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 4h4v16H6zM14 4h4v16h-4z" /></svg>
       </button>
-      <button class="icon-button pause-action" id="resume-action" type="button" aria-label="恢复录音" title="恢复录音" hidden>
+      <button class="icon-button pause-action" id="resume-action" type="button" data-i18n-label="resume" hidden>
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 4v16l13-8z" /></svg>
       </button>
       <div class="status">
-        <div class="title-row"><span class="status-dot"></span><span class="title" id="title">正在录音</span></div>
+        <div class="title-row"><span class="status-dot"></span><span class="title" id="title" data-i18n="recording"></span></div>
         <div class="metric" id="metric">00:00</div>
       </div>
-      <button class="icon-button stop-action" id="stop-action" type="button" aria-label="结束录音" title="结束录音">
+      <button class="icon-button stop-action" id="stop-action" type="button" data-i18n-label="stop">
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6h12v12H6z" /></svg>
       </button>
-      <button class="expand-action" id="expand-action" type="button" aria-label="展开录音配置" title="展开录音配置">
+      <button class="expand-action" id="expand-action" type="button" data-i18n-label="expand">
         <svg viewBox="0 0 24 24" aria-hidden="true"><path id="chevron" d="m6 9 6 6 6-6" /></svg>
       </button>
       <div class="error" id="error" hidden></div>
     </div>
     <div class="settings">
       <label class="setting-row">
-        <span class="setting-label">转写文件标题</span>
-        <input class="filename-input" id="filename-input" type="text" readonly aria-label="转写文件标题" />
+        <span class="setting-label" data-i18n="fileTitle"></span>
+        <input class="filename-input" id="filename-input" type="text" readonly data-i18n-label="fileTitle" />
       </label>
       <div class="setting-row">
-        <span class="setting-label">会议自动总结</span>
-        <button class="switch" id="auto-notes" type="button" role="switch" aria-checked="false" aria-label="本次录音自动生成会议纪要"></button>
+        <span class="setting-label" data-i18n="autoNotes"></span>
+        <button class="switch" id="auto-notes" type="button" role="switch" aria-checked="false" data-i18n-label="autoNotesLabel"></button>
       </div>
       <label class="setting-row">
-        <span class="setting-label">转写保存到项目</span>
-        <select class="project-select" id="project-select" aria-label="转写保存到项目"></select>
+        <span class="setting-label" data-i18n="project"></span>
+        <select class="project-select" id="project-select" data-i18n-label="project"></select>
       </label>
     </div>
   </div>
+  <!--SNACK_LOCALE-->
   <script>
     (function () {
+      var t = window.snackText;
       var current = { elapsedMs: 0, recordingId: '', paused: false, displayName: '', autoGenerateNotesEnabled: false, transcriptProjectId: '', transcriptProjectName: '', projects: [] };
       var expanded = false;
       var pending = false;
@@ -148,11 +151,11 @@
       function invoke(command, args) {
         if (window.__TAURI__ && window.__TAURI__.core) return window.__TAURI__.core.invoke(command, args || {});
         if (window.__TAURI_INTERNALS__ && window.__TAURI_INTERNALS__.invoke) return window.__TAURI_INTERNALS__.invoke(command, args || {});
-        return Promise.reject(new Error('native bridge unavailable'));
+        return Promise.reject(new Error(t('bridgeUnavailable')));
       }
       function withTimeout(promise, timeoutMs) {
         return Promise.race([promise, new Promise(function (_, reject) {
-          setTimeout(function () { reject(new Error('操作超时')); }, timeoutMs);
+          setTimeout(function () { reject(new Error(t('timeout'))); }, timeoutMs);
         })]);
       }
       function formatDuration(ms) {
@@ -172,18 +175,18 @@
         if (signature === projectSignature) return;
         projectSignature = signature;
         projectSelect.replaceChildren();
-        projectSelect.add(new Option('未保存', ''));
+        projectSelect.add(new Option(t('unsaved'), ''));
         projects.forEach(function (project) { projectSelect.add(new Option(project.projectName, project.projectId)); });
         if (selectedId && !projects.some(function (project) { return project.projectId === selectedId; })) {
-          projectSelect.add(new Option(current.transcriptProjectName || '已选项目', selectedId));
+          projectSelect.add(new Option(current.transcriptProjectName || t('selectedProject'), selectedId));
         }
         projectSelect.value = selectedId;
-        projectSelect.title = selectedId ? (current.transcriptProjectName || '已选项目') : '未保存';
+        projectSelect.title = selectedId ? (current.transcriptProjectName || t('selectedProject')) : t('unsaved');
       }
       function render() {
         document.body.dataset.paused = String(Boolean(current.paused));
         document.body.dataset.expanded = String(expanded);
-        titleEl.textContent = current.paused ? '录音已暂停' : '正在录音';
+        titleEl.textContent = t(['recording', 'paused'][Number(Boolean(current.paused))]);
         metricEl.textContent = formatDuration(current.elapsedMs || 0);
         pauseAction.hidden = Boolean(current.paused);
         resumeAction.hidden = !current.paused;
@@ -191,12 +194,12 @@
         resumeAction.disabled = pending;
         stopAction.disabled = pending;
         chevron.setAttribute('d', expanded ? 'm6 15 6-6 6 6' : 'm6 9 6 6 6-6');
-        expandAction.title = expandAction.ariaLabel = expanded ? '收起录音配置' : '展开录音配置';
+        expandAction.title = expandAction.ariaLabel = t(['expand', 'collapse'][Number(expanded)]);
         if (document.activeElement !== filenameInput) filenameInput.value = current.displayName || '';
         autoNotes.setAttribute('aria-checked', String(Boolean(current.autoGenerateNotesEnabled)));
         renderProjectOptions();
         errorEl.hidden = !errorMessage;
-        errorEl.textContent = errorMessage;
+        errorEl.textContent = errorMessage && t(errorMessage);
       }
       function apply(next) {
         if (!next) return;
@@ -210,12 +213,12 @@
         pending = true; errorMessage = ''; render();
         invoke('meeting_set_recording_paused', { paused: !current.paused })
           .then(function () { pending = false; })
-          .catch(function (error) { showError(error, '录音状态切换失败，请重试'); });
+          .catch(function (error) { showError(error, 'pauseFailed'); });
       }
       function stopViaProtocol() {
         return withTimeout(fetch('/stop', { method: 'POST', cache: 'no-store' }), 4000).then(function (response) {
           if (response.ok) return;
-          return response.text().then(function (message) { throw new Error(message || '结束录音失败'); });
+          return response.text().then(function (message) { throw new Error(message || t('stopFailed')); });
         });
       }
       function stopRecording() {
@@ -223,13 +226,13 @@
         pending = true; errorMessage = ''; render();
         withTimeout(invoke('meeting_stop_recording', {}), 4000)
           .catch(function () { return stopViaProtocol(); })
-          .catch(function (error) { showError(error, '结束失败，请重试'); });
+          .catch(function (error) { showError(error, 'stopFailed'); });
       }
       function toggleExpanded() {
         var next = !expanded;
         invoke('set_overlay_expanded', { expanded: next }).then(function () {
           expanded = next; render();
-        }).catch(function (error) { showError(error, '无法展开录音配置'); });
+        }).catch(function (error) { showError(error, 'expandFailed'); });
       }
       function beginRename() {
         filenameInput.readOnly = false;
@@ -240,12 +243,12 @@
         if (filenameInput.readOnly) return;
         filenameInput.readOnly = true;
         invoke('meeting_set_transcript_file_title', { displayName: filenameInput.value })
-          .catch(function (error) { showError(error, '转写文件标题保存失败'); });
+          .catch(function (error) { showError(error, 'renameFailed'); });
       }
       function toggleAutoNotes() {
         var enabled = !current.autoGenerateNotesEnabled;
         invoke('meeting_set_recording_auto_notes', { enabled: enabled })
-          .catch(function (error) { showError(error, '自动转写设置失败'); });
+          .catch(function (error) { showError(error, 'autoNotesFailed'); });
       }
       function selectTranscriptProject() {
         var projectId = projectSelect.value || null;
@@ -258,7 +261,7 @@
           projectName: project ? project.projectName : null
         }).catch(function (error) {
           projectSignature = '';
-          showError(error, '转写保存项目设置失败');
+          showError(error, 'projectFailed');
         });
       }
 
@@ -275,6 +278,7 @@
       autoNotes.addEventListener('click', function (event) { event.stopPropagation(); toggleAutoNotes(); });
       projectSelect.addEventListener('click', function (event) { event.stopPropagation(); });
       projectSelect.addEventListener('change', function (event) { event.stopPropagation(); selectTranscriptProject(); });
+      window.renderSnackLocale = function () { projectSignature = ''; render(); };
       render();
       try {
         var eventApi = window.__TAURI__ && window.__TAURI__.event;

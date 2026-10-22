@@ -4,6 +4,7 @@ mod bridge;
 mod commands;
 mod constants;
 mod download;
+mod i18n;
 mod logging;
 mod meeting;
 mod navigation;
@@ -113,6 +114,7 @@ pub fn run() {
             record_import::acknowledge_record_import_prefilled
         ])
         .setup(|app| {
+            i18n::initialize(app.handle()).map_err(std::io::Error::other)?;
             bridge::initialize(app.handle());
             record_import::initialize(app.handle()).map_err(std::io::Error::other)?;
             meeting::initialize(app.handle()).map_err(std::io::Error::other)?;

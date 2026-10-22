@@ -3,11 +3,13 @@
   "private": true,
   "version": "1.3.0",
   "scripts": {
+    "i18n:check": "node src-tauri/resources/i18n/verify-resources.cjs",
     "dev": "node scripts/index.cjs dev",
     "build": "node scripts/index.cjs build",
     "build:local": "node scripts/index.cjs build-local --debug --bundles app"
   },
   "devDependencies": {
+    "@playwright/test": "1.57.0",
     "@tauri-apps/cli": "^2.11.3",
     "dotenv": "^16.4.5"
   }

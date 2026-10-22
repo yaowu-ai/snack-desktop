@@ -1,4 +1,5 @@
 fn main() {
+    configure_default_locale();
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=SNACK_DESKTOP_BASE_UA");
     println!("cargo:rerun-if-env-changed=SNACK_DESKTOP_VERSION");
@@ -56,6 +57,32 @@ fn main() {
         build_audio_tap();
     }
     tauri_build::build()
+}
+
+fn configure_default_locale() {
+    println!("cargo:rerun-if-env-changed=NEXT_PUBLIC_DEFAULT_LOCALE");
+    println!("cargo:rerun-if-env-changed=SNACK_REGION");
+    println!("cargo:rerun-if-changed=../.env.domestic");
+    println!("cargo:rerun-if-changed=../.env.global");
+    let region = std::env::var("SNACK_REGION").unwrap_or_else(|_| "domestic".into());
+    let source = match region.as_str() {
+        "domestic" => include_str!("../.env.domestic"),
+        "global" => include_str!("../.env.global"),
+        _ => panic!("SNACK_REGION must be domestic or global"),
+    };
+    let locale = std::env::var("NEXT_PUBLIC_DEFAULT_LOCALE").unwrap_or_else(|_| {
+        source
+            .lines()
+            .find_map(|line| line.strip_prefix("NEXT_PUBLIC_DEFAULT_LOCALE="))
+            .expect("locale env configuration")
+            .trim()
+            .into()
+    });
+    assert!(
+        matches!(locale.as_str(), "zh" | "en"),
+        "NEXT_PUBLIC_DEFAULT_LOCALE must be zh or en"
+    );
+    println!("cargo:rustc-env=NEXT_PUBLIC_DEFAULT_LOCALE={locale}");
 }
 
 fn build_audio_tap() {

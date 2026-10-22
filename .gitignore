@@ -2,5 +2,7 @@
 /.idea/
 .env
 node_modules/
+/test-results/
+/playwright-report/
 /src-tauri/resources/python-runtime/*
 !/src-tauri/resources/python-runtime/.gitkeep

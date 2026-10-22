@@ -40,7 +40,7 @@ pub(crate) async fn bridge_call(
     match resolve_probe(&probe_from_call(&request)).status {
         BridgeProbeStatus::Supported => dispatch_call(app, window, request).await,
         BridgeProbeStatus::UpdateRequired => Ok(start_required_update(&app).await),
-        BridgeProbeStatus::Unsupported => Ok(unsupported_response(&request)),
+        BridgeProbeStatus::Unsupported => Ok(unsupported_response(&app, &request)),
     }
 }
 
@@ -69,7 +69,7 @@ async fn dispatch_call(
     window: WebviewWindow,
     request: BridgeCallRequest,
 ) -> Result<BridgeCallResponse, String> {
-    let unsupported = unsupported_response(&request);
+    let unsupported = unsupported_response(&app, &request);
     let context = BridgeContext { app, window };
     let result = registry::dispatch(context, request.method.trim(), request.payload).await;
     Ok(match result {
@@ -87,7 +87,7 @@ async fn start_required_update(app: &AppHandle) -> BridgeCallResponse {
         StartUpdateResult::Updating(version) => BridgeCallResponse::Updating { version },
         StartUpdateResult::Unsupported => BridgeCallResponse::Unsupported {
             code: "NO_SUPPORTED_UPDATE",
-            message: "当前版本不支持此能力，且暂无可用更新".to_string(),
+            message: crate::i18n::t(app, "desktop.noUpdate"),
         },
         StartUpdateResult::Busy(message) => BridgeCallResponse::Busy {
             code: "DESKTOP_BUSY",
@@ -149,12 +149,16 @@ fn probe_from_call(request: &BridgeCallRequest) -> BridgeProbeRequest {
     }
 }
 
-fn unsupported_response(request: &BridgeCallRequest) -> BridgeCallResponse {
+fn unsupported_response(app: &AppHandle, request: &BridgeCallRequest) -> BridgeCallResponse {
     BridgeCallResponse::Unsupported {
         code: "METHOD_OR_API_UNSUPPORTED",
-        message: format!(
-            "当前桌面端不支持桥能力 {}@{}",
-            request.method, request.api_version
+        message: crate::i18n::format(
+            app,
+            "desktop.unsupported",
+            &[
+                ("method", request.method.clone()),
+                ("version", request.api_version.to_string()),
+            ],
         ),
     }
 }

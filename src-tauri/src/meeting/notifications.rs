@@ -69,9 +69,9 @@ pub(crate) fn notify_recording_save_failed(app: &AppHandle, recording_id: &str) 
 fn show_model_ready_notification(app: AppHandle) {
     configure_notification_identity(&app);
     let result = Notification::new()
-        .summary("模型已经下载完成")
-        .body("完成设置，马上体验 Snack 会议录音。")
-        .action("open-meeting-settings", "完成设置")
+        .summary(&crate::i18n::t(&app, "desktop.notifications.modelReady"))
+        .body(&crate::i18n::t(&app, "desktop.notifications.modelReadyBody"))
+        .action("open-meeting-settings", &crate::i18n::t(&app, "desktop.notifications.finishSetup"))
         .show();
 
     let handle = match result {
@@ -87,9 +87,9 @@ fn show_model_ready_notification(app: AppHandle) {
 fn show_transcript_ready_notification(app: AppHandle) {
     configure_notification_identity(&app);
     let result = Notification::new()
-        .summary("音频转写已完成")
-        .body("点击查看音频转写任务。")
-        .action("open-meeting-records", "查看任务")
+        .summary(&crate::i18n::t(&app, "desktop.notifications.transcriptReady"))
+        .body(&crate::i18n::t(&app, "desktop.notifications.transcriptReadyBody"))
+        .action("open-meeting-records", &crate::i18n::t(&app, "desktop.notifications.viewTask"))
         .show();
 
     let handle = match result {
@@ -111,9 +111,9 @@ fn show_transcript_ready_notification(app: AppHandle) {
 fn show_notes_ready_notification(app: AppHandle, target_path: String) {
     configure_notification_identity(&app);
     let result = Notification::new()
-        .summary("会议纪要已生成")
-        .body("点击查看已完成的会议纪要。")
-        .action("open-meeting-records", "查看会议纪要")
+        .summary(&crate::i18n::t(&app, "desktop.notifications.notesReady"))
+        .body(&crate::i18n::t(&app, "desktop.notifications.notesReadyBody"))
+        .action("open-meeting-records", &crate::i18n::t(&app, "desktop.notifications.viewNotes"))
         .show();
 
     let handle = match result {
@@ -135,9 +135,9 @@ fn show_notes_ready_notification(app: AppHandle, target_path: String) {
 fn show_transcript_failed_notification(app: AppHandle, recording_id: String, save_failed: bool) {
     configure_notification_identity(&app);
     let result = Notification::new()
-        .summary(if save_failed { "录音保存失败" } else { "音频转写失败" })
-        .body(if save_failed { "点击检查并恢复录音文件。" } else { "点击查看音频转写任务并重试。" })
-        .action("open-meeting-records", "查看任务")
+        .summary(&crate::i18n::t(&app, if save_failed { "desktop.notifications.saveFailed" } else { "desktop.notifications.transcriptFailed" }))
+        .body(&crate::i18n::t(&app, if save_failed { "desktop.notifications.saveFailedBody" } else { "desktop.notifications.transcriptFailedBody" }))
+        .action("open-meeting-records", &crate::i18n::t(&app, "desktop.notifications.viewTask"))
         .show();
 
     let handle = match result {
