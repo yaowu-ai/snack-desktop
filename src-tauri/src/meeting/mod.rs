@@ -6,6 +6,7 @@
 //! the native recording overlay.
 
 mod audio;
+pub(crate) mod audio_read;
 mod capture;
 #[cfg(target_os = "macos")]
 mod capture_macos;
@@ -16,6 +17,7 @@ mod install;
 mod notifications;
 mod note_notifications;
 pub(crate) mod overlay;
+pub(crate) mod overlay_locale;
 mod permissions;
 mod python_runtime;
 pub(crate) mod quick_access;

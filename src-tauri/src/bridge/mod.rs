@@ -40,7 +40,7 @@ pub(crate) async fn bridge_call(
     match resolve_probe(&probe_from_call(&request)).status {
         BridgeProbeStatus::Supported => dispatch_call(app, window, request).await,
         BridgeProbeStatus::UpdateRequired => Ok(start_required_update(&app).await),
-        BridgeProbeStatus::Unsupported => Ok(unsupported_response(&request)),
+        BridgeProbeStatus::Unsupported => Ok(unsupported_response(&app, &request)),
     }
 }
 
@@ -69,7 +69,7 @@ async fn dispatch_call(
     window: WebviewWindow,
     request: BridgeCallRequest,
 ) -> Result<BridgeCallResponse, String> {
-    let unsupported = unsupported_response(&request);
+    let unsupported = unsupported_response(&app, &request);
     let context = BridgeContext { app, window };
     let result = registry::dispatch(context, request.method.trim(), request.payload).await;
     Ok(match result {
@@ -87,7 +87,7 @@ async fn start_required_update(app: &AppHandle) -> BridgeCallResponse {
         StartUpdateResult::Updating(version) => BridgeCallResponse::Updating { version },
         StartUpdateResult::Unsupported => BridgeCallResponse::Unsupported {
             code: "NO_SUPPORTED_UPDATE",
-            message: "当前版本不支持此能力，且暂无可用更新".to_string(),
+            message: crate::i18n::t(app, "desktop.noUpdate"),
         },
         StartUpdateResult::Busy(message) => BridgeCallResponse::Busy {
             code: "DESKTOP_BUSY",
@@ -101,22 +101,42 @@ async fn start_required_update(app: &AppHandle) -> BridgeCallResponse {
 }
 
 fn resolve_probe(request: &BridgeProbeRequest) -> BridgeProbeResponse {
-    if request.required_contract_revision > BRIDGE_CONTRACT_REVISION {
-        return probe_response(BridgeProbeStatus::UpdateRequired, Some("CONTRACT_TOO_OLD"));
+    resolve_probe_for_revision(request, BRIDGE_CONTRACT_REVISION)
+}
+
+fn resolve_probe_for_revision(
+    request: &BridgeProbeRequest,
+    current_contract_revision: u32,
+) -> BridgeProbeResponse {
+    if request.required_contract_revision > current_contract_revision {
+        return probe_response(
+            BridgeProbeStatus::UpdateRequired,
+            Some("CONTRACT_TOO_OLD"),
+            current_contract_revision,
+        );
     }
     if registry::supports(request) {
-        return probe_response(BridgeProbeStatus::Supported, None);
+        return probe_response(
+            BridgeProbeStatus::Supported,
+            None,
+            current_contract_revision,
+        );
     }
     probe_response(
         BridgeProbeStatus::Unsupported,
         Some("METHOD_OR_API_UNSUPPORTED"),
+        current_contract_revision,
     )
 }
 
-fn probe_response(status: BridgeProbeStatus, code: Option<&'static str>) -> BridgeProbeResponse {
+fn probe_response(
+    status: BridgeProbeStatus,
+    code: Option<&'static str>,
+    current_contract_revision: u32,
+) -> BridgeProbeResponse {
     BridgeProbeResponse {
         status,
-        current_contract_revision: BRIDGE_CONTRACT_REVISION,
+        current_contract_revision,
         code,
     }
 }
@@ -129,12 +149,16 @@ fn probe_from_call(request: &BridgeCallRequest) -> BridgeProbeRequest {
     }
 }
 
-fn unsupported_response(request: &BridgeCallRequest) -> BridgeCallResponse {
+fn unsupported_response(app: &AppHandle, request: &BridgeCallRequest) -> BridgeCallResponse {
     BridgeCallResponse::Unsupported {
         code: "METHOD_OR_API_UNSUPPORTED",
-        message: format!(
-            "当前桌面端不支持桥能力 {}@{}",
-            request.method, request.api_version
+        message: crate::i18n::format(
+            app,
+            "desktop.unsupported",
+            &[
+                ("method", request.method.clone()),
+                ("version", request.api_version.to_string()),
+            ],
         ),
     }
 }
@@ -172,6 +196,18 @@ mod tests {
     fn registered_method_and_api_are_supported() {
         let response = resolve_probe(&probe("bridge.info", BRIDGE_CONTRACT_REVISION, 1));
         assert_eq!(response.status, BridgeProbeStatus::Supported);
+    }
+
+    #[test]
+    fn recording_audio_read_requires_an_update_from_contract_two() {
+        let request = probe("recording.audio.read", 3, 1);
+        let old = resolve_probe_for_revision(&request, 2);
+        assert_eq!(old.status, BridgeProbeStatus::UpdateRequired);
+        assert_eq!(old.current_contract_revision, 2);
+        assert_eq!(old.code, Some("CONTRACT_TOO_OLD"));
+        let current = resolve_probe(&request);
+        assert_eq!(current.status, BridgeProbeStatus::Supported);
+        assert_eq!(current.current_contract_revision, 3);
     }
 
     fn probe(method: &str, revision: u32, api_version: u32) -> BridgeProbeRequest {

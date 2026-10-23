@@ -30,6 +30,22 @@ struct BridgeMethodRegistration {
 const METHODS: &[BridgeMethodRegistration] = &[
     BridgeMethodRegistration {
         descriptor: BridgeMethodDescriptor {
+            method: "locale.get",
+            introduced_contract_revision: 1,
+            api_versions: &[1],
+        },
+        handler: locale_get_handler,
+    },
+    BridgeMethodRegistration {
+        descriptor: BridgeMethodDescriptor {
+            method: "locale.set",
+            introduced_contract_revision: 1,
+            api_versions: &[1],
+        },
+        handler: locale_set_handler,
+    },
+    BridgeMethodRegistration {
+        descriptor: BridgeMethodDescriptor {
             method: "bridge.info",
             introduced_contract_revision: 1,
             api_versions: &[1],
@@ -76,7 +92,45 @@ const METHODS: &[BridgeMethodRegistration] = &[
         },
         handler: diagnostics_info_handler,
     },
+    BridgeMethodRegistration {
+        descriptor: BridgeMethodDescriptor {
+            method: "recording.audio.read",
+            introduced_contract_revision: 3,
+            api_versions: &[1],
+        },
+        handler: recording_audio_read_handler,
+    },
 ];
+
+fn locale_get_handler(context: BridgeContext, payload: serde_json::Value) -> BridgeHandlerFuture {
+    Box::pin(async move {
+        validate_empty_payload(&payload)?;
+        Ok(serde_json::json!(crate::i18n::snapshot(&context.app)))
+    })
+}
+
+fn locale_set_handler(context: BridgeContext, payload: serde_json::Value) -> BridgeHandlerFuture {
+    Box::pin(async move {
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Preference {
+            preference: Option<crate::i18n::Locale>,
+        }
+        let request: Preference =
+            serde_json::from_value(payload).map_err(|_| BridgeHandlerError {
+                code: "INVALID_LOCALE",
+                message: crate::i18n::t(&context.app, "desktop.localeFailed"),
+            })?;
+        let snapshot =
+            crate::i18n::set_preference(&context.app, request.preference).map_err(|_| {
+                BridgeHandlerError {
+                    code: "LOCALE_SAVE_FAILED",
+                    message: crate::i18n::t(&context.app, "desktop.localeFailed"),
+                }
+            })?;
+        Ok(serde_json::json!(snapshot))
+    })
+}
 
 pub(crate) fn descriptors() -> Vec<BridgeMethodDescriptor> {
     METHODS
@@ -117,6 +171,25 @@ fn bridge_info_handler(context: BridgeContext, payload: serde_json::Value) -> Br
                 code: "SERIALIZATION_FAILED",
                 message: error.to_string(),
             }
+        })
+    })
+}
+
+fn recording_audio_read_handler(
+    context: BridgeContext,
+    payload: serde_json::Value,
+) -> BridgeHandlerFuture {
+    Box::pin(async move {
+        let request = parse_payload(payload)?;
+        let response = crate::meeting::audio_read::read(&context.app, request)
+            .await
+            .map_err(|error| BridgeHandlerError {
+                code: error.code,
+                message: error.message,
+            })?;
+        serde_json::to_value(response).map_err(|error| BridgeHandlerError {
+            code: "SERIALIZATION_FAILED",
+            message: error.to_string(),
         })
     })
 }
@@ -315,8 +388,16 @@ mod tests {
 
     #[test]
     fn registry_exposes_only_explicit_methods() {
-        assert_eq!(descriptors().len(), 6);
-        assert_eq!(descriptors()[0].method, "bridge.info");
+        assert_eq!(descriptors().len(), 9);
+        assert!(find("bridge.info").is_some());
+        assert!(find("locale.get").is_some());
+        assert!(find("locale.set").is_some());
+        assert!(find("notifications.permission").is_some());
+        assert!(find("diagnostics.record").is_some());
+        assert!(find("diagnostics.snapshot").is_some());
+        assert!(find("diagnostics.clear").is_some());
+        assert!(find("diagnostics.info").is_some());
+        assert!(find("recording.audio.read").is_some());
         assert!(find("meeting_start_recording").is_none());
     }
 
@@ -325,9 +406,18 @@ mod tests {
         assert!(supports(&request("bridge.info", 1)));
         assert!(supports(&request("notifications.permission", 1)));
         assert!(supports(&request("diagnostics.info", 1)));
+        assert!(supports(&request("recording.audio.read", 1)));
+        assert!(!supports(&request("recording.audio.read", 2)));
         assert!(!supports(&request("notifications.permission", 2)));
         assert!(!supports(&request("bridge.info", 2)));
         assert!(!supports(&request("bridge.missing", 1)));
+    }
+
+    #[test]
+    fn recording_audio_read_declares_its_contract_revision() {
+        let descriptor = &find("recording.audio.read").unwrap().descriptor;
+        assert_eq!(descriptor.introduced_contract_revision, 3);
+        assert_eq!(descriptor.api_versions, &[1]);
     }
 
     fn request(method: &str, api_version: u32) -> BridgeProbeRequest {
