@@ -51,7 +51,7 @@ impl Default for MeetingSettings {
     fn default() -> Self {
         Self {
             storage_directory: None,
-            shortcut: "CommandOrControl+R".to_string(),
+            shortcut: super::shortcut_policy::new_default_shortcut().to_string(),
             retain_audio: true,
             recording_reminder_enabled: false,
             auto_generate_notes_enabled: false,
@@ -286,6 +286,9 @@ impl Default for ServerSubmission {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct MeetingTask {
     pub(crate) recording_id: String,
+    /// Native identity captured only after recording starts; legacy tasks remain unattributed.
+    #[serde(default)]
+    pub(crate) recording_account_key: Option<String>,
     #[serde(default)]
     pub(crate) display_name: Option<String>,
     #[serde(default)]
@@ -334,6 +337,7 @@ impl MeetingTask {
         let now = now_rfc3339();
         Self {
             recording_id,
+            recording_account_key: None,
             display_name: None,
             auto_generate_notes_enabled: None,
             defer_transcription: false,
@@ -403,6 +407,14 @@ pub(crate) struct MeetingStore {
 }
 
 impl MeetingStore {
+    #[cfg(test)]
+    pub(crate) fn for_test(root: PathBuf, default_recordings_root: PathBuf) -> Self {
+        Self {
+            root,
+            default_recordings_root,
+        }
+    }
+
     pub(crate) fn open(app: &AppHandle) -> Result<Self, String> {
         let root = app
             .path()
@@ -709,7 +721,13 @@ impl MeetingStore {
         let mut settings: MeetingSettings = fs::read(self.root.join(SETTINGS_FILE))
             .ok()
             .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-            .unwrap_or_default();
+            .unwrap_or_else(|| MeetingSettings {
+                shortcut: super::shortcut_policy::LEGACY_SHORTCUT.into(),
+                ..MeetingSettings::default()
+            });
+        if let Some(shortcut) = super::shortcut_policy::committed_shortcut(self) {
+            settings.shortcut = shortcut;
+        }
         let legacy_default = self.default_recordings_root.join("Snack会议");
         if settings
             .storage_directory
@@ -729,9 +747,6 @@ impl MeetingStore {
         }
         if settings.notes_prompt.trim().is_empty() {
             settings.notes_prompt = default_meeting_notes_prompt();
-        }
-        if settings.shortcut == "CommandOrControl+Shift+R" {
-            settings.shortcut = "CommandOrControl+R".to_string();
         }
         settings
     }
@@ -1087,7 +1102,10 @@ mod tests {
         assert!(!settings.recording_reminder_enabled);
         assert!(!settings.auto_generate_notes_enabled);
         assert!(!settings.organize_transcripts_by_date);
-        assert_eq!(settings.shortcut, "CommandOrControl+R");
+        assert_eq!(
+            settings.shortcut,
+            super::super::shortcut_policy::new_default_shortcut()
+        );
         assert_eq!(settings.notes_prompt, DEFAULT_MEETING_NOTES_PROMPT);
         assert!(validate_meeting_settings(&settings).is_ok());
     }

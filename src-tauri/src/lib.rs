@@ -167,6 +167,7 @@ pub fn run() {
                 .on_page_load(move |window, payload| {
                     if payload.event() == PageLoadEvent::Started {
                         meeting::reset_note_notification_handler();
+                        meeting::shortcut_policy::clear_account_binding();
                     }
                     if payload.event() == PageLoadEvent::Finished {
                         #[cfg(any(target_os = "macos", windows))]

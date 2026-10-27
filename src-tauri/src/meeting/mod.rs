@@ -24,6 +24,7 @@ pub(crate) mod quick_access;
 mod reminder;
 #[cfg(target_os = "macos")]
 mod reminder_macos;
+pub(crate) mod shortcut_policy;
 mod state;
 mod transcribe;
 
@@ -129,6 +130,7 @@ pub(crate) struct MeetingSnapshot {
     task: Option<MeetingTask>,
     tasks: Vec<MeetingTask>,
     settings: MeetingSettings,
+    shortcut_policy: Option<shortcut_policy::PolicySnapshot>,
     catalog: Vec<CatalogInfo>,
     permissions: Option<PermissionStatus>,
     disk_free_bytes: Option<u64>,
@@ -141,6 +143,7 @@ struct MeetingCapabilities {
     transcription_task_controls: bool,
     inline_recording: bool,
     deferred_transcription: bool,
+    shortcut_policy_migration: bool,
 }
 
 impl MeetingCapabilities {
@@ -150,6 +153,7 @@ impl MeetingCapabilities {
             transcription_task_controls: true,
             inline_recording: true,
             deferred_transcription: true,
+            shortcut_policy_migration: true,
         }
     }
 }
@@ -170,6 +174,7 @@ pub(crate) fn build_snapshot(store: &MeetingStore) -> MeetingSnapshot {
         task: store.load_task(),
         tasks: store.load_task_records(),
         settings: store.load_settings(),
+        shortcut_policy: shortcut_policy::snapshot(store),
         catalog: catalog().iter().map(CatalogInfo::from).collect(),
         permissions: None,
         disk_free_bytes: install::free_disk_bytes(store).ok(),
@@ -267,6 +272,15 @@ fn site_switch_is_blocked_by_state(state: TaskState) -> bool {
 
 pub(crate) fn initialize(app: &AppHandle) -> Result<(), String> {
     let store = MeetingStore::open(app)?;
+    if let Err(error) = shortcut_policy::initialize(&store) {
+        crate::logging::write_app_log(
+            app,
+            "warn",
+            "meeting",
+            "shortcut policy unavailable; preserving settings",
+            Some(&serde_json::json!({ "error": error })),
+        );
+    }
     let manager = Arc::new(InstallManager::new());
     let reminder_enabled = store.load_settings().recording_reminder_enabled;
     let reminder = reminder::RecordingReminderMonitor::new(app.clone());
@@ -583,33 +597,16 @@ pub(crate) fn meeting_update_settings(
     app: AppHandle,
     window: WebviewWindow,
     settings: MeetingSettings,
+    shortcut_explicit: Option<bool>,
 ) -> Result<(), String> {
     require_allowed_window(&window)?;
     let state = app.state::<MeetingManagerState>();
-    let previous = state.store.load_settings();
     state.store.prepare_settings(&settings)?;
-    save_and_activate_settings(&app, &state.store, &previous, &settings)?;
+    shortcut_policy::save_user_settings(&app, &state.store, &settings, shortcut_explicit)?;
     state
         .reminder
         .set_enabled(settings.recording_reminder_enabled);
     emit_state(&app, &state.store);
-    Ok(())
-}
-
-fn save_and_activate_settings(
-    app: &AppHandle,
-    store: &MeetingStore,
-    previous: &MeetingSettings,
-    settings: &MeetingSettings,
-) -> Result<(), String> {
-    quick_access::replace_shortcut(app, &previous.shortcut, &settings.shortcut)?;
-    if let Err(error) = store.save_settings(settings) {
-        let rollback = quick_access::replace_shortcut(app, &settings.shortcut, &previous.shortcut);
-        return match rollback {
-            Ok(()) => Err(error),
-            Err(rollback_error) => Err(format!("{error}; 恢复原快捷键失败: {rollback_error}")),
-        };
-    }
     Ok(())
 }
 
@@ -891,12 +888,23 @@ fn start_recording(
 
     let audio_path = store.audio_path(&recording_id);
     let started_millis = unix_millis();
+    let recording_account = shortcut_policy::account_key();
     state.reminder.set_recording_active(true);
     match capture::start_recording(audio_path.clone(), started_millis) {
         Ok(recorder) => {
             *state.recorder.lock().expect("recorder poisoned") = Some(recorder);
+            if let Err(error) = shortcut_policy::mark_started(store, recording_account.as_deref()) {
+                crate::logging::write_app_log(
+                    &app,
+                    "warn",
+                    "meeting",
+                    "recording usage persistence failed",
+                    Some(&serde_json::json!({ "error": error })),
+                );
+            }
             let mut task = store.load_task().ok_or("任务丢失")?;
             task.state = TaskState::Recording;
+            task.recording_account_key = recording_account;
             task.audio_path = Some(audio_path.to_string_lossy().to_string());
             store.save_task(&task)?;
             state.recording_overlay_enabled.store(show_overlay, Ordering::SeqCst);

@@ -207,7 +207,7 @@ mod tests {
         assert_eq!(old.code, Some("CONTRACT_TOO_OLD"));
         let current = resolve_probe(&request);
         assert_eq!(current.status, BridgeProbeStatus::Supported);
-        assert_eq!(current.current_contract_revision, 3);
+        assert_eq!(current.current_contract_revision, 4);
     }
 
     fn probe(method: &str, revision: u32, api_version: u32) -> BridgeProbeRequest {
