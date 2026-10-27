@@ -950,6 +950,7 @@ fn build_overlay_state(
     status: LiveCaptureStatus,
 ) -> overlay::OverlayState {
     overlay::OverlayState::recording(overlay::RecordingOverlayState {
+        audio_level_db: status.audio_level_db,
         recording_id: task.recording_id.clone(),
         elapsed_ms: status.elapsed_ms,
         mic_active: status.mic_active,
@@ -1615,11 +1616,17 @@ fn fail_finalize(app: &AppHandle, store: &MeetingStore, message: String) {
 pub(crate) fn meeting_get_recording_status(
     app: AppHandle,
     window: WebviewWindow,
+    recording_id: Option<String>,
 ) -> Result<Option<LiveCaptureStatus>, String> {
     if !overlay::is_overlay_window(&window) {
         require_allowed_window(&window)?;
     }
     let state = app.state::<MeetingManagerState>();
+    if recording_id.as_ref().is_some_and(|expected| {
+        !state.store.load_task().is_some_and(|task| task.recording_id == *expected)
+    }) {
+        return Ok(None);
+    }
     let guard = state.recorder.lock().expect("recorder poisoned");
     Ok(guard
         .as_ref()
@@ -2462,7 +2469,7 @@ fn spawn_overlay_updater(app: AppHandle, recording_id: String) {
                 return;
             };
             overlay::update_overlay(&window, build_overlay_state(&state, &task, status));
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
         }
     });
 }
