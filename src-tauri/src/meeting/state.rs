@@ -687,11 +687,9 @@ impl MeetingStore {
     }
 
     fn ensure_transcript_text_file(&self, task: &mut MeetingTask) {
-        if task
-            .transcript_path
-            .as_deref()
-            .is_some_and(|path| PathBuf::from(path).exists())
-        {
+        // Export legacy transcripts once. A recorded path may be missing because
+        // the user deleted or moved the file; reading state must not restore it.
+        if task.transcript_path.is_some() {
             return;
         }
         let Some(transcript) = task.transcript.as_ref() else {
@@ -703,7 +701,7 @@ impl MeetingStore {
         }
         if fs::write(&path, transcript_text(transcript)).is_ok() {
             task.transcript_path = Some(path.to_string_lossy().into_owned());
-            let _ = self.save_task_record(task);
+            let _ = self.save_task_progress(task);
         }
     }
 
@@ -1006,13 +1004,13 @@ fn meeting_task_local_date(task: &MeetingTask) -> String {
 #[cfg(test)]
 mod tests {
     use super::protected_audio_paths;
-    use std::path::PathBuf;
     use super::{
         now_rfc3339, parse_rfc3339_millis, validate_meeting_settings, DownloadProgress,
         MeetingSettings, MeetingStore, MeetingTask, ResourceState, ResourceStatus,
         ServerSubmission, TaskState, TranscriptAssetState, DEFAULT_MEETING_NOTES_PROMPT,
     };
     use std::fs;
+    use std::path::PathBuf;
 
     #[test]
     fn awaiting_transcription_audio_is_protected_from_pruning() {
@@ -1253,6 +1251,118 @@ mod tests {
             recordings_root.join("产品周会 (2).txt")
         );
 
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn loading_records_does_not_recreate_deleted_transcript_exports() {
+        for remove_directory in [false, true] {
+            let root = std::env::temp_dir().join(format!(
+                "snack-deleted-transcripts-{}-{remove_directory}",
+                super::unix_millis()
+            ));
+            let store = MeetingStore {
+                root: root.join("state"),
+                default_recordings_root: root.join("recordings"),
+            };
+            let recordings_root = store.recordings_root();
+            fs::create_dir_all(&recordings_root).unwrap();
+            for index in 0..3 {
+                let mut task = MeetingTask::new(format!("rec-{index}"), "zh".to_string());
+                task.display_name = Some(format!("meeting-{index}.txt"));
+                task.state = TaskState::TranscriptReady;
+                task.transcript = Some(super::Transcript {
+                    text: format!("transcript {index}"),
+                    language: "zh".to_string(),
+                    segments: Vec::new(),
+                    model_key: "test".to_string(),
+                    engine: "test".to_string(),
+                    generated_at: task.created_at.clone(),
+                });
+                let path = store.transcript_text_path(&task);
+                fs::write(&path, "exported transcript").unwrap();
+                task.transcript_path = Some(path.to_string_lossy().into_owned());
+                store.save_task(&task).unwrap();
+                fs::remove_file(path).unwrap();
+            }
+            if remove_directory {
+                fs::remove_dir_all(&recordings_root).unwrap();
+            }
+
+            // A fresh store also covers startup reads after the user deletes exports.
+            let reopened = MeetingStore {
+                root: store.root.clone(),
+                default_recordings_root: store.default_recordings_root.clone(),
+            };
+            for _ in 0..3 {
+                let tasks = reopened.load_task_records();
+                assert_eq!(tasks.len(), 3);
+                for task in tasks {
+                    assert!(task.transcript.is_some());
+                    assert!(!PathBuf::from(task.transcript_path.unwrap()).exists());
+                }
+                if remove_directory {
+                    assert!(!recordings_root.exists());
+                } else {
+                    assert_eq!(fs::read_dir(&recordings_root).unwrap().count(), 0);
+                }
+            }
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn legacy_current_transcript_is_exported_only_once_across_restart() {
+        let root = std::env::temp_dir().join(format!(
+            "snack-legacy-transcript-export-{}",
+            super::unix_millis()
+        ));
+        let store = MeetingStore {
+            root: root.join("state"),
+            default_recordings_root: root.join("recordings"),
+        };
+        let mut task = MeetingTask::new("rec-legacy".to_string(), "zh".to_string());
+        task.state = TaskState::TranscriptReady;
+        task.transcript = Some(super::Transcript {
+            text: "legacy transcript".to_string(),
+            language: "zh".to_string(),
+            segments: Vec::new(),
+            model_key: "test".to_string(),
+            engine: "test".to_string(),
+            generated_at: task.created_at.clone(),
+        });
+        store.save_task(&task).unwrap();
+
+        let tasks = store.load_task_records();
+        let exported_path = tasks[0].transcript_path.clone().unwrap();
+        assert_eq!(
+            fs::read_to_string(&exported_path).unwrap(),
+            "legacy transcript"
+        );
+        assert_eq!(
+            store
+                .load_task_record("rec-legacy")
+                .unwrap()
+                .transcript_path,
+            Some(exported_path.clone())
+        );
+        assert_eq!(
+            store.load_task().unwrap().transcript_path,
+            Some(exported_path.clone())
+        );
+        fs::remove_file(&exported_path).unwrap();
+
+        // Startup copies the current task back into the historical task index.
+        let reopened = MeetingStore {
+            root: store.root.clone(),
+            default_recordings_root: store.default_recordings_root.clone(),
+        };
+        reopened
+            .save_task_record(&reopened.load_task().unwrap())
+            .unwrap();
+        assert_eq!(reopened.load_task_records().len(), 1);
+        assert!(!PathBuf::from(exported_path).exists());
+        assert_eq!(fs::read_dir(store.recordings_root()).unwrap().count(), 0);
         fs::remove_dir_all(root).unwrap();
     }
 
