@@ -100,7 +100,33 @@ const METHODS: &[BridgeMethodRegistration] = &[
         },
         handler: recording_audio_read_handler,
     },
+    BridgeMethodRegistration {
+        descriptor: BridgeMethodDescriptor {
+            method: "recording.overlay.sync",
+            introduced_contract_revision: 4,
+            api_versions: &[1, 2],
+        },
+        handler: recording_overlay_sync_handler,
+    },
 ];
+
+fn recording_overlay_sync_handler(
+    context: BridgeContext,
+    payload: serde_json::Value,
+) -> BridgeHandlerFuture {
+    Box::pin(async move {
+        let request = parse_payload(payload)?;
+        let result = crate::meeting::note_overlay::sync(&context.app, &context.window, request)
+            .map_err(|message| BridgeHandlerError {
+                code: "RECORDING_OVERLAY_UNAVAILABLE",
+                message,
+            })?;
+        serde_json::to_value(result).map_err(|error| BridgeHandlerError {
+            code: "SERIALIZATION_FAILED",
+            message: error.to_string(),
+        })
+    })
+}
 
 fn locale_get_handler(context: BridgeContext, payload: serde_json::Value) -> BridgeHandlerFuture {
     Box::pin(async move {
@@ -388,7 +414,7 @@ mod tests {
 
     #[test]
     fn registry_exposes_only_explicit_methods() {
-        assert_eq!(descriptors().len(), 9);
+        assert_eq!(descriptors().len(), 10);
         assert!(find("bridge.info").is_some());
         assert!(find("locale.get").is_some());
         assert!(find("locale.set").is_some());
@@ -398,6 +424,7 @@ mod tests {
         assert!(find("diagnostics.clear").is_some());
         assert!(find("diagnostics.info").is_some());
         assert!(find("recording.audio.read").is_some());
+        assert!(find("recording.overlay.sync").is_some());
         assert!(find("meeting_start_recording").is_none());
     }
 
@@ -407,6 +434,9 @@ mod tests {
         assert!(supports(&request("notifications.permission", 1)));
         assert!(supports(&request("diagnostics.info", 1)));
         assert!(supports(&request("recording.audio.read", 1)));
+        assert!(supports(&request("recording.overlay.sync", 1)));
+        assert!(supports(&request("recording.overlay.sync", 2)));
+        assert!(!supports(&request("recording.overlay.sync", 3)));
         assert!(!supports(&request("recording.audio.read", 2)));
         assert!(!supports(&request("notifications.permission", 2)));
         assert!(!supports(&request("bridge.info", 2)));

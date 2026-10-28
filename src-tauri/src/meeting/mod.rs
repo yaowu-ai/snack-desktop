@@ -16,6 +16,7 @@ mod catalog;
 mod install;
 mod notifications;
 mod note_notifications;
+pub(crate) mod note_overlay;
 pub(crate) mod overlay;
 pub(crate) mod overlay_locale;
 mod permissions;
@@ -281,6 +282,7 @@ pub(crate) fn initialize(app: &AppHandle) -> Result<(), String> {
         reminder,
         background_notes_active: AtomicBool::new(false),
     });
+    note_overlay::initialize(app);
 
     // Resource reconciliation (downloads/verification never survive a crash).
     let resource = install::reconcile_resource(&store, &manager);

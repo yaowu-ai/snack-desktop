@@ -2,10 +2,10 @@
   "schemaVersion": 1,
   "source": "h-snack-website/src/lib/i18n",
   "target": "desktop",
-  "fingerprint": "ded66f705c245e975e8123715bb250f2f7207079a626f6ca2bb53387651a48db",
+  "fingerprint": "bc8ed25e846e46423e932edf005ccc5da26ec527afb32555d24757da364bce34",
   "files": {
     "en.json": "8a8f65100d5e08f115d9671986423814af45d3b1bf384979aa5a1c5b718f4397",
     "verify-resources.cjs": "5878a2c4c7221247043a2403484a264c898609f7ca28e24c274ca8c214b57078",
-    "zh.json": "f6123793b4356e9955ff15daca4d56d8aa94876b8bff9bd22967ea64ce4bd776"
+    "zh.json": "58c4c2cf2103453ffe37776150ca419c57eabd8f264eb4a39ca336ea306ade86"
   }
 }
