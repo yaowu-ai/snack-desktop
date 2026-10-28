@@ -47,7 +47,13 @@ test('Figma capsule retains its geometry and local asset slots across every stat
     await page.evaluate((phase) => (window as any).noteStateHandler({ payload: { recordingId: 'rec-a', phase, paused: phase === 'recording', elapsedMs: 743000 } }), phase);
     await expect(page.locator('#capsule')).toHaveAttribute('data-phase', phase);
     expect(await page.locator('img:visible').evaluateAll((images) => images.every((image) => (image as HTMLImageElement).complete && (image as HTMLImageElement).naturalWidth > 0))).toBe(true);
-    if (phase === 'completed') await expect(page.locator('#result-action')).toHaveText(messages.viewNote);
+    if (['completed', 'ended', 'recording_failed', 'transcription_paused'].includes(phase)) {
+      await expect(page.locator('#result-action')).toBeHidden();
+      await expect(page.locator('#result-open')).toBeVisible();
+      await expect(page.locator('#result-open')).toHaveAccessibleName(messages.viewNote);
+      await expect(page.locator('#result-open img')).toHaveAttribute('src', '/note-assets/open-note-processing.svg');
+      expect(await page.locator('#result-open').boundingBox()).toEqual({ x: 198, y: 33, width: 20, height: 32 });
+    }
     if (phase === 'failed') await expect(page.locator('#result-action')).toHaveText(messages.retryTranscription);
     if (phase === 'summary_generating') {
       await expect(page.locator('#result-action')).toBeHidden();
@@ -61,7 +67,7 @@ test('Figma capsule retains its geometry and local asset slots across every stat
     expect(identity).toEqual(phase === 'recording'
       ? { x: 45, y: 28, width: 73, height: 41 }
       : { x: 49, y: 28, width: 78, height: 42 });
-    if (phase === 'completed' || phase === 'failed')
+    if (phase === 'failed')
       expect(await page.locator('#result-action').boundingBox()).toEqual({ x: 152, y: 32, width: 66, height: 34 });
     if (phase === 'transcribing') {
       const status = await page.locator('#status-line').boundingBox();
@@ -107,10 +113,17 @@ test('controls carry the rendered recording identity and retry delegates to Web'
   await page.locator('#open').click();
   await page.evaluate(() => (window as any).noteStateHandler({ payload: { recordingId: 'rec-a', phase: 'failed', paused: false } }));
   await page.locator('#result-action').click();
+  for (const phase of ['completed', 'recording_failed', 'transcription_paused', 'ended']) {
+    await page.evaluate((phase) => (window as any).noteStateHandler({ payload: { recordingId: `rec-${phase}`, phase } }), phase);
+    await expect(page.locator('#result-action')).toBeHidden();
+    await page.getByRole('button', { name: messages.viewNote, exact: true }).click();
+  }
   const calls = await page.evaluate(() => (window as any).noteCalls);
   expect(calls).toContainEqual({ command: 'meeting_note_overlay_control', args: { expectedRecordingId: 'rec-a', paused: true } });
   expect(calls).toContainEqual({ command: 'meeting_note_overlay_action', args: { expectedRecordingId: 'rec-a', action: 'open' } });
   expect(calls).toContainEqual({ command: 'meeting_note_overlay_action', args: { expectedRecordingId: 'rec-a', action: 'retry' } });
+  for (const phase of ['completed', 'recording_failed', 'transcription_paused', 'ended'])
+    expect(calls).toContainEqual({ command: 'meeting_note_overlay_action', args: { expectedRecordingId: `rec-${phase}`, action: 'open' } });
   expect(calls.some((call: { command: string }) => call.command === 'meeting_retranscribe')).toBe(false);
 });
 

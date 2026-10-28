@@ -109,15 +109,16 @@
       function render() {
         var recording = current.phase === 'recording';
         var view = resultViews[current.phase] || resultViews.ended;
+        var expandsNote = view.action === 'viewNote';
         capsule.classList.toggle('result', !recording);
         capsule.dataset.phase = current.phase;
         timer.hidden = !recording;
         statusLine.hidden = recording;
         document.getElementById('recording-actions').hidden = !recording;
-        resultOpen.hidden = current.phase !== 'transcribing' && current.phase !== 'summary_generating';
-        var openText = window.snackText(current.phase === 'summary_generating' ? 'viewSummary' : 'openNote');
+        resultOpen.hidden = recording || (!expandsNote && current.phase !== 'transcribing' && current.phase !== 'summary_generating');
+        var openText = window.snackText(current.phase === 'summary_generating' ? 'viewSummary' : expandsNote ? 'viewNote' : 'openNote');
         resultOpen.title = resultOpen.ariaLabel = openText;
-        resultAction.hidden = recording || !view.action;
+        resultAction.hidden = recording || !view.action || expandsNote;
         document.getElementById('pause-bars').hidden = current.paused;
         document.getElementById('resume-icon').hidden = !current.paused;
         var pauseText = window.snackText(current.paused ? 'resume' : 'pause');
