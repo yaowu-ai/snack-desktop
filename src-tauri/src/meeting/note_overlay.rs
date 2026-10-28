@@ -10,6 +10,7 @@ use tauri::{
 
 use super::{
     capture::LiveCaptureStatus,
+    note_overlay_lifecycle::{Activity, Lifecycle},
     state::{MeetingTask, TaskState},
     MeetingManagerState,
 };
@@ -49,6 +50,12 @@ pub(crate) struct SyncRequest {
     note_visible: bool,
     #[serde(default)]
     summary_source_version: Option<String>,
+    /// API v3: Web confirms that saving and all automatic follow-up work have completed.
+    #[serde(default)]
+    completion_ready: bool,
+    /// Stable across refreshes and phase changes; a deliberate retry creates a new attempt.
+    #[serde(default)]
+    result_attempt: Option<String>,
     #[serde(default)]
     acknowledged_action_id: Option<String>,
 }
@@ -62,6 +69,8 @@ struct Binding {
     note_visible: bool,
     native_task_updated_at: String,
     summary_source_version: Option<String>,
+    completion_ready: bool,
+    result_attempt: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -80,6 +89,7 @@ pub(crate) enum ActionKind {
     Open,
     Retry,
     RetrySummary,
+    Dismiss,
 }
 
 #[derive(Debug, Default)]
@@ -91,7 +101,103 @@ struct RuntimeData {
 #[derive(Default)]
 struct Runtime {
     data: Mutex<RuntimeData>,
+    lifecycles: Mutex<LifecycleLedger>,
     watching: AtomicBool,
+    refresh_pending: AtomicBool,
+    reset_position_pending: AtomicBool,
+    window_creating: AtomicBool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LifecycleKey {
+    origin: String,
+    scope_key: String,
+    recording_id: String,
+    result_attempt: String,
+}
+
+impl Binding {
+    fn lifecycle_key(&self) -> LifecycleKey {
+        LifecycleKey {
+            origin: self.origin.clone(),
+            scope_key: self.scope_key.clone(),
+            recording_id: self.recording_id.clone(),
+            result_attempt: self.result_attempt.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SavedLifecycle {
+    key: LifecycleKey,
+    processing_dismissed: bool,
+    terminal_closed: bool,
+    success_presented_at_ms: Option<u64>,
+}
+
+impl SavedLifecycle {
+    fn state(&self) -> Lifecycle {
+        Lifecycle {
+            processing_dismissed: self.processing_dismissed,
+            terminal_closed: self.terminal_closed,
+            success_presented_at_ms: self.success_presented_at_ms,
+        }
+    }
+
+    fn new(key: LifecycleKey, state: Lifecycle) -> Self {
+        Self {
+            key,
+            processing_dismissed: state.processing_dismissed,
+            terminal_closed: state.terminal_closed,
+            success_presented_at_ms: state.success_presented_at_ms,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct LifecycleLedger {
+    #[serde(default)]
+    entries: Vec<SavedLifecycle>,
+}
+
+const LIFECYCLE_FILE: &str = "note-overlay-lifecycle.json";
+
+/// Serialize only meaningful transitions, under one lock, using the meeting store's atomic writer.
+/// Binding cleanup deliberately does not clear the ledger: a page reload/login cannot resurrect it.
+fn update_lifecycle<T>(
+    app: &AppHandle,
+    binding: &Binding,
+    update: impl FnOnce(&mut Lifecycle) -> T,
+) -> Result<T, String> {
+    let runtime = app.state::<Runtime>();
+    let mut ledger = runtime
+        .lifecycles
+        .lock()
+        .map_err(|_| "recording overlay lifecycle lock unavailable")?;
+    let key = binding.lifecycle_key();
+    let index = ledger.entries.iter().position(|entry| entry.key == key);
+    let before = index.map_or_else(Lifecycle::default, |index| ledger.entries[index].state());
+    let mut after = before;
+    let result = update(&mut after);
+    if after != before {
+        let mut next = ledger.clone();
+        let entry = SavedLifecycle::new(key, after);
+        match index {
+            Some(index) => next.entries[index] = entry,
+            None => next.entries.push(entry),
+        }
+        super::state::persist_json_atomic(
+            &app.state::<MeetingManagerState>()
+                .store
+                .root()
+                .join(LIFECYCLE_FILE),
+            &next,
+        )?;
+        *ledger = next;
+    }
+    Ok(result)
 }
 
 #[derive(Serialize)]
@@ -105,13 +211,27 @@ pub(crate) struct SyncResponse {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct DisplayState {
     recording_id: String,
+    result_attempt: String,
     phase: Phase,
     elapsed_ms: u64,
     paused: bool,
+    can_dismiss: bool,
 }
 
 pub(crate) fn initialize(app: &AppHandle) {
-    app.manage(Runtime::default());
+    let lifecycles = std::fs::read(
+        app.state::<MeetingManagerState>()
+            .store
+            .root()
+            .join(LIFECYCLE_FILE),
+    )
+    .ok()
+    .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+    .unwrap_or_default();
+    app.manage(Runtime {
+        lifecycles: Mutex::new(lifecycles),
+        ..Runtime::default()
+    });
 }
 
 fn validate(request: &SyncRequest) -> Result<(), String> {
@@ -126,6 +246,13 @@ fn validate(request: &SyncRequest) -> Result<(), String> {
                 .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
     }) {
         return Err("invalid recording identifier".into());
+    }
+    if request
+        .result_attempt
+        .as_ref()
+        .is_some_and(|attempt| attempt.trim().is_empty() || attempt.len() > 200)
+    {
+        return Err("invalid recording result attempt".into());
     }
     Ok(())
 }
@@ -182,7 +309,8 @@ pub(crate) fn sync(
             .is_some_and(|binding| binding.origin == origin)
         {
             *data = RuntimeData::default();
-            hide(app);
+            drop(data);
+            refresh(app, false)?;
         }
         return Ok(SyncResponse {
             pending_action: None,
@@ -205,7 +333,11 @@ pub(crate) fn sync(
             && binding.recording_id == recording_id
             && binding.origin == origin
     });
-    if changed {
+    if changed
+        || data.binding.as_ref().is_some_and(|binding| {
+            binding.result_attempt != request.result_attempt.as_deref().unwrap_or("capture")
+        })
+    {
         data.pending_action = None;
     }
     // Visibility/focus syncs must not erase evidence of native work that progressed while
@@ -226,6 +358,8 @@ pub(crate) fn sync(
         note_visible: request.note_visible,
         native_task_updated_at,
         summary_source_version: request.summary_source_version,
+        completion_ready: request.completion_ready,
+        result_attempt: request.result_attempt.unwrap_or_else(|| "capture".into()),
     });
     // Keep the action until Web has resolved the owned note and accepted the action.
     // A sync response may race listener registration, a reload, or a suspended page.
@@ -306,9 +440,26 @@ fn display_state(app: &AppHandle, binding: &Binding) -> DisplayState {
     );
     DisplayState {
         recording_id: binding.recording_id.clone(),
+        result_attempt: binding.result_attempt.clone(),
         phase,
         elapsed_ms: status.as_ref().map_or(0, |status| status.elapsed_ms),
         paused: status.as_ref().is_some_and(|status| status.paused),
+        can_dismiss: phase != Phase::Recording,
+    }
+}
+
+fn lifecycle_activity(binding: &Binding, state: &DisplayState) -> Activity {
+    match state.phase {
+        Phase::Recording => Activity::Recording,
+        Phase::Failed | Phase::RecordingFailed | Phase::SummaryFailed => Activity::Failure,
+        Phase::Ended | Phase::Completed | Phase::SummaryCompleted
+            if binding.completion_ready && binding.phase == state.phase =>
+        {
+            Activity::Success
+        }
+        // Native transcription may finish before Web has queued the automatic summary or saved
+        // the note. Only a current API-v3 Web confirmation can start a success countdown.
+        _ => Activity::Processing,
     }
 }
 
@@ -447,7 +598,44 @@ fn ensure_watcher(app: &AppHandle) {
 }
 
 fn refresh(app: &AppHandle, reset_position: bool) -> Result<(), String> {
-    let Some(binding) = binding(app) else {
+    // Tauri window getters synchronously await the UI thread when called from a watcher.
+    // Never hold Runtime.data on that background thread while waiting for UI: overlay commands
+    // also take the lock on the UI thread. Queue the whole operation and read the latest binding
+    // there, coalescing ticks while the UI is busy.
+    let runtime = app.state::<Runtime>();
+    if reset_position {
+        runtime.reset_position_pending.store(true, Ordering::SeqCst);
+    }
+    if runtime.refresh_pending.swap(true, Ordering::SeqCst) {
+        return Ok(());
+    }
+    let handle = app.clone();
+    let scheduled = app.run_on_main_thread(move || {
+        let runtime = handle.state::<Runtime>();
+        // Once this job starts, allow one successor to be queued. In particular, a concurrent
+        // binding=None cleanup must not be swallowed after this job read the old binding:
+        // its watcher stops as soon as it sees None and would never hide that old window.
+        runtime.refresh_pending.store(false, Ordering::SeqCst);
+        let reset_position = runtime.reset_position_pending.swap(false, Ordering::SeqCst);
+        if let Err(message) = refresh_on_main_thread(&handle, reset_position) {
+            crate::logging::write_app_log(&handle, "warn", "note-overlay", &message, None);
+        }
+    });
+    if scheduled.is_err() {
+        runtime.refresh_pending.store(false, Ordering::SeqCst);
+    }
+    scheduled.map_err(|error| error.to_string())
+}
+
+fn refresh_on_main_thread(app: &AppHandle, reset_position: bool) -> Result<(), String> {
+    // On the UI thread, getters run inline. Keep this binding stable through the final window
+    // operation so a previous recording's tick cannot hide or acknowledge a newer recording.
+    let runtime = app.state::<Runtime>();
+    let mut data = runtime
+        .data
+        .lock()
+        .map_err(|_| "recording overlay lock unavailable")?;
+    let Some(binding) = data.binding.clone() else {
         hide(app);
         return Ok(());
     };
@@ -463,10 +651,7 @@ fn refresh(app: &AppHandle, reset_position: bool) -> Result<(), String> {
         .url()
         .is_ok_and(|url| url.path() == "/login" || url.path().starts_with("/login/"))
     {
-        *app.state::<Runtime>()
-            .data
-            .lock()
-            .map_err(|_| "recording overlay lock unavailable")? = RuntimeData::default();
+        *data = RuntimeData::default();
         hide(app);
         return Ok(());
     }
@@ -476,49 +661,123 @@ fn refresh(app: &AppHandle, reset_position: bool) -> Result<(), String> {
         hide(app);
         return Ok(());
     }
-    if !should_show(
+    let note_visible = !should_show(
         binding.note_visible,
         main.is_visible().unwrap_or(false),
         main.is_minimized().unwrap_or(false),
-    ) {
+    );
+    let state = display_state(app, &binding);
+    let activity = lifecycle_activity(&binding, &state);
+    // A route acknowledgement alone is insufficient. Web must have rendered this phase, and
+    // the current note must actually be in the visible, focused main window.
+    let result_viewed =
+        note_visible && main.is_focused().unwrap_or(false) && binding.phase == state.phase;
+    let now = super::state::unix_millis();
+    let show = update_lifecycle(app, &binding, |lifecycle| {
+        lifecycle.should_show(activity, note_visible, result_viewed, now)
+    })?;
+    if !show {
         hide(app);
         return Ok(());
     }
-    let window = ensure_window(app, reset_position)?;
-    let _ = window.emit(STATE_EVENT, display_state(app, &binding));
+    let window = app.get_webview_window(LABEL);
+    if runtime.window_creating.load(Ordering::SeqCst) || window.is_none() {
+        // Windows/WebView2 cannot build a webview from a synchronous UI/event callback.
+        // Release the binding lock before the background builder waits for that UI thread.
+        drop(data);
+        ensure_window_in_background(app);
+        return Ok(());
+    }
+    let window = window.expect("overlay window checked above");
+    update_window_presentation(app, &window, reset_position)?;
+    let emitted = window.emit(STATE_EVENT, state).is_ok();
     if !window.is_visible().unwrap_or(false) {
         window.show().map_err(|error| error.to_string())?;
+    }
+    // A failed native show/emit must not consume the five-second result opportunity.
+    if emitted && window.is_visible().unwrap_or(false) {
+        update_lifecycle(app, &binding, |lifecycle| {
+            lifecycle.presented(activity, now)
+        })?;
     }
     Ok(())
 }
 
-fn ensure_window(app: &AppHandle, reset_position: bool) -> Result<WebviewWindow, String> {
-    let (window, created) = if let Some(window) = app.get_webview_window(LABEL) {
-        (window, false)
-    } else {
-        let url = format!("{}://localhost/note.html", super::overlay::OVERLAY_SCHEME)
-            .parse()
-            .map_err(|_| "invalid note overlay URL")?;
-        let window = WebviewWindowBuilder::new(app, LABEL, WebviewUrl::CustomProtocol(url))
-            .title(crate::i18n::t(app, "desktop.overlay.windowTitle"))
-            .inner_size(WINDOW_WIDTH, WINDOW_HEIGHT)
-            .resizable(false)
-            .decorations(false)
-            .always_on_top(true)
-            .skip_taskbar(true)
-            .shadow(false)
-            .transparent(true)
-            .background_color(Color(0, 0, 0, 0))
-            .accept_first_mouse(true)
-            .focused(false)
-            .visible(false)
-            .build()
-            .map_err(|error| error.to_string())?;
-        #[cfg(target_os = "macos")]
-        install_native_backdrop(&window)?;
-        (window, true)
-    };
-    if created || reset_position {
+fn ensure_window_in_background(app: &AppHandle) {
+    if app
+        .state::<Runtime>()
+        .window_creating
+        .swap(true, Ordering::SeqCst)
+    {
+        return;
+    }
+    let handle = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        // No Runtime.data lock is held while build/getters await the UI thread. If logout or
+        // cleanup won the race, avoid creating a window that is no longer needed.
+        let created = if binding(&handle).is_some() {
+            create_hidden_window(&handle)
+        } else {
+            Ok(())
+        };
+        handle
+            .state::<Runtime>()
+            .window_creating
+            .store(false, Ordering::SeqCst);
+        match created {
+            Ok(()) => {
+                // Re-read the current owner/recording on UI; never show the binding that asked
+                // for creation. A newly created window still needs its initial positioning even
+                // if an earlier refresh already consumed reset_position_pending.
+                if let Err(message) = refresh(&handle, true) {
+                    crate::logging::write_app_log(&handle, "warn", "note-overlay", &message, None);
+                }
+            }
+            Err(message) => {
+                // Reset singleflight on failure, but let the 500 ms watcher retry rather than
+                // immediately queueing an unbounded create/fail loop.
+                crate::logging::write_app_log(&handle, "warn", "note-overlay", &message, None);
+            }
+        }
+    });
+}
+
+/// Called only by the background builder above. The fresh window never shows or takes focus.
+fn create_hidden_window(app: &AppHandle) -> Result<(), String> {
+    if app.get_webview_window(LABEL).is_some() {
+        return Ok(());
+    }
+    let url = format!("{}://localhost/note.html", super::overlay::OVERLAY_SCHEME)
+        .parse()
+        .map_err(|_| "invalid note overlay URL")?;
+    let window = WebviewWindowBuilder::new(app, LABEL, WebviewUrl::CustomProtocol(url))
+        .title(crate::i18n::t(app, "desktop.overlay.windowTitle"))
+        .inner_size(WINDOW_WIDTH, WINDOW_HEIGHT)
+        .resizable(false)
+        .decorations(false)
+        .always_on_top(true)
+        .skip_taskbar(true)
+        .shadow(false)
+        .transparent(true)
+        .background_color(Color(0, 0, 0, 0))
+        .accept_first_mouse(true)
+        .focused(false)
+        .visible(false)
+        .build()
+        .map_err(|error| error.to_string())?;
+    #[cfg(target_os = "macos")]
+    install_native_backdrop(&window)?;
+    #[cfg(not(target_os = "macos"))]
+    let _ = window;
+    Ok(())
+}
+
+fn update_window_presentation(
+    app: &AppHandle,
+    window: &WebviewWindow,
+    reset_position: bool,
+) -> Result<(), String> {
+    if reset_position {
         if let Ok(Some(monitor)) = app
             .get_webview_window("main")
             .map_or_else(|| window.current_monitor(), |main| main.current_monitor())
@@ -537,10 +796,8 @@ fn ensure_window(app: &AppHandle, reset_position: bool) -> Result<WebviewWindow,
         }
     }
     #[cfg(target_os = "macos")]
-    if !created {
-        refresh_native_backdrop(&window)?;
-    }
-    Ok(window)
+    refresh_native_backdrop(window)?;
+    Ok(())
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -679,20 +936,56 @@ pub(crate) fn meeting_note_overlay_action(
     app: AppHandle,
     window: WebviewWindow,
     expected_recording_id: String,
+    expected_result_attempt: Option<String>,
+    expected_phase: Option<Phase>,
     action: ActionKind,
 ) -> Result<(), String> {
     require_overlay(&window)?;
-    let binding = binding(&app).ok_or("note overlay is no longer bound")?;
-    let active = active_recording_id(&app.state::<MeetingManagerState>());
-    verify_action_recording(&binding, &expected_recording_id, active.as_deref())?;
+    // Resolve UI-owned data before taking the runtime lock, even when this command is moved to
+    // a background executor in the future.
     let main = app
         .get_webview_window("main")
         .ok_or("main webview is unavailable")?;
-    if !main_matches(&main, &binding) {
+    let main_origin = main
+        .url()
+        .map_err(|error| error.to_string())?
+        .origin()
+        .ascii_serialization();
+    let runtime = app.state::<Runtime>();
+    let mut data = runtime
+        .data
+        .lock()
+        .map_err(|_| "recording overlay lock unavailable")?;
+    let binding = data
+        .binding
+        .clone()
+        .ok_or("note overlay is no longer bound")?;
+    let active = active_recording_id(&app.state::<MeetingManagerState>());
+    verify_action_recording(&binding, &expected_recording_id, active.as_deref())?;
+    verify_action_attempt(&binding, expected_result_attempt.as_deref(), action)?;
+    if main_origin != binding.origin {
         return Err("note overlay origin changed".into());
     }
-    if !action_allowed(action, display_state(&app, &binding).phase) {
+    let state = display_state(&app, &binding);
+    if action == ActionKind::Dismiss && !dismiss_matches_phase(expected_phase, state.phase) {
+        // A click rendered while processing must not consume a result that finished before IPC
+        // arrived. Refresh the card and let the user dismiss that actual result if they want to.
+        drop(data);
+        refresh(&app, false)?;
+        return Err("note overlay phase changed before closing".into());
+    }
+    if !action_allowed(action, state.phase) {
         return Err("note is not awaiting the requested retry".into());
+    }
+    if action == ActionKind::Dismiss {
+        // Closing the reminder is entirely local and never pauses/cancels the actual work.
+        // Require the new identity field so a delayed click cannot dismiss a later result.
+        let activity = lifecycle_activity(&binding, &state);
+        update_lifecycle(&app, &binding, |lifecycle| lifecycle.dismiss(activity))?
+            .map_err(str::to_string)?;
+        drop(data);
+        refresh(&app, false)?;
+        return Ok(());
     }
     let event = Action {
         id: format!(
@@ -705,11 +998,8 @@ pub(crate) fn meeting_note_overlay_action(
         origin: binding.origin,
         action,
     };
-    app.state::<Runtime>()
-        .data
-        .lock()
-        .map_err(|_| "recording overlay lock unavailable")?
-        .pending_action = Some(event.clone());
+    data.pending_action = Some(event.clone());
+    drop(data);
     crate::logging::write_app_log(
         &app,
         "info",
@@ -730,7 +1020,26 @@ fn action_allowed(action: ActionKind, phase: Phase) -> bool {
         ActionKind::Open => true,
         ActionKind::Retry => phase == Phase::Failed,
         ActionKind::RetrySummary => phase == Phase::SummaryFailed,
+        ActionKind::Dismiss => phase != Phase::Recording,
     }
+}
+
+fn dismiss_matches_phase(expected: Option<Phase>, actual: Phase) -> bool {
+    expected == Some(actual) && actual != Phase::Recording
+}
+
+fn verify_action_attempt(
+    binding: &Binding,
+    expected_attempt: Option<&str>,
+    action: ActionKind,
+) -> Result<(), String> {
+    if expected_attempt.is_some_and(|attempt| attempt != binding.result_attempt) {
+        return Err("note overlay result attempt changed".into());
+    }
+    if action == ActionKind::Dismiss && expected_attempt.is_none() {
+        return Err("closing the overlay requires the current result attempt".into());
+    }
+    Ok(())
 }
 
 /// Restore and dispatch on the native UI loop. A minimized WebView can wake after the first
@@ -947,12 +1256,45 @@ mod tests {
             note_visible: false,
             native_task_updated_at: String::new(),
             summary_source_version: None,
+            completion_ready: false,
+            result_attempt: "attempt-b".into(),
         };
         assert!(verify_action_recording(&binding, "rec-a", Some("rec-b")).is_err());
         assert!(verify_action_recording(&binding, "rec-b", Some("rec-c")).is_err());
         assert!(verify_action_recording(&binding, "rec-b", Some("rec-b")).is_ok());
         // Completed notes remain openable when there is no active capture.
         assert!(verify_action_recording(&binding, "rec-b", None).is_ok());
+        assert!(verify_action_attempt(&binding, Some("attempt-a"), ActionKind::Dismiss).is_err());
+        assert!(verify_action_attempt(&binding, None, ActionKind::Dismiss).is_err());
+        assert!(verify_action_attempt(&binding, Some("attempt-b"), ActionKind::Dismiss).is_ok());
+        assert!(verify_action_attempt(&binding, None, ActionKind::Open).is_ok());
+
+        let mut state = DisplayState {
+            recording_id: "rec-b".into(),
+            result_attempt: "attempt-b".into(),
+            phase: Phase::Completed,
+            elapsed_ms: 0,
+            paused: false,
+            can_dismiss: true,
+        };
+        assert_eq!(lifecycle_activity(&binding, &state), Activity::Processing);
+        let mut ready_binding = binding.clone();
+        ready_binding.completion_ready = true;
+        ready_binding.phase = Phase::Completed;
+        assert_eq!(
+            lifecycle_activity(&ready_binding, &state),
+            Activity::Success
+        );
+        ready_binding.phase = Phase::SummaryGenerating;
+        assert_eq!(
+            lifecycle_activity(&ready_binding, &state),
+            Activity::Processing
+        );
+        state.phase = Phase::Failed;
+        assert_eq!(
+            lifecycle_activity(&ready_binding, &state),
+            Activity::Failure
+        );
     }
 
     #[test]
@@ -1096,6 +1438,39 @@ mod tests {
         assert!(!action_allowed(ActionKind::Retry, Phase::SummaryFailed));
         assert!(action_allowed(ActionKind::Retry, Phase::Failed));
         assert!(action_allowed(ActionKind::Open, Phase::SummaryCompleted));
+    }
+
+    #[test]
+    fn closing_progress_cannot_consume_a_just_finished_result() {
+        assert!(dismiss_matches_phase(
+            Some(Phase::Transcribing),
+            Phase::Transcribing
+        ));
+        assert!(!dismiss_matches_phase(
+            Some(Phase::Transcribing),
+            Phase::Completed
+        ));
+        assert!(!dismiss_matches_phase(
+            Some(Phase::Transcribing),
+            Phase::Failed
+        ));
+        assert!(!dismiss_matches_phase(
+            Some(Phase::SummaryGenerating),
+            Phase::SummaryCompleted
+        ));
+        assert!(!dismiss_matches_phase(
+            Some(Phase::SummaryGenerating),
+            Phase::SummaryFailed
+        ));
+        assert!(dismiss_matches_phase(
+            Some(Phase::SummaryFailed),
+            Phase::SummaryFailed
+        ));
+        assert!(!dismiss_matches_phase(
+            Some(Phase::Recording),
+            Phase::Recording
+        ));
+        assert!(!dismiss_matches_phase(None, Phase::Failed));
     }
 
     #[test]

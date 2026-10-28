@@ -124,6 +124,8 @@
       "recording": "正在录音",
       "paused": "录音已暂停",
       "openNote": "打开笔记",
+      "dismiss": "关闭悬浮窗",
+      "dismissFailed": "无法关闭悬浮窗，请重试。",
       "openingNote": "正在打开笔记…",
       "openNoteFailed": "无法打开笔记，请重试。",
       "transcribing": "正在转写中...",

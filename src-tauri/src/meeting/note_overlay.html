@@ -40,6 +40,9 @@
   [data-phase="recording_failed"] .status-label { font-size: 12px; }
   .result-open { position: absolute; left: 164px; top: 50%; transform: translateY(-50%); }
   .result-action { position: absolute; left: 118px; top: 50%; transform: translateY(-50%); min-height: 34px; padding: 6px 8px; border: 1px solid #f1f5f9; border-radius: 20px; background: #fff; color: #fe720a; font-size: 12px; font-weight: 500; line-height: 20px; white-space: nowrap; cursor: pointer; }
+  .dismiss-action { position: absolute; left: 226px; top: 4px; display: flex; align-items: center; justify-content: center; width: 24px; height: 24px; border: 1px solid #e2e8f0; border-radius: 50%; background: rgba(255,255,255,.95); color: #64748b; box-shadow: 0 2px 5px rgba(15,23,42,.08); cursor: pointer; }
+  .dismiss-action::before, .dismiss-action::after { content: ""; position: absolute; width: 10px; height: 1.5px; border-radius: 1px; background: currentColor; transform: rotate(45deg); }
+  .dismiss-action::after { transform: rotate(-45deg); }
   button:focus-visible { outline: 2px solid #fe720a; outline-offset: 2px; }
   button:hover { filter: brightness(.97); }
   button:disabled { opacity: .55; cursor: default; }
@@ -68,10 +71,11 @@
     <button class="result-action" id="result-action" type="button" hidden></button>
     <div class="sr-only" id="live-status" role="status" aria-live="polite"></div>
   </div>
+  <button class="dismiss-action" id="dismiss" type="button" data-i18n-label="dismiss" hidden></button>
   <!--SNACK_LOCALE-->
   <script>
     (function () {
-      var current = { recordingId: '', phase: 'recording', elapsedMs: 0, paused: false };
+      var current = { recordingId: '', resultAttempt: '', phase: 'recording', elapsedMs: 0, paused: false, canDismiss: false };
       var pending = false;
       var errorKey = '';
       var operation = 0;
@@ -86,6 +90,7 @@
       var open = document.getElementById('open');
       var resultOpen = document.getElementById('result-open');
       var resultAction = document.getElementById('result-action');
+      var dismiss = document.getElementById('dismiss');
       var liveStatus = document.getElementById('live-status');
       var resultViews = {
         transcribing: { status: 'transcribing', icon: 'transcribing', loading: true },
@@ -119,6 +124,7 @@
         var openText = window.snackText(current.phase === 'summary_generating' ? 'viewSummary' : expandsNote ? 'viewNote' : 'openNote');
         resultOpen.title = resultOpen.ariaLabel = openText;
         resultAction.hidden = recording || !view.action || expandsNote;
+        dismiss.hidden = recording || !current.canDismiss;
         document.getElementById('pause-bars').hidden = current.paused;
         document.getElementById('resume-icon').hidden = !current.paused;
         var pauseText = window.snackText(current.paused ? 'resume' : 'pause');
@@ -130,14 +136,14 @@
         statusIcon.hidden = !view.icon;
         statusIcon.classList.toggle('loading', Boolean(view.loading));
         resultAction.textContent = window.snackText(view.action || 'viewNote');
-        [pause, stop, open, resultOpen, resultAction].forEach(function (button) { button.disabled = pending; });
+        [pause, stop, open, resultOpen, resultAction, dismiss].forEach(function (button) { button.disabled = pending; });
         var stateText = recording ? window.snackText(current.paused ? 'paused' : 'recording') : statusLabel.textContent;
         liveStatus.textContent = errorKey ? window.snackText(errorKey) : stateText;
         capsule.title = errorKey ? window.snackText(errorKey) : '';
       }
       function apply(next) {
         if (!next) return;
-        if (next.recordingId !== current.recordingId || next.phase !== current.phase || next.paused !== current.paused) {
+        if (next.recordingId !== current.recordingId || next.resultAttempt !== current.resultAttempt || next.phase !== current.phase || next.paused !== current.paused) {
           operation += 1; pending = false; errorKey = '';
         }
         current = Object.assign({}, current, next);
@@ -163,14 +169,19 @@
         perform(stopping, 'stopFailed');
       });
       function openNote() {
-        if (!pending) perform(withTimeout(invoke('meeting_note_overlay_action', { expectedRecordingId: current.recordingId, action: 'open' })), 'openNoteFailed');
+        if (!pending) perform(withTimeout(invoke('meeting_note_overlay_action', { expectedRecordingId: current.recordingId, expectedResultAttempt: current.resultAttempt, action: 'open' })), 'openNoteFailed');
       }
       open.addEventListener('click', openNote);
       resultOpen.addEventListener('click', openNote);
       resultAction.addEventListener('click', function () {
         var action = current.phase === 'failed' ? 'retry' : current.phase === 'summary_failed' ? 'retry_summary' : 'open';
         var failureKey = action === 'retry' ? 'retryTranscriptionFailed' : action === 'retry_summary' ? 'retrySummaryFailed' : 'openNoteFailed';
-        if (!pending) perform(withTimeout(invoke('meeting_note_overlay_action', { expectedRecordingId: current.recordingId, action: action })), failureKey);
+        if (!pending) perform(withTimeout(invoke('meeting_note_overlay_action', { expectedRecordingId: current.recordingId, expectedResultAttempt: current.resultAttempt, action: action })), failureKey);
+      });
+      dismiss.addEventListener('click', function () {
+        if (!pending && current.canDismiss && current.phase !== 'recording') {
+          perform(withTimeout(invoke('meeting_note_overlay_action', { expectedRecordingId: current.recordingId, expectedResultAttempt: current.resultAttempt, expectedPhase: current.phase, action: 'dismiss' })), 'dismissFailed');
+        }
       });
       window.renderSnackLocale = render;
       render();

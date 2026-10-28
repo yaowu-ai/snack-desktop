@@ -104,7 +104,7 @@ const METHODS: &[BridgeMethodRegistration] = &[
         descriptor: BridgeMethodDescriptor {
             method: "recording.overlay.sync",
             introduced_contract_revision: 4,
-            api_versions: &[1, 2],
+            api_versions: &[1, 2, 3],
         },
         handler: recording_overlay_sync_handler,
     },
@@ -436,7 +436,8 @@ mod tests {
         assert!(supports(&request("recording.audio.read", 1)));
         assert!(supports(&request("recording.overlay.sync", 1)));
         assert!(supports(&request("recording.overlay.sync", 2)));
-        assert!(!supports(&request("recording.overlay.sync", 3)));
+        assert!(supports(&request("recording.overlay.sync", 3)));
+        assert!(!supports(&request("recording.overlay.sync", 4)));
         assert!(!supports(&request("recording.audio.read", 2)));
         assert!(!supports(&request("notifications.permission", 2)));
         assert!(!supports(&request("bridge.info", 2)));

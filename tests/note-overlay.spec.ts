@@ -15,7 +15,7 @@ async function openSurface(page: Page, phase = 'recording', paused = false, fail
     host.__TAURI__ = {
       core: { invoke: async (command: string, args: unknown) => {
         host.noteCalls.push({ command, args });
-        if (command === 'meeting_get_note_overlay_state') return { recordingId: 'rec-a', phase, paused, elapsedMs: 743000 };
+        if (command === 'meeting_get_note_overlay_state') return { recordingId: 'rec-a', resultAttempt: 'capture', phase, paused, elapsedMs: 743000, canDismiss: phase !== 'recording' };
         if (failControl && command === 'meeting_note_overlay_control') throw new Error('IPC unavailable');
         if (stallControl && command === 'meeting_note_overlay_control') return new Promise(() => {});
       } },
@@ -44,8 +44,14 @@ test('Figma capsule retains its geometry and local asset slots across every stat
   expect(box).toEqual({ x: 33, y: 13, width: 197, height: 72 });
   for (const phase of ['recording', 'transcribing', 'completed', 'failed', 'ended', 'recording_failed', 'transcription_paused',
     'summary_generating', 'summary_completed', 'summary_failed']) {
-    await page.evaluate((phase) => (window as any).noteStateHandler({ payload: { recordingId: 'rec-a', phase, paused: phase === 'recording', elapsedMs: 743000 } }), phase);
+    await page.evaluate((phase) => (window as any).noteStateHandler({ payload: { recordingId: 'rec-a', resultAttempt: 'capture', phase, paused: phase === 'recording', elapsedMs: 743000, canDismiss: phase !== 'recording' } }), phase);
     await expect(page.locator('#capsule')).toHaveAttribute('data-phase', phase);
+    if (phase === 'recording') await expect(page.locator('#dismiss')).toBeHidden();
+    else {
+      await expect(page.locator('#dismiss')).toBeVisible();
+      await expect(page.locator('#dismiss')).toHaveAccessibleName(messages.dismiss);
+      expect(await page.locator('#dismiss').boundingBox()).toEqual({ x: 226, y: 4, width: 24, height: 24 });
+    }
     expect(await page.locator('img:visible').evaluateAll((images) => images.every((image) => (image as HTMLImageElement).complete && (image as HTMLImageElement).naturalWidth > 0))).toBe(true);
     if (phase === 'completed') {
       await expect(page.locator('#status-label')).toHaveText('转写完成');
@@ -107,9 +113,9 @@ test('summary actions preserve note identity and distinguish retry from viewing'
   await page.getByRole('button', { name: '重新生成', exact: true }).click();
   const calls = await page.evaluate(() => (window as any).noteCalls.filter((call: { command: string }) => call.command === 'meeting_note_overlay_action'));
   expect(calls.map((call: { args: unknown }) => call.args)).toEqual([
-    { expectedRecordingId: 'rec-a', action: 'open' },
-    { expectedRecordingId: 'rec-a', action: 'open' },
-    { expectedRecordingId: 'rec-a', action: 'retry_summary' },
+    { expectedRecordingId: 'rec-a', expectedResultAttempt: 'capture', action: 'open' },
+    { expectedRecordingId: 'rec-a', expectedResultAttempt: 'capture', action: 'open' },
+    { expectedRecordingId: 'rec-a', expectedResultAttempt: 'capture', action: 'retry_summary' },
   ]);
 });
 
@@ -127,10 +133,10 @@ test('controls carry the rendered recording identity and retry delegates to Web'
   }
   const calls = await page.evaluate(() => (window as any).noteCalls);
   expect(calls).toContainEqual({ command: 'meeting_note_overlay_control', args: { expectedRecordingId: 'rec-a', paused: true } });
-  expect(calls).toContainEqual({ command: 'meeting_note_overlay_action', args: { expectedRecordingId: 'rec-a', action: 'open' } });
-  expect(calls).toContainEqual({ command: 'meeting_note_overlay_action', args: { expectedRecordingId: 'rec-a', action: 'retry' } });
+  expect(calls).toContainEqual({ command: 'meeting_note_overlay_action', args: { expectedRecordingId: 'rec-a', expectedResultAttempt: 'capture', action: 'open' } });
+  expect(calls).toContainEqual({ command: 'meeting_note_overlay_action', args: { expectedRecordingId: 'rec-a', expectedResultAttempt: 'capture', action: 'retry' } });
   for (const phase of ['completed', 'recording_failed', 'transcription_paused', 'ended'])
-    expect(calls).toContainEqual({ command: 'meeting_note_overlay_action', args: { expectedRecordingId: `rec-${phase}`, action: 'open' } });
+    expect(calls).toContainEqual({ command: 'meeting_note_overlay_action', args: { expectedRecordingId: `rec-${phase}`, expectedResultAttempt: 'capture', action: 'open' } });
   expect(calls.some((call: { command: string }) => call.command === 'meeting_retranscribe')).toBe(false);
 });
 
@@ -162,4 +168,77 @@ test('a delayed stop fallback cannot target a newly rendered recording', async (
   await expect(page.locator('#duration')).toHaveText('00:00:03');
   await expect(page.locator('#capsule')).toHaveAttribute('title', '');
   await expect(page.locator('#stop')).toBeEnabled();
+});
+
+test('dismiss only closes the reminder and carries both recording and result identity', async ({ page }) => {
+  await openSurface(page, 'transcribing');
+  await page.locator('#dismiss').click();
+  const calls = await page.evaluate(() => (window as any).noteCalls);
+  expect(calls).toContainEqual({ command: 'meeting_note_overlay_action', args: {
+    expectedRecordingId: 'rec-a', expectedResultAttempt: 'capture', expectedPhase: 'transcribing', action: 'dismiss',
+  } });
+  expect(calls.some((call: { command: string }) => call.command === 'meeting_note_overlay_control')).toBe(false);
+  await page.evaluate(() => (window as any).noteStateHandler({ payload: {
+    recordingId: 'rec-b', resultAttempt: 'capture', phase: 'recording', paused: true, canDismiss: false,
+  } }));
+  await expect(page.locator('#dismiss')).toBeHidden();
+});
+
+test('a dismiss failure keeps the reminder actionable and reports the error', async ({ page }) => {
+  await openSurface(page, 'failed');
+  await page.evaluate(() => {
+    const host = window as any;
+    const original = host.__TAURI__.core.invoke;
+    host.__TAURI__.core.invoke = (command: string, args: { action?: string }) =>
+      args?.action === 'dismiss' ? Promise.reject(new Error('disk unavailable')) : original(command, args);
+  });
+  await page.locator('#dismiss').click();
+  await expect(page.locator('#dismiss')).toBeVisible();
+  await expect(page.locator('#dismiss')).toBeEnabled();
+  await expect(page.locator('#result-action')).toBeEnabled();
+  await expect(page.locator('#live-status')).toHaveText(messages.dismissFailed);
+});
+
+test('a stale dismiss response cannot affect a later attempt of the same recording', async ({ page }) => {
+  await openSurface(page, 'failed');
+  await page.evaluate(() => {
+    const host = window as any;
+    const original = host.__TAURI__.core.invoke;
+    host.__TAURI__.core.invoke = (command: string, args: { action?: string }) => {
+      if (args?.action === 'dismiss') return new Promise((_resolve, reject) => { host.rejectOldDismiss = reject; });
+      return original(command, args);
+    };
+  });
+  await page.locator('#dismiss').click();
+  await expect(page.locator('#dismiss')).toBeDisabled();
+  await page.evaluate(() => {
+    const host = window as any;
+    host.noteStateHandler({ payload: { recordingId: 'rec-a', resultAttempt: 'retry-2', phase: 'failed', paused: false, canDismiss: true } });
+    host.rejectOldDismiss(new Error('old attempt rejected'));
+  });
+  await expect(page.locator('#dismiss')).toBeEnabled();
+  await expect(page.locator('#capsule')).toHaveAttribute('title', '');
+  await expect(page.locator('#live-status')).toHaveText(messages.transcriptionFailed);
+});
+
+test('a processing dismiss rejected after completion preserves the final result', async ({ page }) => {
+  await openSurface(page, 'transcribing');
+  await page.evaluate(() => {
+    const host = window as any;
+    host.__TAURI__.core.invoke = (command: string, args: { action?: string; expectedPhase?: string }) => {
+      host.noteCalls.push({ command, args });
+      host.noteStateHandler({ payload: {
+        recordingId: 'rec-a', resultAttempt: 'capture', phase: 'completed', paused: false, canDismiss: true,
+      } });
+      return Promise.reject(new Error('phase changed before closing'));
+    };
+  });
+  await page.locator('#dismiss').click();
+  await expect(page.locator('#status-label')).toHaveText(messages.transcriptionCompleted);
+  await expect(page.locator('#result-action')).toBeVisible();
+  await expect(page.locator('#result-action')).toBeEnabled();
+  const calls = await page.evaluate(() => (window as any).noteCalls);
+  expect(calls).toContainEqual({ command: 'meeting_note_overlay_action', args: {
+    expectedRecordingId: 'rec-a', expectedResultAttempt: 'capture', expectedPhase: 'transcribing', action: 'dismiss',
+  } });
 });

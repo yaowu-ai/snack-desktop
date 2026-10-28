@@ -17,6 +17,7 @@ mod install;
 mod notifications;
 mod note_notifications;
 pub(crate) mod note_overlay;
+mod note_overlay_lifecycle;
 pub(crate) mod overlay;
 pub(crate) mod overlay_locale;
 mod permissions;

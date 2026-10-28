@@ -230,9 +230,13 @@ mod tests {
             resolve_probe(&probe("recording.overlay.sync", 4, 2)).status,
             BridgeProbeStatus::Supported
         );
-        assert_ne!(
-            resolve_probe(&probe("recording.overlay.sync", 4, 3)).status,
+        assert_eq!(
+            resolve_probe(&probe("recording.overlay.sync", 5, 3)).status,
             BridgeProbeStatus::Supported
+        );
+        assert_eq!(
+            resolve_probe_for_revision(&probe("recording.overlay.sync", 5, 3), 4).status,
+            BridgeProbeStatus::UpdateRequired
         );
     }
 
