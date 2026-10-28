@@ -47,7 +47,13 @@ test('Figma capsule retains its geometry and local asset slots across every stat
     await page.evaluate((phase) => (window as any).noteStateHandler({ payload: { recordingId: 'rec-a', phase, paused: phase === 'recording', elapsedMs: 743000 } }), phase);
     await expect(page.locator('#capsule')).toHaveAttribute('data-phase', phase);
     expect(await page.locator('img:visible').evaluateAll((images) => images.every((image) => (image as HTMLImageElement).complete && (image as HTMLImageElement).naturalWidth > 0))).toBe(true);
-    if (['completed', 'ended', 'recording_failed', 'transcription_paused'].includes(phase)) {
+    if (phase === 'completed') {
+      await expect(page.locator('#status-label')).toHaveText('转写完成');
+      await expect(page.locator('#result-action')).toHaveText(messages.viewNote);
+      await expect(page.locator('#result-action')).toBeVisible();
+      await expect(page.locator('#result-open')).toBeHidden();
+    }
+    if (['ended', 'recording_failed', 'transcription_paused'].includes(phase)) {
       await expect(page.locator('#result-action')).toBeHidden();
       await expect(page.locator('#result-open')).toBeVisible();
       await expect(page.locator('#result-open')).toHaveAccessibleName(messages.viewNote);
@@ -67,7 +73,7 @@ test('Figma capsule retains its geometry and local asset slots across every stat
     expect(identity).toEqual(phase === 'recording'
       ? { x: 45, y: 28, width: 73, height: 41 }
       : { x: 49, y: 28, width: 78, height: 42 });
-    if (phase === 'failed')
+    if (phase === 'completed' || phase === 'failed')
       expect(await page.locator('#result-action').boundingBox()).toEqual({ x: 152, y: 32, width: 66, height: 34 });
     if (phase === 'transcribing') {
       const status = await page.locator('#status-line').boundingBox();
@@ -115,7 +121,8 @@ test('controls carry the rendered recording identity and retry delegates to Web'
   await page.locator('#result-action').click();
   for (const phase of ['completed', 'recording_failed', 'transcription_paused', 'ended']) {
     await page.evaluate((phase) => (window as any).noteStateHandler({ payload: { recordingId: `rec-${phase}`, phase } }), phase);
-    await expect(page.locator('#result-action')).toBeHidden();
+    if (phase === 'completed') await expect(page.locator('#result-action')).toBeVisible();
+    else await expect(page.locator('#result-action')).toBeHidden();
     await page.getByRole('button', { name: messages.viewNote, exact: true }).click();
   }
   const calls = await page.evaluate(() => (window as any).noteCalls);

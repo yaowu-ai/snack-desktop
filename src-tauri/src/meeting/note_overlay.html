@@ -109,7 +109,7 @@
       function render() {
         var recording = current.phase === 'recording';
         var view = resultViews[current.phase] || resultViews.ended;
-        var expandsNote = view.action === 'viewNote';
+        var expandsNote = view.action === 'viewNote' && current.phase !== 'completed';
         capsule.classList.toggle('result', !recording);
         capsule.dataset.phase = current.phase;
         timer.hidden = !recording;
