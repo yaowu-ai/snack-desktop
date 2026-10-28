@@ -618,7 +618,7 @@ impl MeetingStore {
                 .ok()
                 .and_then(|bytes| serde_json::from_slice::<MeetingTask>(&bytes).ok())
                 .is_some_and(|task| {
-                    task.state.is_active() || task.transcript_asset_state.is_active()
+                    task.state.is_active() || task.transcript_asset_state.is_active() || task.defer_transcription
                 })
             {
                 continue;
@@ -772,6 +772,9 @@ impl MeetingStore {
     }
 
     pub(crate) fn delete_task_record(&self, recording_id: &str) -> Result<(), String> {
+        if self.load_task_record(recording_id).is_some_and(|task| task.defer_transcription) {
+            return Err("笔记录音只保存在本机，请暂停转写，不能移除录音记录".to_string());
+        }
         match fs::remove_file(self.task_record_path(recording_id)) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -841,8 +844,8 @@ fn protected_audio_paths(tasks: &[MeetingTask]) -> HashSet<PathBuf> {
         .iter()
         .filter(|task| {
             task.state.is_active()
+                || task.defer_transcription
                 || task.state == TaskState::AwaitingTranscription
-                || (task.defer_transcription && task.state == TaskState::NoAudioDetected)
                 || !task.audio_file_owned
         })
         .filter_map(|task| task.audio_path.as_deref().map(PathBuf::from))
@@ -1563,6 +1566,32 @@ mod tests {
             .unwrap()
             .audio_path
             .is_none());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn note_recordings_survive_retention_and_task_cleanup() {
+        let root = std::env::temp_dir().join(format!("snack-note-retention-{}", super::unix_millis()));
+        let store = MeetingStore::for_test(root.join("state"), root.join("recordings"));
+        let audio_root = root.join("recordings").join(super::AUDIO_DIR_NAME);
+        fs::create_dir_all(&audio_root).unwrap();
+        for index in 0..15 {
+            let audio_path = audio_root.join(format!("note-{index}.wav"));
+            fs::write(&audio_path, b"local note audio").unwrap();
+            let mut task = MeetingTask::new(format!("note-{index}"), "zh".to_string());
+            task.state = TaskState::TranscriptReady;
+            task.defer_transcription = true;
+            task.audio_path = Some(audio_path.to_string_lossy().into_owned());
+            store.save_task_record(&task).unwrap();
+        }
+        assert_eq!(store.prune_recording_audio(10).unwrap(), 0);
+        assert_eq!(store.clear_task_records().unwrap(), 0);
+        assert!(store.delete_task_record("note-0").is_err());
+        assert_eq!(store.prune_recording_audio(10).unwrap(), 0);
+        for index in 0..15 {
+            assert!(audio_root.join(format!("note-{index}.wav")).exists());
+            assert!(store.load_task_record(&format!("note-{index}")).is_some());
+        }
         fs::remove_dir_all(root).unwrap();
     }
 

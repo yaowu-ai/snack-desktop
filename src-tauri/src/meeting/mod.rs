@@ -143,6 +143,7 @@ struct MeetingCapabilities {
     transcription_task_controls: bool,
     inline_recording: bool,
     deferred_transcription: bool,
+    local_audio_retention: bool,
     shortcut_policy_migration: bool,
 }
 
@@ -153,6 +154,7 @@ impl MeetingCapabilities {
             transcription_task_controls: true,
             inline_recording: true,
             deferred_transcription: true,
+            local_audio_retention: true,
             shortcut_policy_migration: true,
         }
     }
@@ -2622,6 +2624,7 @@ mod tests {
         value.as_object_mut().unwrap().remove("deferTranscription");
         assert!(!serde_json::from_value::<MeetingTask>(value).unwrap().defer_transcription);
         assert_eq!(serde_json::to_value(MeetingCapabilities::current()).unwrap()["deferredTranscription"], true);
+        assert_eq!(serde_json::to_value(MeetingCapabilities::current()).unwrap()["localAudioRetention"], true);
     }
 
     #[test]
