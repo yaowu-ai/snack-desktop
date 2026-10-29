@@ -8,6 +8,12 @@ use tauri::{
     AppHandle, Emitter, Manager, PhysicalPosition, WebviewUrl, WebviewWindow, WebviewWindowBuilder,
 };
 
+#[path = "note_overlay_geometry.rs"]
+mod geometry;
+#[cfg(target_os = "macos")]
+use geometry::{CAPSULE_LEFT, CAPSULE_TOP};
+use geometry::{NOTICE_HEIGHT, NOTICE_WIDTH, WINDOW_HEIGHT, WINDOW_WIDTH};
+
 use super::{
     capture::LiveCaptureStatus,
     note_overlay_lifecycle::{Activity, Lifecycle},
@@ -16,14 +22,11 @@ use super::{
 };
 
 pub(crate) const LABEL: &str = "note_record_overlay";
+pub(crate) const NOTICE_LABEL: &str = "note_record_notice";
 const STATE_EVENT: &str = "meeting-note-overlay-state";
 const ACTION_EVENT: &str = "meeting-note-overlay-action";
 const REFRESH_EVENT: &str = "meeting-note-overlay-refresh";
-// Reserve the same transparent area with and without the notice so the capture controls stay put.
-const WINDOW_WIDTH: f64 = 360.0;
-const WINDOW_HEIGHT: f64 = 200.0;
-const CAPSULE_LEFT: f64 = 81.0;
-const CAPSULE_TOP: f64 = 100.0;
+// The capsule stays compact; a separate passive window presents the temporary notice.
 const HANDOFF_NOTICE_MS: u64 = 3_000;
 static ACTION_COUNTER: AtomicU64 = AtomicU64::new(0);
 #[cfg(target_os = "macos")]
@@ -851,7 +854,7 @@ fn refresh_on_main_thread(app: &AppHandle, reset_position: bool) -> Result<(), S
         main.is_visible().unwrap_or(false),
         main.is_minimized().unwrap_or(false),
     );
-    let mut state = display_state(app, &binding);
+    let state = display_state(app, &binding);
     let activity = lifecycle_activity(&binding, &state);
     // A route acknowledgement alone is insufficient. Web must have rendered this phase, and
     // the current note must actually be in the visible, focused main window.
@@ -873,37 +876,38 @@ fn refresh_on_main_thread(app: &AppHandle, reset_position: bool) -> Result<(), S
         return Ok(());
     }
     let window = app.get_webview_window(LABEL);
-    if runtime.window_creating.load(Ordering::SeqCst) || window.is_none() {
+    let notice_missing =
+        data.handoff_notice.is_some() && app.get_webview_window(NOTICE_LABEL).is_none();
+    if window.is_none() {
         // Windows/WebView2 cannot build a webview from a synchronous UI/event callback.
         // Release the binding lock before the background builder waits for that UI thread.
         drop(data);
         ensure_window_in_background(app);
         return Ok(());
     }
+    if notice_missing {
+        // The passive notice must never hold up the current recording's controls.
+        ensure_window_in_background(app);
+    }
     let window = window.expect("overlay window checked above");
     update_window_presentation(app, &window, reset_position)?;
-    let was_visible = window.is_visible().unwrap_or(false);
-    if was_visible {
-        state.handoff_notice_id = data.handoff_notice.as_ref().map(|notice| notice.id.clone());
-    }
-    let mut emitted = window.emit(STATE_EVENT, &state).is_ok();
-    if !was_visible {
+    let emitted = window.emit(STATE_EVENT, &state).is_ok();
+    if !window.is_visible().unwrap_or(false) {
         window.show().map_err(|error| error.to_string())?;
     }
     // A failed native show/emit must not consume the five-second result opportunity.
     if emitted && window.is_visible().unwrap_or(false) {
-        if let Some(notice) = data.handoff_notice.as_mut() {
-            if !was_visible {
-                state.handoff_notice_id = Some(notice.id.clone());
-                emitted = window.emit(STATE_EVENT, &state).is_ok();
-            }
-            if emitted {
-                notice.presented_at_ms.get_or_insert(now);
-            }
+        if let Err(message) =
+            present_handoff_notice(app, &window, &state, data.handoff_notice.as_mut(), now)
+        {
+            hide_notice(app);
+            crate::logging::write_app_log(app, "warn", "note-overlay", &message, None);
         }
         update_lifecycle(app, &binding, |lifecycle| {
             lifecycle.presented(activity, now)
         })?;
+    } else {
+        hide_notice(app);
     }
     Ok(())
 }
@@ -920,38 +924,58 @@ fn ensure_window_in_background(app: &AppHandle) {
     tauri::async_runtime::spawn_blocking(move || {
         // No Runtime.data lock is held while build/getters await the UI thread. If logout or
         // cleanup won the race, avoid creating a window that is no longer needed.
+        let main_existed = handle.get_webview_window(LABEL).is_some();
         let created = if binding(&handle).is_some() {
             create_hidden_window(&handle)
         } else {
-            Ok(())
+            Ok(false)
         };
         handle
             .state::<Runtime>()
             .window_creating
             .store(false, Ordering::SeqCst);
         match created {
-            Ok(()) => {
+            Ok(created) if created => {
                 // Re-read the current owner/recording on UI; never show the binding that asked
                 // for creation. A newly created window still needs its initial positioning even
                 // if an earlier refresh already consumed reset_position_pending.
-                if let Err(message) = refresh(&handle, true) {
+                if let Err(message) = refresh(&handle, !main_existed) {
                     crate::logging::write_app_log(&handle, "warn", "note-overlay", &message, None);
                 }
             }
+            Ok(_) => {}
             Err(message) => {
                 // Reset singleflight on failure, but let the 500 ms watcher retry rather than
                 // immediately queueing an unbounded create/fail loop.
                 crate::logging::write_app_log(&handle, "warn", "note-overlay", &message, None);
+                if !main_existed && handle.get_webview_window(LABEL).is_some() {
+                    // A notice creation failure must not leave the newly created capsule unplaced.
+                    let _ = refresh(&handle, true);
+                }
             }
         }
     });
 }
 
 /// Called only by the background builder above. The fresh window never shows or takes focus.
-fn create_hidden_window(app: &AppHandle) -> Result<(), String> {
-    if app.get_webview_window(LABEL).is_some() {
-        return Ok(());
+fn create_hidden_window(app: &AppHandle) -> Result<bool, String> {
+    let mut created = false;
+    if app.get_webview_window(LABEL).is_none() {
+        create_capsule_window(app)?;
+        created = true;
     }
+    if app.get_webview_window(NOTICE_LABEL).is_none() {
+        match create_notice_window(app) {
+            Ok(()) => created = true,
+            Err(message) => {
+                crate::logging::write_app_log(app, "warn", "note-overlay", &message, None);
+            }
+        }
+    }
+    Ok(created)
+}
+
+fn create_capsule_window(app: &AppHandle) -> Result<(), String> {
     let url = format!("{}://localhost/note.html", super::overlay::OVERLAY_SCHEME)
         .parse()
         .map_err(|_| "invalid note overlay URL")?;
@@ -973,8 +997,56 @@ fn create_hidden_window(app: &AppHandle) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     install_native_backdrop(&window)?;
     #[cfg(not(target_os = "macos"))]
-    let _ = window;
+    let _ = &window;
+    follow_capsule_events(app, &window);
     Ok(())
+}
+
+fn create_notice_window(app: &AppHandle) -> Result<(), String> {
+    let url = format!(
+        "{}://localhost/note-notice.html",
+        super::overlay::OVERLAY_SCHEME
+    )
+    .parse()
+    .map_err(|_| "invalid note notice URL")?;
+    let window = WebviewWindowBuilder::new(app, NOTICE_LABEL, WebviewUrl::CustomProtocol(url))
+        .title(crate::i18n::t(app, "desktop.overlay.windowTitle"))
+        .inner_size(NOTICE_WIDTH, NOTICE_HEIGHT)
+        .resizable(false)
+        .decorations(false)
+        .always_on_top(true)
+        .skip_taskbar(true)
+        .shadow(false)
+        .transparent(true)
+        .background_color(Color(0, 0, 0, 0))
+        .focusable(false)
+        .focused(false)
+        .visible(false)
+        .build()
+        .map_err(|error| error.to_string())?;
+    if let Err(error) = window.set_ignore_cursor_events(true) {
+        let _ = window.destroy();
+        return Err(error.to_string());
+    }
+    Ok(())
+}
+
+fn follow_capsule_events(app: &AppHandle, window: &WebviewWindow) {
+    let handle = app.clone();
+    window.on_window_event(move |event| match event {
+        tauri::WindowEvent::Moved(_) | tauri::WindowEvent::ScaleFactorChanged { .. } => {
+            // A UI-thread dispatch may run inline. Leave this native callback before a refresh
+            // can take Runtime.data, which the set_position caller may still hold.
+            let moved_app = handle.clone();
+            tauri::async_runtime::spawn(async move {
+                let _ = refresh(&moved_app, false);
+            });
+        }
+        tauri::WindowEvent::Destroyed | tauri::WindowEvent::CloseRequested { .. } => {
+            hide_notice(&handle);
+        }
+        _ => {}
+    });
 }
 
 fn update_window_presentation(
@@ -989,19 +1061,80 @@ fn update_window_presentation(
         {
             let area = monitor.work_area();
             let scale = monitor.scale_factor();
-            let width = window
-                .outer_size()
-                .map_or((WINDOW_WIDTH * scale) as u32, |size| size.width)
-                as i32;
-            // Keep the full notice inside the work area; its content is inset 24 logical px.
-            let _ = window.set_position(PhysicalPosition::new(
-                (area.position.x + area.size.width as i32 - width).max(area.position.x),
-                area.position.y + (8.0 * scale) as i32,
-            ));
+            let position = geometry::default_position(work_area(area), scale);
+            let _ = window.set_position(PhysicalPosition::new(position.0, position.1));
         }
     }
     #[cfg(target_os = "macos")]
     refresh_native_backdrop(window)?;
+    Ok(())
+}
+
+fn work_area(area: &tauri::PhysicalRect<i32, u32>) -> geometry::WorkArea {
+    geometry::WorkArea {
+        x: area.position.x,
+        y: area.position.y,
+        width: area.size.width,
+        height: area.size.height,
+    }
+}
+
+fn position_notice(overlay: &WebviewWindow, notice: &WebviewWindow) -> Result<bool, String> {
+    let monitor = overlay
+        .current_monitor()
+        .map_err(|error| error.to_string())?
+        .ok_or("recording overlay monitor is unavailable")?;
+    let origin = overlay
+        .outer_position()
+        .map_err(|error| error.to_string())?;
+    let size = notice.outer_size().map_err(|error| error.to_string())?;
+    let position = geometry::notice_position(
+        work_area(monitor.work_area()),
+        (origin.x, origin.y),
+        monitor.scale_factor(),
+        (size.width, size.height),
+    );
+    let target = PhysicalPosition::new(position.0, position.1);
+    let actual = notice.outer_position().map_err(|error| error.to_string())?;
+    if actual == target {
+        return Ok(true);
+    }
+    // macOS may apply the move after this call returns. A later refresh must observe the
+    // target before showing the notice, otherwise its first frame flashes at the old position.
+    notice
+        .set_position(target)
+        .map_err(|error| error.to_string())?;
+    Ok(false)
+}
+
+fn present_handoff_notice(
+    app: &AppHandle,
+    overlay: &WebviewWindow,
+    state: &DisplayState,
+    notice: Option<&mut HandoffNotice>,
+    now: u64,
+) -> Result<(), String> {
+    let Some(notice) = notice else {
+        hide_notice(app);
+        return Ok(());
+    };
+    let Some(window) = app.get_webview_window(NOTICE_LABEL) else {
+        return Ok(());
+    };
+    if !position_notice(overlay, &window)? && !window.is_visible().unwrap_or(false) {
+        // Only the first frame waits for the move; an already visible notice follows the
+        // capsule without disappearing between native drag events.
+        return Ok(());
+    }
+    let mut state = state.clone();
+    state.handoff_notice_id = Some(notice.id.clone());
+    let emitted = window.emit(STATE_EVENT, &state).is_ok();
+    if !window.is_visible().unwrap_or(false) {
+        window.show().map_err(|error| error.to_string())?;
+    }
+    if emitted && window.is_visible().unwrap_or(false) {
+        notice.presented_at_ms.get_or_insert(now);
+    }
     Ok(())
 }
 
@@ -1111,6 +1244,7 @@ fn install_native_backdrop(window: &WebviewWindow) -> Result<(), String> {
 }
 
 fn hide(app: &AppHandle) {
+    hide_notice(app);
     if let Some(window) = app.get_webview_window(LABEL) {
         if window.is_visible().unwrap_or(false) {
             let _ = window.hide();
@@ -1118,12 +1252,24 @@ fn hide(app: &AppHandle) {
     }
 }
 
+fn hide_notice(app: &AppHandle) {
+    if let Some(window) = app.get_webview_window(NOTICE_LABEL) {
+        if window.is_visible().unwrap_or(false) {
+            let _ = window.hide();
+        }
+    }
+}
+
 fn require_overlay(window: &WebviewWindow) -> Result<(), String> {
-    if window.label() == LABEL {
+    if is_control_overlay(window.label()) {
         Ok(())
     } else {
         Err("note overlay action requires note overlay window".into())
     }
+}
+
+fn is_control_overlay(label: &str) -> bool {
+    label == LABEL
 }
 
 #[tauri::command]
@@ -1131,8 +1277,10 @@ pub(crate) fn meeting_get_note_overlay_state(
     app: AppHandle,
     window: WebviewWindow,
 ) -> Result<DisplayState, String> {
-    require_overlay(&window)?;
-    let visible = window.is_visible().unwrap_or(false);
+    require_readable_overlay(window.label())?;
+    let visible = app
+        .get_webview_window(LABEL)
+        .is_some_and(|overlay| overlay.is_visible().unwrap_or(false));
     let runtime = app.state::<Runtime>();
     let mut data = runtime
         .data
@@ -1151,7 +1299,11 @@ pub(crate) fn meeting_get_note_overlay_state(
     {
         data.handoff_notice = None;
     }
-    if visible {
+    if visible
+        && app
+            .get_webview_window("main")
+            .is_some_and(|main| main_matches(&main, &binding))
+    {
         state.handoff_notice_id = data
             .handoff_notice
             .as_ref()
@@ -1159,6 +1311,14 @@ pub(crate) fn meeting_get_note_overlay_state(
             .map(|notice| notice.id.clone());
     }
     Ok(state)
+}
+
+fn require_readable_overlay(label: &str) -> Result<(), String> {
+    if label == LABEL || label == NOTICE_LABEL {
+        Ok(())
+    } else {
+        Err("note overlay state requires an overlay window".into())
+    }
 }
 
 #[tauri::command]
@@ -1446,9 +1606,22 @@ fn render_html(locale: &serde_json::Value) -> String {
     super::overlay_locale::render(&html, locale)
 }
 
+pub(crate) fn render_notice_html(locale: &serde_json::Value) -> String {
+    super::overlay_locale::render(include_str!("note_notice.html"), locale)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn passive_notice_can_only_read_the_shared_overlay_state() {
+        assert!(require_readable_overlay(LABEL).is_ok());
+        assert!(require_readable_overlay(NOTICE_LABEL).is_ok());
+        assert!(require_readable_overlay("main").is_err());
+        assert!(is_control_overlay(LABEL));
+        assert!(!is_control_overlay(NOTICE_LABEL));
+    }
 
     #[test]
     fn reduced_transparency_preserves_an_opaque_material_fallback() {

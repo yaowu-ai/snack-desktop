@@ -12,8 +12,7 @@
   body { color: #0f172a; font-family: "Source Han Sans CN", "PingFang SC", "Microsoft YaHei", sans-serif; user-select: none; -webkit-user-select: none; }
   button { font: inherit; -webkit-tap-highlight-color: transparent; }
   button[hidden], [hidden] { display: none !important; }
-  .capsule { position: absolute; left: 81px; top: 100px; width: 197px; height: 72px; overflow: hidden; border: 1px solid #e2e8f0; border-radius: 40px; background: rgba(255,255,255,.8); backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px); box-shadow: 0 25px 50px -12px rgba(0,0,0,.25); }
-  .handoff-notice { position: absolute; left: 24px; right: 24px; top: 16px; padding: 12px 16px; border: 1px solid #e2e8f0; border-radius: 12px; background: rgba(255,255,255,.96); color: #334155; font-size: 14px; line-height: 20px; overflow-wrap: anywhere; box-shadow: 0 2px 4px rgba(15,23,42,.08); pointer-events: none; }
+  .capsule { position: absolute; left: 33px; top: 13px; width: 197px; height: 72px; overflow: hidden; border: 1px solid #e2e8f0; border-radius: 40px; background: rgba(255,255,255,.8); backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px); box-shadow: 0 8px 18px -6px rgba(0,0,0,.20); }
   html[data-backdrop="native"] .capsule { background: transparent; backdrop-filter: none; -webkit-backdrop-filter: none; }
   .drag-region { position: absolute; inset: 0; cursor: grab; }
   .drag-region:active { cursor: grabbing; }
@@ -41,7 +40,7 @@
   [data-phase="recording_failed"] .status-label { font-size: 12px; }
   .result-open { position: absolute; left: 164px; top: 50%; transform: translateY(-50%); }
   .result-action { position: absolute; left: 118px; top: 50%; transform: translateY(-50%); min-height: 34px; padding: 6px 8px; border: 1px solid #f1f5f9; border-radius: 20px; background: #fff; color: #fe720a; font-size: 12px; font-weight: 500; line-height: 20px; white-space: nowrap; cursor: pointer; }
-  .dismiss-action { position: absolute; left: 274px; top: 91px; display: flex; align-items: center; justify-content: center; width: 24px; height: 24px; border: 1px solid #e2e8f0; border-radius: 50%; background: rgba(255,255,255,.95); color: #64748b; box-shadow: 0 2px 5px rgba(15,23,42,.08); cursor: pointer; }
+  .dismiss-action { position: absolute; left: 226px; top: 4px; display: flex; align-items: center; justify-content: center; width: 24px; height: 24px; border: 1px solid #e2e8f0; border-radius: 50%; background: rgba(255,255,255,.95); color: #64748b; box-shadow: 0 2px 5px rgba(15,23,42,.08); cursor: pointer; }
   .dismiss-action::before, .dismiss-action::after { content: ""; position: absolute; width: 10px; height: 1.5px; border-radius: 1px; background: currentColor; transform: rotate(45deg); }
   .dismiss-action::after { transform: rotate(-45deg); }
   button:focus-visible { outline: 2px solid #fe720a; outline-offset: 2px; }
@@ -54,7 +53,6 @@
 </style>
 </head>
 <body>
-  <div class="handoff-notice" id="handoff-notice" role="status" aria-live="polite" aria-atomic="true" hidden></div>
   <div class="capsule" id="capsule" data-phase="recording">
     <div class="drag-region" data-tauri-drag-region data-i18n-label="drag"></div>
     <div class="identity">
@@ -81,9 +79,6 @@
       var pending = false;
       var errorKey = '';
       var operation = 0;
-      var lastNoticeId = '';
-      var noticeTimer = 0;
-      var handoffNotice = document.getElementById('handoff-notice');
       var capsule = document.getElementById('capsule');
       var timer = document.getElementById('timer');
       var duration = document.getElementById('duration');
@@ -114,7 +109,6 @@
         return Promise.race([promise, new Promise(function (_, reject) { setTimeout(function () { reject(new Error('timeout')); }, 4000); })]);
       }
       function render() {
-        renderHandoffNotice();
         capsule.hidden = current.phase.indexOf('summary_') === 0;
         if (capsule.hidden) { dismiss.hidden = true; liveStatus.textContent = ''; return; }
         var recording = current.phase === 'recording';
@@ -146,24 +140,12 @@
         liveStatus.textContent = errorKey ? window.snackText(errorKey) : stateText;
         capsule.title = errorKey ? window.snackText(errorKey) : '';
       }
-      /** Keep native tick updates from restarting or repeatedly announcing the same handoff. */
-      function renderHandoffNotice() {
-        var id = current.phase === 'recording' ? current.handoffNoticeId : '';
-        var message = window.snackText('backgroundTranscription');
-        if (handoffNotice.textContent !== message) handoffNotice.textContent = message;
-        if (!id) { clearTimeout(noticeTimer); handoffNotice.hidden = true; return; }
-        if (id === lastNoticeId) return;
-        lastNoticeId = id;
-        clearTimeout(noticeTimer);
-        handoffNotice.hidden = false;
-        noticeTimer = setTimeout(function () { handoffNotice.hidden = true; }, 3000);
-      }
       function apply(next) {
         if (!next) return;
         if (next.recordingId !== current.recordingId || next.resultAttempt !== current.resultAttempt || next.phase !== current.phase || next.paused !== current.paused) {
           operation += 1; pending = false; errorKey = '';
         }
-        current = Object.assign({}, current, next, { handoffNoticeId: next.handoffNoticeId || null });
+        current = Object.assign({}, current, next);
         render();
       }
       function perform(promise, failureKey) {

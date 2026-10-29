@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title data-i18n="windowTitle"></title>
+<style>
+  @font-face { font-family: "Source Han Sans CN"; src: url('/note-assets/SourceHanSansCN-VF.woff2') format('woff2'); font-weight: 100 900; font-style: normal; font-display: block; }
+  :root { color-scheme: light; }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { width: 100%; height: 100%; overflow: hidden; background: transparent; pointer-events: none; }
+  body { font-family: "Source Han Sans CN", "PingFang SC", "Microsoft YaHei", sans-serif; user-select: none; -webkit-user-select: none; }
+  [hidden] { display: none !important; }
+  .handoff-notice { position: absolute; left: 24px; right: 24px; top: 16px; padding: 12px 16px; border: 1px solid #e2e8f0; border-radius: 12px; background: rgba(255,255,255,.96); color: #334155; font-size: 14px; line-height: 20px; overflow-wrap: anywhere; box-shadow: 0 2px 4px rgba(15,23,42,.08); }
+</style>
+</head>
+<body>
+  <div class="handoff-notice" id="handoff-notice" role="status" aria-live="polite" aria-atomic="true" hidden></div>
+  <!--SNACK_LOCALE-->
+  <script>
+    (function () {
+      var current = {};
+      var notice = document.getElementById('handoff-notice');
+      var seen = new Set();
+      var displayedId = '';
+      var timer = 0;
+      var revision = 0;
+      var unlisten;
+
+      /** The notice has read-only access to the current recording presentation. */
+      function readState() {
+        if (window.__TAURI__ && window.__TAURI__.core) return window.__TAURI__.core.invoke('meeting_get_note_overlay_state');
+        if (window.__TAURI_INTERNALS__ && window.__TAURI_INTERNALS__.invoke) return window.__TAURI_INTERNALS__.invoke('meeting_get_note_overlay_state');
+        return Promise.reject(new Error('bridge unavailable'));
+      }
+
+      /** Retiring a visible notice never resets its already-consumed identity. */
+      function hide() {
+        clearTimeout(timer);
+        displayedId = '';
+        notice.hidden = true;
+      }
+
+      /** Repeated state ticks and locale refreshes cannot extend the three-second display. */
+      function render() {
+        var message = window.snackText('backgroundTranscription');
+        if (notice.textContent !== message) notice.textContent = message;
+        var id = current.phase === 'recording' ? current.handoffNoticeId : '';
+        if (!id) { hide(); return; }
+        if (id === displayedId) return;
+        if (seen.has(id)) { hide(); return; }
+        clearTimeout(timer);
+        seen.add(id);
+        displayedId = id;
+        notice.hidden = false;
+        timer = setTimeout(hide, 3000);
+      }
+
+      /** Omitted notice identities clear the previous recording's message. */
+      function apply(next) {
+        if (!next) return;
+        current = next;
+        render();
+      }
+
+      /** A late bootstrap response must not replace a newer native state event. */
+      function subscribe() {
+        var events = window.__TAURI__ && window.__TAURI__.event;
+        if (events) events.listen('meeting-note-overlay-state', function (event) {
+          revision += 1;
+          apply(event.payload);
+        }).then(function (stop) { unlisten = stop; }).catch(function () {});
+        readState().then(function (state) { if (revision === 0) apply(state); })
+          .catch(function () { if (revision === 0) hide(); });
+      }
+
+      window.renderSnackLocale = render;
+      window.addEventListener('beforeunload', function () { hide(); if (unlisten) unlisten(); });
+      render();
+      subscribe();
+    })();
+  </script>
+</body>
+</html>
