@@ -6,15 +6,17 @@
 <title data-i18n="windowTitle"></title>
 <style>
   @font-face { font-family: "Source Han Sans CN"; src: url('/note-assets/SourceHanSansCN-VF.woff2') format('woff2'); font-weight: 100 900; font-style: normal; font-display: block; }
-  :root { color-scheme: light; }
+  :root { color-scheme: light; --capsule-top: 13px; }
   * { margin: 0; padding: 0; box-sizing: border-box; }
   html, body { width: 100%; height: 100%; overflow: hidden; background: transparent; }
   body { color: #0f172a; font-family: "Source Han Sans CN", "PingFang SC", "Microsoft YaHei", sans-serif; user-select: none; -webkit-user-select: none; }
   button { font: inherit; -webkit-tap-highlight-color: transparent; }
   button[hidden], [hidden] { display: none !important; }
-  .capsule { position: absolute; left: 81px; top: 100px; width: 197px; height: 72px; overflow: hidden; border: 1px solid #e2e8f0; border-radius: 40px; background: rgba(255,255,255,.8); backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px); box-shadow: 0 25px 50px -12px rgba(0,0,0,.25); }
-  .handoff-notice { position: absolute; left: 24px; right: 24px; top: 16px; padding: 12px 16px; border: 1px solid #e2e8f0; border-radius: 12px; background: rgba(255,255,255,.96); color: #334155; font-size: 14px; line-height: 20px; overflow-wrap: anywhere; box-shadow: 0 2px 4px rgba(15,23,42,.08); pointer-events: none; }
+  #deck { position: absolute; left: 33px; top: var(--capsule-top); width: 197px; height: 72px; perspective: 760px; perspective-origin: 50% 50%; }
+  .capsule { position: absolute; left: 0; top: 0; width: 197px; height: 72px; overflow: hidden; border: 1px solid #e2e8f0; border-radius: 40px; background: rgba(255,255,255,.8); backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px); box-shadow: 0 8px 18px -6px rgba(0,0,0,.20); transform-origin: 50% 45%; backface-visibility: hidden; }
   html[data-backdrop="native"] .capsule { background: transparent; backdrop-filter: none; -webkit-backdrop-filter: none; }
+  html[data-deck-active="true"] .capsule { background: #fff; backdrop-filter: none; -webkit-backdrop-filter: none; }
+  #current-content { position: absolute; inset: 0; }
   .drag-region { position: absolute; inset: 0; cursor: grab; }
   .drag-region:active { cursor: grabbing; }
   .identity { position: absolute; left: 11px; top: 50%; display: flex; flex-direction: column; align-items: flex-start; width: 73px; transform: translateY(calc(-50% - .5px)); pointer-events: none; }
@@ -41,7 +43,21 @@
   [data-phase="recording_failed"] .status-label { font-size: 12px; }
   .result-open { position: absolute; left: 164px; top: 50%; transform: translateY(-50%); }
   .result-action { position: absolute; left: 118px; top: 50%; transform: translateY(-50%); min-height: 34px; padding: 6px 8px; border: 1px solid #f1f5f9; border-radius: 20px; background: #fff; color: #fe720a; font-size: 12px; font-weight: 500; line-height: 20px; white-space: nowrap; cursor: pointer; }
-  .dismiss-action { position: absolute; left: 274px; top: 91px; display: flex; align-items: center; justify-content: center; width: 24px; height: 24px; border: 1px solid #e2e8f0; border-radius: 50%; background: rgba(255,255,255,.95); color: #64748b; box-shadow: 0 2px 5px rgba(15,23,42,.08); cursor: pointer; }
+  .dismiss-action { position: absolute; left: 226px; top: calc(var(--capsule-top) - 9px); display: flex; align-items: center; justify-content: center; width: 24px; height: 24px; border: 1px solid #e2e8f0; border-radius: 50%; background: rgba(255,255,255,.95); color: #64748b; box-shadow: 0 2px 5px rgba(15,23,42,.08); cursor: pointer; }
+  .previous-card { position: absolute; inset: 0; width: 197px; height: 72px; transform-origin: 50% 45%; backface-visibility: hidden; }
+  .previous-surface { position: relative; width: 197px; height: 72px; overflow: hidden; border: 1px solid #e2e8f0; border-radius: 40px; background: #fff; box-shadow: 0 8px 18px -6px rgba(0,0,0,.16); }
+  .previous-card[data-mode="receipt"] .previous-surface { width: 188px; height: 64px; margin-left: 4.5px; border-radius: 36px; box-shadow: 0 3px 8px -3px rgba(0,0,0,.12); }
+  .previous-identity { position: absolute; left: 15px; top: 50%; transform: translateY(-50%); }
+  .previous-status { display: flex; align-items: center; gap: 4px; font-size: 14px; line-height: 20px; white-space: nowrap; }
+  #previous-open { position: absolute; left: 164px; top: 19px; }
+  .deck-peek { position: absolute; bottom: 0; left: 0; width: 100%; height: 28px; display: flex; align-items: center; justify-content: center; gap: 6px; padding: 0 14px; border: 0; background: transparent; color: #475569; font-size: 11px; line-height: 16px; white-space: nowrap; cursor: pointer; }
+  .deck-peek img { width: 5px; height: 5px; }
+  html[data-stack-above="true"] .deck-peek { top: 0; bottom: auto; }
+  #recording-peek-time { font-variant-numeric: tabular-nums; }
+  #handoff-notice { position: absolute; left: -1px; top: -1px; width: 188px; height: 64px; border-radius: 36px; display: flex; align-items: flex-start; gap: 8px; padding: 10px 12px; pointer-events: none; }
+  #handoff-notice > img { flex: 0 0 auto; width: 18px; height: 18px; margin-top: 3px; }
+  #handoff-title { font-size: 14px; font-weight: 500; line-height: 20px; white-space: nowrap; }
+  #handoff-description { font-size: 12px; line-height: 18px; margin-top: 2px; color: #526074; white-space: nowrap; }
   .dismiss-action::before, .dismiss-action::after { content: ""; position: absolute; width: 10px; height: 1.5px; border-radius: 1px; background: currentColor; transform: rotate(45deg); }
   .dismiss-action::after { transform: rotate(-45deg); }
   button:focus-visible { outline: 2px solid #fe720a; outline-offset: 2px; }
@@ -54,8 +70,19 @@
 </style>
 </head>
 <body>
-  <div class="handoff-notice" id="handoff-notice" role="status" aria-live="polite" aria-atomic="true" hidden></div>
+  <div id="deck" data-deck-view="recording">
+  <div class="previous-card" id="previous-card" data-mode="back" hidden>
+    <div class="previous-surface">
+      <div id="previous-full" hidden>
+        <div class="previous-identity"><div class="logo"><img src="/note-assets/logo.png" alt="Snack" /></div><div class="previous-status"><img id="previous-status-icon" src="/note-assets/transcribing.svg" width="16" height="16" alt="" /><span id="previous-label"></span></div></div>
+        <button class="open-action" id="previous-open" type="button" data-i18n-label="viewPreviousTranscription"><img src="/note-assets/open-note.svg" alt="" /></button>
+      </div>
+      <button class="deck-peek" id="previous-peek" type="button" data-i18n-label="viewPreviousTranscription"><span id="previous-peek-label"></span></button>
+      <div id="handoff-notice" role="status" aria-live="polite" aria-atomic="true" hidden><img src="/note-assets/success.svg" alt="" /><div><div id="handoff-title"></div><div id="handoff-description"></div></div></div>
+    </div>
+  </div>
   <div class="capsule" id="capsule" data-phase="recording">
+    <div id="current-content">
     <div class="drag-region" data-tauri-drag-region data-i18n-label="drag"></div>
     <div class="identity">
       <div class="logo"><img src="/note-assets/logo.png" alt="Snack" /></div>
@@ -71,19 +98,22 @@
     </div>
     <button class="open-action result-open" id="result-open" type="button" data-i18n-label="openNote" hidden><img src="/note-assets/open-note-processing.svg" alt="" /></button>
     <button class="result-action" id="result-action" type="button" hidden></button>
+    </div>
+    <button class="deck-peek" id="recording-peek" type="button" data-i18n-label="backToCurrentRecording" hidden><img src="/note-assets/recording-dot.svg" alt="" /><span id="recording-peek-label"></span><span id="recording-peek-time"></span></button>
     <div class="sr-only" id="live-status" role="status" aria-live="polite"></div>
+  </div>
   </div>
   <button class="dismiss-action" id="dismiss" type="button" data-i18n-label="dismiss" hidden></button>
   <!--SNACK_LOCALE-->
+  <script src="/note-assets/note-overlay-deck.js"></script>
   <script>
     (function () {
       var current = { recordingId: '', resultAttempt: '', phase: 'recording', elapsedMs: 0, paused: false, canDismiss: false };
       var pending = false;
       var errorKey = '';
       var operation = 0;
-      var lastNoticeId = '';
-      var noticeTimer = 0;
-      var handoffNotice = document.getElementById('handoff-notice');
+      var revision = 0;
+      var deck;
       var capsule = document.getElementById('capsule');
       var timer = document.getElementById('timer');
       var duration = document.getElementById('duration');
@@ -114,9 +144,8 @@
         return Promise.race([promise, new Promise(function (_, reject) { setTimeout(function () { reject(new Error('timeout')); }, 4000); })]);
       }
       function render() {
-        renderHandoffNotice();
         capsule.hidden = current.phase.indexOf('summary_') === 0;
-        if (capsule.hidden) { dismiss.hidden = true; liveStatus.textContent = ''; return; }
+        if (capsule.hidden) { dismiss.hidden = true; liveStatus.textContent = ''; if (deck) deck.update(current, pending); return; }
         var recording = current.phase === 'recording';
         var view = resultViews[current.phase] || resultViews.ended;
         var expandsNote = view.action === 'viewNote' && current.phase !== 'completed';
@@ -145,25 +174,14 @@
         var stateText = recording ? window.snackText(current.paused ? 'paused' : 'recording') : statusLabel.textContent;
         liveStatus.textContent = errorKey ? window.snackText(errorKey) : stateText;
         capsule.title = errorKey ? window.snackText(errorKey) : '';
-      }
-      /** Keep native tick updates from restarting or repeatedly announcing the same handoff. */
-      function renderHandoffNotice() {
-        var id = current.phase === 'recording' ? current.handoffNoticeId : '';
-        var message = window.snackText('backgroundTranscription');
-        if (handoffNotice.textContent !== message) handoffNotice.textContent = message;
-        if (!id) { clearTimeout(noticeTimer); handoffNotice.hidden = true; return; }
-        if (id === lastNoticeId) return;
-        lastNoticeId = id;
-        clearTimeout(noticeTimer);
-        handoffNotice.hidden = false;
-        noticeTimer = setTimeout(function () { handoffNotice.hidden = true; }, 3000);
+        if (deck) deck.update(current, pending);
       }
       function apply(next) {
         if (!next) return;
         if (next.recordingId !== current.recordingId || next.resultAttempt !== current.resultAttempt || next.phase !== current.phase || next.paused !== current.paused) {
           operation += 1; pending = false; errorKey = '';
         }
-        current = Object.assign({}, current, next, { handoffNoticeId: next.handoffNoticeId || null });
+        current = Object.assign({}, current, next, { previous: next.previous || null, handoffNoticeId: next.handoffNoticeId || '' });
         render();
       }
       function perform(promise, failureKey) {
@@ -200,12 +218,15 @@
           perform(withTimeout(invoke('meeting_note_overlay_action', { expectedRecordingId: current.recordingId, expectedResultAttempt: current.resultAttempt, expectedPhase: current.phase, action: 'dismiss' })), 'dismissFailed');
         }
       });
+      deck = window.createSnackRecordingDeck({ capsule: capsule, openPrevious: function (previous) {
+        if (!pending) perform(withTimeout(invoke('meeting_note_overlay_action', { expectedRecordingId: previous.recordingId, expectedResultAttempt: previous.resultAttempt, action: 'open' })), 'openNoteFailed');
+      } });
       window.renderSnackLocale = render;
       render();
       try {
         var events = window.__TAURI__ && window.__TAURI__.event;
-        if (events) events.listen('meeting-note-overlay-state', function (event) { apply(event.payload); });
-        invoke('meeting_get_note_overlay_state').then(apply).catch(function () {});
+        if (events) events.listen('meeting-note-overlay-state', function (event) { revision += 1; apply(event.payload); });
+        invoke('meeting_get_note_overlay_state').then(function (state) { if (!revision) apply(state); }).catch(function () {});
       } catch (error) {}
     })();
   </script>

@@ -375,6 +375,12 @@
           "markdownDescription": "Allow the Snack main webview to manage local meeting models, recording, transcription, and submission recovery."
         },
         {
+          "description": "Allow the passive recording notice to read its current presentation state.",
+          "type": "string",
+          "const": "allow-note-notice-state",
+          "markdownDescription": "Allow the passive recording notice to read its current presentation state."
+        },
+        {
           "description": "Allow the remote Snack web app to update desktop unread attention state.",
           "type": "string",
           "const": "allow-set-desktop-attention",

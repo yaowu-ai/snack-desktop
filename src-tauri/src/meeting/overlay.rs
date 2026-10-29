@@ -107,6 +107,7 @@ pub(crate) fn serve_overlay_request(
     let body = match path {
         "/" | "/index.html" => overlay_locale::render(OVERLAY_HTML, locale).into_bytes(),
         "/reminder.html" => overlay_locale::render(REMINDER_HTML, locale).into_bytes(),
+        "/note-notice.html" => super::note_overlay::render_notice_html(locale).into_bytes(),
         _ => Vec::new(),
     };
     let status = if body.is_empty() { 404 } else { 200 };
@@ -383,6 +384,25 @@ const REMINDER_HTML: &str = include_str!("reminder.html");
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn handoff_notice_route_is_localized_and_contains_no_recording_controls() {
+        let request = tauri::http::Request::builder()
+            .uri("snack-overlay://localhost/note-notice.html")
+            .body(Vec::new())
+            .unwrap();
+        let response = serve_overlay_request(
+            request,
+            &overlay_locale::payload(i18n::Locale::Zh, i18n::Locale::Zh),
+        );
+        assert_eq!(response.status(), 200);
+        let html = String::from_utf8(response.into_body()).unwrap();
+        assert!(html.contains("上一条录音继续转写"));
+        assert!(html.contains("meeting_get_note_overlay_state"));
+        for control in ["meeting_note_overlay_control", "meeting_note_overlay_action", "fetch('/stop'"] {
+            assert!(!html.contains(control), "notice must remain passive: {control}");
+        }
+    }
 
     #[test]
     fn overlay_html_includes_native_protocol_stop_fallback() {
