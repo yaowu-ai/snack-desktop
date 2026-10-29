@@ -1,7 +1,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use tauri::AppHandle;
-use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
+use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
 use tauri_plugin_notification::NotificationExt;
 
 use super::state::MeetingStore;
@@ -9,6 +9,9 @@ use super::state::MeetingStore;
 static QUICK_RECORDING_PENDING: AtomicBool = AtomicBool::new(false);
 
 pub(crate) fn register_saved_shortcut(app: &AppHandle, store: &MeetingStore) -> Result<(), String> {
+    if !super::shortcut_policy::should_register(store) {
+        return Ok(());
+    }
     let shortcut = store.load_settings().shortcut;
     let shortcuts = app.global_shortcut();
     if shortcuts.is_registered(shortcut.as_str()) {
@@ -20,8 +23,15 @@ pub(crate) fn register_saved_shortcut(app: &AppHandle, store: &MeetingStore) -> 
 }
 
 pub(crate) fn replace_shortcut(app: &AppHandle, previous: &str, next: &str) -> Result<(), String> {
-    if previous == next {
-        return Ok(());
+    if same_shortcut(previous, next) {
+        let shortcuts = app.global_shortcut();
+        return if shortcuts.is_registered(next) {
+            Ok(())
+        } else {
+            shortcuts
+                .register(next)
+                .map_err(|error| format!("快捷键已被占用或格式不正确: {error}"))
+        };
     }
     let shortcuts = app.global_shortcut();
     let previous_registered = shortcuts.is_registered(previous);
@@ -37,6 +47,45 @@ pub(crate) fn replace_shortcut(app: &AppHandle, previous: &str, next: &str) -> R
         return Err(format!("快捷键已被占用或格式不正确: {error}"));
     }
     Ok(())
+}
+
+fn same_shortcut(previous: &str, next: &str) -> bool {
+    previous == next
+        || matches!((previous.parse::<Shortcut>(), next.parse::<Shortcut>()),
+        (Ok(previous), Ok(next)) if previous == next)
+}
+
+pub(crate) fn activate_shortcut(
+    app: &AppHandle,
+    previous: Option<&str>,
+    next: &str,
+) -> Result<(), String> {
+    match previous {
+        Some(previous) => replace_shortcut(app, previous, next),
+        None => {
+            let shortcuts = app.global_shortcut();
+            if shortcuts.is_registered(next) {
+                return Ok(());
+            }
+            shortcuts
+                .register(next)
+                .map_err(|error| format!("快捷键已被占用或格式不正确: {error}"))
+        }
+    }
+}
+
+pub(crate) fn restore_shortcut(
+    app: &AppHandle,
+    next: &str,
+    previous: Option<&str>,
+) -> Result<(), String> {
+    match previous {
+        Some(previous) => replace_shortcut(app, next, previous),
+        None => app
+            .global_shortcut()
+            .unregister(next)
+            .map_err(|error| error.to_string()),
+    }
 }
 
 fn unregister_if_registered(
@@ -88,4 +137,30 @@ fn notify_quick_recording_error(app: &AppHandle, message: &str) {
         .title("Snack 会议录音未开始")
         .body(message)
         .show();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::same_shortcut;
+
+    #[test]
+    fn platform_aliases_do_not_unregister_the_already_active_combination() {
+        let platform_key = if cfg!(target_os = "macos") {
+            "Command+R"
+        } else {
+            "Control+R"
+        };
+        assert!(same_shortcut("CommandOrControl+R", platform_key));
+        assert!(!same_shortcut(
+            "CommandOrControl+R",
+            "CommandOrControl+Shift+R"
+        ));
+    }
+
+    #[test]
+    fn control_is_distinct_from_command_on_mac() {
+        if cfg!(target_os = "macos") {
+            assert!(!same_shortcut("Control+R", "Command+R"));
+        }
+    }
 }

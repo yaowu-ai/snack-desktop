@@ -51,7 +51,7 @@ impl Default for MeetingSettings {
     fn default() -> Self {
         Self {
             storage_directory: None,
-            shortcut: "CommandOrControl+R".to_string(),
+            shortcut: super::shortcut_policy::new_default_shortcut().to_string(),
             retain_audio: true,
             recording_reminder_enabled: false,
             auto_generate_notes_enabled: false,
@@ -286,6 +286,9 @@ impl Default for ServerSubmission {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct MeetingTask {
     pub(crate) recording_id: String,
+    /// Native identity captured only after recording starts; legacy tasks remain unattributed.
+    #[serde(default)]
+    pub(crate) recording_account_key: Option<String>,
     #[serde(default)]
     pub(crate) display_name: Option<String>,
     #[serde(default)]
@@ -334,6 +337,7 @@ impl MeetingTask {
         let now = now_rfc3339();
         Self {
             recording_id,
+            recording_account_key: None,
             display_name: None,
             auto_generate_notes_enabled: None,
             defer_transcription: false,
@@ -403,6 +407,14 @@ pub(crate) struct MeetingStore {
 }
 
 impl MeetingStore {
+    #[cfg(test)]
+    pub(crate) fn for_test(root: PathBuf, default_recordings_root: PathBuf) -> Self {
+        Self {
+            root,
+            default_recordings_root,
+        }
+    }
+
     pub(crate) fn open(app: &AppHandle) -> Result<Self, String> {
         let root = app
             .path()
@@ -606,7 +618,7 @@ impl MeetingStore {
                 .ok()
                 .and_then(|bytes| serde_json::from_slice::<MeetingTask>(&bytes).ok())
                 .is_some_and(|task| {
-                    task.state.is_active() || task.transcript_asset_state.is_active()
+                    task.state.is_active() || task.transcript_asset_state.is_active() || task.defer_transcription
                 })
             {
                 continue;
@@ -687,11 +699,9 @@ impl MeetingStore {
     }
 
     fn ensure_transcript_text_file(&self, task: &mut MeetingTask) {
-        if task
-            .transcript_path
-            .as_deref()
-            .is_some_and(|path| PathBuf::from(path).exists())
-        {
+        // Export legacy transcripts once. A recorded path may be missing because
+        // the user deleted or moved the file; reading state must not restore it.
+        if task.transcript_path.is_some() {
             return;
         }
         let Some(transcript) = task.transcript.as_ref() else {
@@ -703,7 +713,7 @@ impl MeetingStore {
         }
         if fs::write(&path, transcript_text(transcript)).is_ok() {
             task.transcript_path = Some(path.to_string_lossy().into_owned());
-            let _ = self.save_task_record(task);
+            let _ = self.save_task_progress(task);
         }
     }
 
@@ -711,7 +721,13 @@ impl MeetingStore {
         let mut settings: MeetingSettings = fs::read(self.root.join(SETTINGS_FILE))
             .ok()
             .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-            .unwrap_or_default();
+            .unwrap_or_else(|| MeetingSettings {
+                shortcut: super::shortcut_policy::LEGACY_SHORTCUT.into(),
+                ..MeetingSettings::default()
+            });
+        if let Some(shortcut) = super::shortcut_policy::committed_shortcut(self) {
+            settings.shortcut = shortcut;
+        }
         let legacy_default = self.default_recordings_root.join("Snack会议");
         if settings
             .storage_directory
@@ -731,9 +747,6 @@ impl MeetingStore {
         }
         if settings.notes_prompt.trim().is_empty() {
             settings.notes_prompt = default_meeting_notes_prompt();
-        }
-        if settings.shortcut == "CommandOrControl+Shift+R" {
-            settings.shortcut = "CommandOrControl+R".to_string();
         }
         settings
     }
@@ -759,6 +772,9 @@ impl MeetingStore {
     }
 
     pub(crate) fn delete_task_record(&self, recording_id: &str) -> Result<(), String> {
+        if self.load_task_record(recording_id).is_some_and(|task| task.defer_transcription) {
+            return Err("笔记录音只保存在本机，请暂停转写，不能移除录音记录".to_string());
+        }
         match fs::remove_file(self.task_record_path(recording_id)) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -828,8 +844,8 @@ fn protected_audio_paths(tasks: &[MeetingTask]) -> HashSet<PathBuf> {
         .iter()
         .filter(|task| {
             task.state.is_active()
+                || task.defer_transcription
                 || task.state == TaskState::AwaitingTranscription
-                || (task.defer_transcription && task.state == TaskState::NoAudioDetected)
                 || !task.audio_file_owned
         })
         .filter_map(|task| task.audio_path.as_deref().map(PathBuf::from))
@@ -1006,13 +1022,13 @@ fn meeting_task_local_date(task: &MeetingTask) -> String {
 #[cfg(test)]
 mod tests {
     use super::protected_audio_paths;
-    use std::path::PathBuf;
     use super::{
         now_rfc3339, parse_rfc3339_millis, validate_meeting_settings, DownloadProgress,
         MeetingSettings, MeetingStore, MeetingTask, ResourceState, ResourceStatus,
         ServerSubmission, TaskState, TranscriptAssetState, DEFAULT_MEETING_NOTES_PROMPT,
     };
     use std::fs;
+    use std::path::PathBuf;
 
     #[test]
     fn awaiting_transcription_audio_is_protected_from_pruning() {
@@ -1089,7 +1105,10 @@ mod tests {
         assert!(!settings.recording_reminder_enabled);
         assert!(!settings.auto_generate_notes_enabled);
         assert!(!settings.organize_transcripts_by_date);
-        assert_eq!(settings.shortcut, "CommandOrControl+R");
+        assert_eq!(
+            settings.shortcut,
+            super::super::shortcut_policy::new_default_shortcut()
+        );
         assert_eq!(settings.notes_prompt, DEFAULT_MEETING_NOTES_PROMPT);
         assert!(validate_meeting_settings(&settings).is_ok());
     }
@@ -1253,6 +1272,118 @@ mod tests {
             recordings_root.join("产品周会 (2).txt")
         );
 
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn loading_records_does_not_recreate_deleted_transcript_exports() {
+        for remove_directory in [false, true] {
+            let root = std::env::temp_dir().join(format!(
+                "snack-deleted-transcripts-{}-{remove_directory}",
+                super::unix_millis()
+            ));
+            let store = MeetingStore {
+                root: root.join("state"),
+                default_recordings_root: root.join("recordings"),
+            };
+            let recordings_root = store.recordings_root();
+            fs::create_dir_all(&recordings_root).unwrap();
+            for index in 0..3 {
+                let mut task = MeetingTask::new(format!("rec-{index}"), "zh".to_string());
+                task.display_name = Some(format!("meeting-{index}.txt"));
+                task.state = TaskState::TranscriptReady;
+                task.transcript = Some(super::Transcript {
+                    text: format!("transcript {index}"),
+                    language: "zh".to_string(),
+                    segments: Vec::new(),
+                    model_key: "test".to_string(),
+                    engine: "test".to_string(),
+                    generated_at: task.created_at.clone(),
+                });
+                let path = store.transcript_text_path(&task);
+                fs::write(&path, "exported transcript").unwrap();
+                task.transcript_path = Some(path.to_string_lossy().into_owned());
+                store.save_task(&task).unwrap();
+                fs::remove_file(path).unwrap();
+            }
+            if remove_directory {
+                fs::remove_dir_all(&recordings_root).unwrap();
+            }
+
+            // A fresh store also covers startup reads after the user deletes exports.
+            let reopened = MeetingStore {
+                root: store.root.clone(),
+                default_recordings_root: store.default_recordings_root.clone(),
+            };
+            for _ in 0..3 {
+                let tasks = reopened.load_task_records();
+                assert_eq!(tasks.len(), 3);
+                for task in tasks {
+                    assert!(task.transcript.is_some());
+                    assert!(!PathBuf::from(task.transcript_path.unwrap()).exists());
+                }
+                if remove_directory {
+                    assert!(!recordings_root.exists());
+                } else {
+                    assert_eq!(fs::read_dir(&recordings_root).unwrap().count(), 0);
+                }
+            }
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn legacy_current_transcript_is_exported_only_once_across_restart() {
+        let root = std::env::temp_dir().join(format!(
+            "snack-legacy-transcript-export-{}",
+            super::unix_millis()
+        ));
+        let store = MeetingStore {
+            root: root.join("state"),
+            default_recordings_root: root.join("recordings"),
+        };
+        let mut task = MeetingTask::new("rec-legacy".to_string(), "zh".to_string());
+        task.state = TaskState::TranscriptReady;
+        task.transcript = Some(super::Transcript {
+            text: "legacy transcript".to_string(),
+            language: "zh".to_string(),
+            segments: Vec::new(),
+            model_key: "test".to_string(),
+            engine: "test".to_string(),
+            generated_at: task.created_at.clone(),
+        });
+        store.save_task(&task).unwrap();
+
+        let tasks = store.load_task_records();
+        let exported_path = tasks[0].transcript_path.clone().unwrap();
+        assert_eq!(
+            fs::read_to_string(&exported_path).unwrap(),
+            "legacy transcript"
+        );
+        assert_eq!(
+            store
+                .load_task_record("rec-legacy")
+                .unwrap()
+                .transcript_path,
+            Some(exported_path.clone())
+        );
+        assert_eq!(
+            store.load_task().unwrap().transcript_path,
+            Some(exported_path.clone())
+        );
+        fs::remove_file(&exported_path).unwrap();
+
+        // Startup copies the current task back into the historical task index.
+        let reopened = MeetingStore {
+            root: store.root.clone(),
+            default_recordings_root: store.default_recordings_root.clone(),
+        };
+        reopened
+            .save_task_record(&reopened.load_task().unwrap())
+            .unwrap();
+        assert_eq!(reopened.load_task_records().len(), 1);
+        assert!(!PathBuf::from(exported_path).exists());
+        assert_eq!(fs::read_dir(store.recordings_root()).unwrap().count(), 0);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1435,6 +1566,32 @@ mod tests {
             .unwrap()
             .audio_path
             .is_none());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn note_recordings_survive_retention_and_task_cleanup() {
+        let root = std::env::temp_dir().join(format!("snack-note-retention-{}", super::unix_millis()));
+        let store = MeetingStore::for_test(root.join("state"), root.join("recordings"));
+        let audio_root = root.join("recordings").join(super::AUDIO_DIR_NAME);
+        fs::create_dir_all(&audio_root).unwrap();
+        for index in 0..15 {
+            let audio_path = audio_root.join(format!("note-{index}.wav"));
+            fs::write(&audio_path, b"local note audio").unwrap();
+            let mut task = MeetingTask::new(format!("note-{index}"), "zh".to_string());
+            task.state = TaskState::TranscriptReady;
+            task.defer_transcription = true;
+            task.audio_path = Some(audio_path.to_string_lossy().into_owned());
+            store.save_task_record(&task).unwrap();
+        }
+        assert_eq!(store.prune_recording_audio(10).unwrap(), 0);
+        assert_eq!(store.clear_task_records().unwrap(), 0);
+        assert!(store.delete_task_record("note-0").is_err());
+        assert_eq!(store.prune_recording_audio(10).unwrap(), 0);
+        for index in 0..15 {
+            assert!(audio_root.join(format!("note-{index}.wav")).exists());
+            assert!(store.load_task_record(&format!("note-{index}")).is_some());
+        }
         fs::remove_dir_all(root).unwrap();
     }
 

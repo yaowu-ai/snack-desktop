@@ -102,6 +102,14 @@ const METHODS: &[BridgeMethodRegistration] = &[
     },
     BridgeMethodRegistration {
         descriptor: BridgeMethodDescriptor {
+            method: "recording.shortcut.reconcile",
+            introduced_contract_revision: 4,
+            api_versions: &[1],
+        },
+        handler: recording_shortcut_reconcile_handler,
+    },
+    BridgeMethodRegistration {
+        descriptor: BridgeMethodDescriptor {
             method: "recording.overlay.sync",
             introduced_contract_revision: 4,
             api_versions: &[1, 2, 3],
@@ -122,6 +130,25 @@ fn recording_overlay_sync_handler(
                 message,
             })?;
         serde_json::to_value(result).map_err(|error| BridgeHandlerError {
+            code: "SERIALIZATION_FAILED",
+            message: error.to_string(),
+        })
+    })
+}
+
+fn recording_shortcut_reconcile_handler(
+    context: BridgeContext,
+    payload: serde_json::Value,
+) -> BridgeHandlerFuture {
+    Box::pin(async move {
+        let request = parse_payload(payload)?;
+        let response = crate::meeting::shortcut_policy::reconcile(&context.app, request).map_err(
+            |message| BridgeHandlerError {
+                code: "SHORTCUT_POLICY_UNAVAILABLE",
+                message,
+            },
+        )?;
+        serde_json::to_value(response).map_err(|error| BridgeHandlerError {
             code: "SERIALIZATION_FAILED",
             message: error.to_string(),
         })
@@ -414,7 +441,7 @@ mod tests {
 
     #[test]
     fn registry_exposes_only_explicit_methods() {
-        assert_eq!(descriptors().len(), 10);
+        assert_eq!(descriptors().len(), 11);
         assert!(find("bridge.info").is_some());
         assert!(find("locale.get").is_some());
         assert!(find("locale.set").is_some());
@@ -424,6 +451,7 @@ mod tests {
         assert!(find("diagnostics.clear").is_some());
         assert!(find("diagnostics.info").is_some());
         assert!(find("recording.audio.read").is_some());
+        assert!(find("recording.shortcut.reconcile").is_some());
         assert!(find("recording.overlay.sync").is_some());
         assert!(find("meeting_start_recording").is_none());
     }
@@ -439,6 +467,8 @@ mod tests {
         assert!(supports(&request("recording.overlay.sync", 3)));
         assert!(!supports(&request("recording.overlay.sync", 4)));
         assert!(!supports(&request("recording.audio.read", 2)));
+        assert!(supports(&request("recording.shortcut.reconcile", 1)));
+        assert!(!supports(&request("recording.shortcut.reconcile", 2)));
         assert!(!supports(&request("notifications.permission", 2)));
         assert!(!supports(&request("bridge.info", 2)));
         assert!(!supports(&request("bridge.missing", 1)));
