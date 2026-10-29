@@ -16,6 +16,7 @@ pub(crate) struct Lifecycle {
     pub(crate) processing_dismissed: bool,
     pub(crate) terminal_closed: bool,
     pub(crate) success_presented_at_ms: Option<u64>,
+    pub(crate) handoff_notice_issued: bool,
 }
 
 impl Lifecycle {
@@ -69,6 +70,21 @@ impl Lifecycle {
             Activity::Success | Activity::Failure => self.terminal_closed = true,
         }
         Ok(())
+    }
+
+    /// A replaced recording or a summary phase never returns as a result reminder.
+    pub(crate) fn retire(&mut self) {
+        self.terminal_closed = true;
+        self.success_presented_at_ms = None;
+    }
+
+    /// The destination attempt owns this one-shot notice, including across rebindings/restarts.
+    pub(crate) fn issue_handoff_notice(&mut self) -> bool {
+        if self.handoff_notice_issued {
+            return false;
+        }
+        self.handoff_notice_issued = true;
+        true
     }
 }
 
@@ -160,5 +176,30 @@ mod tests {
         old.dismiss(Activity::Failure).unwrap();
         assert!(next.should_show(Activity::Processing, false, false, 5_001));
         assert_eq!(next, Lifecycle::default());
+    }
+
+    #[test]
+    fn retired_attempts_cannot_resume_after_summary_cancellation_or_late_failure() {
+        let mut state = Lifecycle::default();
+        state.presented(Activity::Success, 1_000);
+        state.retire();
+        assert_eq!(state.success_presented_at_ms, None);
+        for activity in [Activity::Processing, Activity::Success, Activity::Failure] {
+            assert!(!state.should_show(activity, false, false, 2_000));
+        }
+        // Actual capture remains authoritative if a stale Web message retired the same ID.
+        assert!(state.should_show(Activity::Recording, false, false, 2_000));
+        let mut retry = Lifecycle::default();
+        assert!(retry.should_show(Activity::Processing, false, false, 2_000));
+    }
+
+    #[test]
+    fn handoff_notice_is_one_shot_for_the_destination_attempt() {
+        let mut state = Lifecycle::default();
+        assert!(state.issue_handoff_notice());
+        assert!(!state.issue_handoff_notice());
+        state.retire();
+        assert!(!state.issue_handoff_notice());
+        assert!(Lifecycle::default().issue_handoff_notice());
     }
 }

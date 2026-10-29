@@ -240,6 +240,22 @@ mod tests {
         );
     }
 
+    #[test]
+    fn handoff_retirement_requires_contract_six_and_keeps_earlier_apis() {
+        let request = probe("recording.overlay.sync", 6, 4);
+        assert_eq!(
+            resolve_probe_for_revision(&request, 5).status,
+            BridgeProbeStatus::UpdateRequired
+        );
+        assert_eq!(resolve_probe(&request).status, BridgeProbeStatus::Supported);
+        for api in [1, 2, 3] {
+            assert_eq!(
+                resolve_probe(&probe("recording.overlay.sync", 6, api)).status,
+                BridgeProbeStatus::Supported
+            );
+        }
+    }
+
     fn probe(method: &str, revision: u32, api_version: u32) -> BridgeProbeRequest {
         BridgeProbeRequest {
             method: method.to_string(),

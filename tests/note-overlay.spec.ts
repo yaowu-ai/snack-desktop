@@ -8,7 +8,7 @@ const localeScript = readFileSync(path.join(root, 'src/meeting/overlay-locale.js
 const messages = JSON.parse(readFileSync(path.join(root, 'resources/i18n/zh.json'), 'utf8')).desktop.overlay;
 
 async function openSurface(page: Page, phase = 'recording', paused = false, failControl = false, stallControl = false) {
-  await page.setViewportSize({ width: 263, height: 148 });
+  await page.setViewportSize({ width: 360, height: 200 });
   await page.addInitScript(({ phase, paused, failControl, stallControl }) => {
     const host = window as any;
     host.noteCalls = [];
@@ -41,16 +41,15 @@ test('Figma capsule retains its geometry and local asset slots across every stat
   await openSurface(page);
   await expect(page.locator('#duration')).toHaveText('00:12:23');
   const box = await page.locator('#capsule').boundingBox();
-  expect(box).toEqual({ x: 33, y: 13, width: 197, height: 72 });
-  for (const phase of ['recording', 'transcribing', 'completed', 'failed', 'ended', 'recording_failed', 'transcription_paused',
-    'summary_generating', 'summary_completed', 'summary_failed']) {
+  expect(box).toEqual({ x: 81, y: 100, width: 197, height: 72 });
+  for (const phase of ['recording', 'transcribing', 'completed', 'failed', 'ended', 'recording_failed', 'transcription_paused']) {
     await page.evaluate((phase) => (window as any).noteStateHandler({ payload: { recordingId: 'rec-a', resultAttempt: 'capture', phase, paused: phase === 'recording', elapsedMs: 743000, canDismiss: phase !== 'recording' } }), phase);
     await expect(page.locator('#capsule')).toHaveAttribute('data-phase', phase);
     if (phase === 'recording') await expect(page.locator('#dismiss')).toBeHidden();
     else {
       await expect(page.locator('#dismiss')).toBeVisible();
       await expect(page.locator('#dismiss')).toHaveAccessibleName(messages.dismiss);
-      expect(await page.locator('#dismiss').boundingBox()).toEqual({ x: 226, y: 4, width: 24, height: 24 });
+      expect(await page.locator('#dismiss').boundingBox()).toEqual({ x: 274, y: 91, width: 24, height: 24 });
     }
     expect(await page.locator('img:visible').evaluateAll((images) => images.every((image) => (image as HTMLImageElement).complete && (image as HTMLImageElement).naturalWidth > 0))).toBe(true);
     if (phase === 'completed') {
@@ -64,59 +63,66 @@ test('Figma capsule retains its geometry and local asset slots across every stat
       await expect(page.locator('#result-open')).toBeVisible();
       await expect(page.locator('#result-open')).toHaveAccessibleName(messages.viewNote);
       await expect(page.locator('#result-open img')).toHaveAttribute('src', '/note-assets/open-note-processing.svg');
-      expect(await page.locator('#result-open').boundingBox()).toEqual({ x: 198, y: 33, width: 20, height: 32 });
+      expect(await page.locator('#result-open').boundingBox()).toEqual({ x: 246, y: 120, width: 20, height: 32 });
     }
     if (phase === 'failed') await expect(page.locator('#result-action')).toHaveText(messages.retryTranscription);
-    if (phase === 'summary_generating') {
-      await expect(page.locator('#result-action')).toBeHidden();
-      await expect(page.locator('#result-open')).toBeVisible();
-      await expect(page.locator('#result-open')).toHaveAccessibleName(messages.viewSummary);
-      expect(await page.locator('#result-open').boundingBox()).toEqual({ x: 198, y: 33, width: 20, height: 32 });
-    }
-    if (phase === 'summary_completed') await expect(page.locator('#result-action')).toHaveText('查看纪要');
-    if (phase === 'summary_failed') await expect(page.locator('#result-action')).toHaveText('重新生成');
     const identity = await page.locator('.identity').boundingBox();
     expect(identity).toEqual(phase === 'recording'
-      ? { x: 45, y: 28, width: 73, height: 41 }
-      : { x: 49, y: 28, width: 78, height: 42 });
+      ? { x: 93, y: 115, width: 73, height: 41 }
+      : { x: 97, y: 115, width: 78, height: 42 });
     if (phase === 'completed' || phase === 'failed')
-      expect(await page.locator('#result-action').boundingBox()).toEqual({ x: 152, y: 32, width: 66, height: 34 });
+      expect(await page.locator('#result-action').boundingBox()).toEqual({ x: 200, y: 119, width: 66, height: 34 });
     if (phase === 'transcribing') {
       const status = await page.locator('#status-line').boundingBox();
-      expect(status).toMatchObject({ x: 49, y: 50, height: 20 });
+      expect(status).toMatchObject({ x: 97, y: 137, height: 20 });
       expect(Math.abs(status!.width - 102)).toBeLessThan(0.5);
-    }
-    if (phase.startsWith('summary_')) {
-      const status = await page.locator('#status-line').boundingBox();
-      const button = await page.locator(phase === 'summary_generating' ? '#result-open' : '#result-action').boundingBox();
-      if (phase !== 'summary_generating') expect(button).toEqual({ x: 152, y: 32, width: 66, height: 34 });
-      expect(status!.x + status!.width + 8).toBeLessThanOrEqual(button!.x);
-      expect(await page.locator('#status-icon').boundingBox()).toMatchObject({ width: 16, height: 16 });
-      if (phase !== 'summary_generating') await expect(page.locator('#result-open')).toBeHidden();
     }
     await page.screenshot({ path: `test-results/note-overlay-${phase}.png` });
   }
 });
 
-test('summary actions preserve note identity and distinguish retry from viewing', async ({ page }) => {
-  await openSurface(page, 'summary_generating');
-  await expect(page.locator('#status-label')).toHaveText(messages.summaryGenerating);
-  await expect(page.locator('#status-icon')).toHaveClass('loading');
-  await expect(page.getByRole('button', { name: '前往查看', exact: true })).toHaveCount(0);
-  await page.getByRole('button', { name: messages.viewSummary, exact: true }).click();
-  await page.evaluate(() => (window as any).noteStateHandler({ payload: { recordingId: 'rec-a', phase: 'summary_completed' } }));
-  await expect(page.locator('#status-label')).toHaveText(messages.summaryCompleted);
-  await expect(page.locator('#status-icon')).not.toHaveClass('loading');
-  await page.getByRole('button', { name: '查看纪要', exact: true }).click();
-  await page.evaluate(() => (window as any).noteStateHandler({ payload: { recordingId: 'rec-a', phase: 'summary_failed' } }));
-  await expect(page.locator('#status-label')).toHaveText(messages.summaryFailed);
-  await page.getByRole('button', { name: '重新生成', exact: true }).click();
+test('every summary stage hides the capsule and its actions', async ({ page }) => {
+  await openSurface(page);
+  for (const phase of ['summary_generating', 'summary_completed', 'summary_failed']) {
+    await page.evaluate((phase) => (window as any).noteStateHandler({ payload: { recordingId: 'rec-a', phase } }), phase);
+    await expect(page.locator('#capsule')).toBeHidden();
+    await expect(page.locator('#dismiss')).toBeHidden();
+    await expect(page.locator('#handoff-notice')).toBeHidden();
+    await expect(page.getByRole('button')).toHaveCount(0);
+  }
   const calls = await page.evaluate(() => (window as any).noteCalls.filter((call: { command: string }) => call.command === 'meeting_note_overlay_action'));
-  expect(calls.map((call: { args: unknown }) => call.args)).toEqual([
-    { expectedRecordingId: 'rec-a', expectedResultAttempt: 'capture', action: 'open' },
-    { expectedRecordingId: 'rec-a', expectedResultAttempt: 'capture', action: 'open' },
-    { expectedRecordingId: 'rec-a', expectedResultAttempt: 'capture', action: 'retry_summary' },
-  ]);
+  expect(calls).toEqual([]);
+});
+
+test('handoff notice lasts three seconds without restarting on native ticks', async ({ page }) => {
+  await page.clock.install();
+  await openSurface(page);
+  const state = { recordingId: 'rec-b', resultAttempt: 'capture', phase: 'recording', handoffNoticeId: 'a-to-b', elapsedMs: 3000 };
+  await page.evaluate((payload) => (window as any).noteStateHandler({ payload }), state);
+  await expect(page.locator('#handoff-notice')).toHaveText(messages.backgroundTranscription);
+  await expect(page.locator('#handoff-notice')).toBeVisible();
+  const notice = await page.locator('#handoff-notice').boundingBox();
+  const capsule = await page.locator('#capsule').boundingBox();
+  expect(notice!.x).toBe(24);
+  expect(notice!.width).toBe(312);
+  expect(notice!.y + notice!.height + 16).toBeLessThanOrEqual(capsule!.y);
+  await page.clock.runFor(2000);
+  await page.evaluate((payload) => (window as any).noteStateHandler({ payload }), state);
+  await page.clock.runFor(1001);
+  await expect(page.locator('#handoff-notice')).toBeHidden();
+  await page.evaluate((payload) => (window as any).noteStateHandler({ payload }), state);
+  await expect(page.locator('#handoff-notice')).toBeHidden();
+  await expect(page.locator('#duration')).toHaveText('00:00:03');
+});
+
+test('changing the binding clears the previous recording handoff notice', async ({ page }) => {
+  await openSurface(page);
+  await page.evaluate(() => (window as any).noteStateHandler({ payload: {
+    recordingId: 'rec-b', phase: 'recording', handoffNoticeId: 'a-to-b',
+  } }));
+  await expect(page.locator('#handoff-notice')).toBeVisible();
+  await page.evaluate(() => (window as any).noteStateHandler({ payload: { recordingId: 'rec-c', phase: 'recording' } }));
+  await expect(page.locator('#handoff-notice')).toBeHidden();
 });
 
 test('controls carry the rendered recording identity and retry delegates to Web', async ({ page }) => {
