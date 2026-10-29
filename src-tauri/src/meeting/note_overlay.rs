@@ -12,7 +12,7 @@ use tauri::{
 mod geometry;
 #[cfg(target_os = "macos")]
 use geometry::{CAPSULE_LEFT, CAPSULE_TOP};
-use geometry::{NOTICE_HEIGHT, NOTICE_WIDTH, WINDOW_HEIGHT, WINDOW_WIDTH};
+use geometry::{WINDOW_HEIGHT, WINDOW_WIDTH};
 
 use super::{
     capture::LiveCaptureStatus,
@@ -26,11 +26,13 @@ pub(crate) const NOTICE_LABEL: &str = "note_record_notice";
 const STATE_EVENT: &str = "meeting-note-overlay-state";
 const ACTION_EVENT: &str = "meeting-note-overlay-action";
 const REFRESH_EVENT: &str = "meeting-note-overlay-refresh";
-// The capsule stays compact; a separate passive window presents the temporary notice.
-const HANDOFF_NOTICE_MS: u64 = 3_000;
+// Allow the 560 ms card exchange before the three-second confirmation is fully visible.
+const HANDOFF_NOTICE_MS: u64 = 3_560;
 static ACTION_COUNTER: AtomicU64 = AtomicU64::new(0);
 #[cfg(target_os = "macos")]
 static BACKDROP_REFRESH_PENDING: AtomicBool = AtomicBool::new(false);
+#[cfg(target_os = "macos")]
+static BACKDROP_VISIBLE: AtomicBool = AtomicBool::new(true);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -97,6 +99,8 @@ pub(crate) struct Action {
     recording_id: String,
     origin: String,
     action: ActionKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current_recording_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -111,8 +115,13 @@ pub(crate) enum ActionKind {
 #[derive(Debug, Default)]
 struct RuntimeData {
     binding: Option<Binding>,
+    // A displaced transcription is retained only for explicit read-only navigation while the
+    // current capture is running. It never becomes the active binding or a result reminder.
+    previous_binding: Option<Binding>,
+    handoff_candidate: Option<LifecycleKey>,
     pending_action: Option<Action>,
     handoff_notice: Option<HandoffNotice>,
+    stack_above: bool,
 }
 
 #[derive(Debug)]
@@ -262,6 +271,18 @@ pub(crate) struct DisplayState {
     can_dismiss: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     handoff_notice_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    previous: Option<PreviousDisplayState>,
+    capsule_top: f64,
+    stack_above: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PreviousDisplayState {
+    recording_id: String,
+    result_attempt: String,
+    phase: Phase,
 }
 
 pub(crate) fn initialize(app: &AppHandle) {
@@ -399,7 +420,25 @@ pub(crate) fn sync(
         }
         // A late retirement of A must succeed while B is capturing without rebinding or hiding B.
         // Keep A's binding until replacement so the confirmed A -> B handoff can still explain it.
-        update_lifecycle_key(app, requested_key.clone(), Lifecycle::retire)?;
+        let was_available = update_lifecycle_key(app, requested_key.clone(), |lifecycle| {
+            let available = available_for_handoff(lifecycle);
+            lifecycle.retire();
+            available
+        })?;
+        // Web can retire A just before it binds the already-running B. Remember only this
+        // exact replacement, never an attempt which was dismissed before the handoff.
+        if was_available
+            && request.disposition == Some(Disposition::Retired)
+            && active
+                .as_ref()
+                .is_some_and(|active| active != &recording_id)
+            && data.binding.as_ref().is_some_and(|current| {
+                current.lifecycle_key() == requested_key
+                    && display_state(app, current).phase == Phase::Transcribing
+            })
+        {
+            data.handoff_candidate = Some(requested_key.clone());
+        }
         let matches_current = data.binding.as_ref().is_some_and(|current| {
             current.lifecycle_key() == requested_key
                 || (is_summary_phase(request.phase)
@@ -462,6 +501,7 @@ pub(crate) fn sync(
     if changed || attempt_changed {
         data.pending_action = None;
         data.handoff_notice = None;
+        data.previous_binding = None;
     }
     // Visibility/focus syncs must not erase evidence of native work that progressed while
     // Web was suspended. Reset this marker only for a new binding or a new requested phase.
@@ -485,14 +525,21 @@ pub(crate) fn sync(
         result_attempt: request.result_attempt.unwrap_or_else(|| "capture".into()),
     };
     if changed && active.as_deref() == Some(next.recording_id.as_str()) {
-        if let Some(previous) = data.binding.as_ref().filter(|previous| {
+        if let Some(previous) = data.binding.clone().filter(|previous| {
             same_owner(previous, &next) && previous.recording_id != next.recording_id
         }) {
-            let displaced_phase = display_state(app, previous).phase;
+            let displaced_phase = display_state(app, &previous).phase;
+            let was_available =
+                update_lifecycle(app, &previous, |lifecycle| available_for_handoff(lifecycle))?;
             // Every displaced attempt stays retired, even if its later result arrives after B ends.
-            update_lifecycle(app, previous, Lifecycle::retire)?;
-            if should_issue_handoff(previous, &next, displaced_phase)
-                && update_lifecycle(app, &next, Lifecycle::issue_handoff_notice)?
+            update_lifecycle(app, &previous, Lifecycle::retire)?;
+            if retainable_handoff(
+                &previous,
+                &next,
+                displaced_phase,
+                was_available,
+                data.handoff_candidate.as_ref(),
+            ) && update_lifecycle(app, &next, Lifecycle::issue_handoff_notice)?
             {
                 let created_at_ms = super::state::unix_millis();
                 data.handoff_notice = Some(HandoffNotice {
@@ -505,17 +552,22 @@ pub(crate) fn sync(
                     created_at_ms,
                     presented_at_ms: None,
                 });
+                data.previous_binding = Some(previous);
             }
         }
     }
+    data.handoff_candidate = None;
     data.binding = Some(next);
+    // The two cards exchange depth at the user's current anchor; replacing A with B must
+    // not teleport a dragged capsule back to the monitor's default corner.
+    let reset_position = changed && data.previous_binding.is_none();
     // Keep the action until Web has resolved the owned note and accepted the action.
     // A sync response may race listener registration, a reload, or a suspended page.
     let pending_action = data.pending_action.clone();
     drop(data);
     // A standard-note binding never displays the legacy recording/settings card.
     super::overlay::hide_overlay(app);
-    refresh(app, changed)?;
+    refresh(app, reset_position)?;
     ensure_watcher(app);
     Ok(SyncResponse { pending_action })
 }
@@ -529,6 +581,21 @@ fn should_issue_handoff(previous: &Binding, next: &Binding, displaced_phase: Pha
         && previous.recording_id != next.recording_id
         && displaced_phase == Phase::Transcribing
         && next.phase == Phase::Recording
+}
+
+fn available_for_handoff(lifecycle: &Lifecycle) -> bool {
+    !lifecycle.processing_dismissed && !lifecycle.terminal_closed
+}
+
+fn retainable_handoff(
+    previous: &Binding,
+    next: &Binding,
+    displaced_phase: Phase,
+    was_available: bool,
+    candidate: Option<&LifecycleKey>,
+) -> bool {
+    should_issue_handoff(previous, next, displaced_phase)
+        && (was_available || candidate == Some(&previous.lifecycle_key()))
 }
 
 /// Earlier Web clients create a new attempt for summary retry. Hide their previous completed
@@ -633,7 +700,45 @@ fn display_state(app: &AppHandle, binding: &Binding) -> DisplayState {
         paused: status.as_ref().is_some_and(|status| status.paused),
         can_dismiss: phase != Phase::Recording,
         handoff_notice_id: None,
+        previous: None,
+        capsule_top: geometry::CAPSULE_TOP,
+        stack_above: false,
     }
+}
+
+fn attach_deck_state(
+    app: &AppHandle,
+    data: &RuntimeData,
+    binding: &Binding,
+    state: &mut DisplayState,
+) {
+    if state.phase == Phase::Recording {
+        state.previous = data
+            .previous_binding
+            .as_ref()
+            .filter(|previous| {
+                same_owner(previous, binding)
+                    && previous.recording_id != binding.recording_id
+                    && app
+                        .state::<MeetingManagerState>()
+                        .store
+                        .load_task_record(&previous.recording_id)
+                        .is_some_and(|task| task.defer_transcription)
+            })
+            .and_then(|previous| {
+                let previous_state = display_state(app, previous);
+                if is_summary_phase(previous_state.phase) {
+                    return None;
+                }
+                Some(PreviousDisplayState {
+                    recording_id: previous.recording_id.clone(),
+                    result_attempt: previous.result_attempt.clone(),
+                    phase: previous_state.phase,
+                })
+            });
+    }
+    state.stack_above = data.stack_above && state.previous.is_some();
+    state.capsule_top = geometry::capsule_top(state.stack_above);
 }
 
 fn lifecycle_activity(binding: &Binding, state: &DisplayState) -> Activity {
@@ -854,7 +959,7 @@ fn refresh_on_main_thread(app: &AppHandle, reset_position: bool) -> Result<(), S
         main.is_visible().unwrap_or(false),
         main.is_minimized().unwrap_or(false),
     );
-    let state = display_state(app, &binding);
+    let mut state = display_state(app, &binding);
     let activity = lifecycle_activity(&binding, &state);
     // A route acknowledgement alone is insufficient. Web must have rendered this phase, and
     // the current note must actually be in the visible, focused main window.
@@ -868,6 +973,10 @@ fn refresh_on_main_thread(app: &AppHandle, reset_position: bool) -> Result<(), S
     {
         data.handoff_notice = None;
     }
+    if state.phase != Phase::Recording {
+        data.previous_binding = None;
+    }
+    attach_deck_state(app, &data, &binding, &mut state);
     let show = update_lifecycle(app, &binding, |lifecycle| {
         lifecycle.should_show(activity, note_visible, result_viewed, now)
     })?;
@@ -876,8 +985,6 @@ fn refresh_on_main_thread(app: &AppHandle, reset_position: bool) -> Result<(), S
         return Ok(());
     }
     let window = app.get_webview_window(LABEL);
-    let notice_missing =
-        data.handoff_notice.is_some() && app.get_webview_window(NOTICE_LABEL).is_none();
     if window.is_none() {
         // Windows/WebView2 cannot build a webview from a synchronous UI/event callback.
         // Release the binding lock before the background builder waits for that UI thread.
@@ -885,23 +992,25 @@ fn refresh_on_main_thread(app: &AppHandle, reset_position: bool) -> Result<(), S
         ensure_window_in_background(app);
         return Ok(());
     }
-    if notice_missing {
-        // The passive notice must never hold up the current recording's controls.
-        ensure_window_in_background(app);
-    }
     let window = window.expect("overlay window checked above");
-    update_window_presentation(app, &window, reset_position)?;
+    data.stack_above = update_window_presentation(
+        app,
+        &window,
+        reset_position,
+        data.stack_above,
+        state.previous.is_some(),
+    )?;
+    attach_deck_state(app, &data, &binding, &mut state);
+    state.handoff_notice_id = data.handoff_notice.as_ref().map(|notice| notice.id.clone());
+    hide_notice(app);
     let emitted = window.emit(STATE_EVENT, &state).is_ok();
     if !window.is_visible().unwrap_or(false) {
         window.show().map_err(|error| error.to_string())?;
     }
     // A failed native show/emit must not consume the five-second result opportunity.
     if emitted && window.is_visible().unwrap_or(false) {
-        if let Err(message) =
-            present_handoff_notice(app, &window, &state, data.handoff_notice.as_mut(), now)
-        {
-            hide_notice(app);
-            crate::logging::write_app_log(app, "warn", "note-overlay", &message, None);
+        if let Some(notice) = data.handoff_notice.as_mut() {
+            notice.presented_at_ms.get_or_insert(now);
         }
         update_lifecycle(app, &binding, |lifecycle| {
             lifecycle.presented(activity, now)
@@ -964,14 +1073,6 @@ fn create_hidden_window(app: &AppHandle) -> Result<bool, String> {
         create_capsule_window(app)?;
         created = true;
     }
-    if app.get_webview_window(NOTICE_LABEL).is_none() {
-        match create_notice_window(app) {
-            Ok(()) => created = true,
-            Err(message) => {
-                crate::logging::write_app_log(app, "warn", "note-overlay", &message, None);
-            }
-        }
-    }
     Ok(created)
 }
 
@@ -1002,35 +1103,6 @@ fn create_capsule_window(app: &AppHandle) -> Result<(), String> {
     Ok(())
 }
 
-fn create_notice_window(app: &AppHandle) -> Result<(), String> {
-    let url = format!(
-        "{}://localhost/note-notice.html",
-        super::overlay::OVERLAY_SCHEME
-    )
-    .parse()
-    .map_err(|_| "invalid note notice URL")?;
-    let window = WebviewWindowBuilder::new(app, NOTICE_LABEL, WebviewUrl::CustomProtocol(url))
-        .title(crate::i18n::t(app, "desktop.overlay.windowTitle"))
-        .inner_size(NOTICE_WIDTH, NOTICE_HEIGHT)
-        .resizable(false)
-        .decorations(false)
-        .always_on_top(true)
-        .skip_taskbar(true)
-        .shadow(false)
-        .transparent(true)
-        .background_color(Color(0, 0, 0, 0))
-        .focusable(false)
-        .focused(false)
-        .visible(false)
-        .build()
-        .map_err(|error| error.to_string())?;
-    if let Err(error) = window.set_ignore_cursor_events(true) {
-        let _ = window.destroy();
-        return Err(error.to_string());
-    }
-    Ok(())
-}
-
 fn follow_capsule_events(app: &AppHandle, window: &WebviewWindow) {
     let handle = app.clone();
     window.on_window_event(move |event| match event {
@@ -1053,21 +1125,43 @@ fn update_window_presentation(
     app: &AppHandle,
     window: &WebviewWindow,
     reset_position: bool,
-) -> Result<(), String> {
-    if reset_position {
-        if let Ok(Some(monitor)) = app
-            .get_webview_window("main")
+    was_above: bool,
+    stack_active: bool,
+) -> Result<bool, String> {
+    let monitor = if reset_position {
+        app.get_webview_window("main")
             .map_or_else(|| window.current_monitor(), |main| main.current_monitor())
-        {
-            let area = monitor.work_area();
-            let scale = monitor.scale_factor();
-            let position = geometry::default_position(work_area(area), scale);
-            let _ = window.set_position(PhysicalPosition::new(position.0, position.1));
+    } else {
+        window.current_monitor()
+    }
+    .map_err(|error| error.to_string())?;
+    let mut above = was_above;
+    if let Some(monitor) = monitor {
+        let area = work_area(monitor.work_area());
+        let scale = monitor.scale_factor();
+        let current = window.outer_position().map_err(|error| error.to_string())?;
+        let origin = if reset_position {
+            geometry::default_position(area, scale)
+        } else {
+            (current.x, current.y)
+        };
+        let (target, next_above) = geometry::stack_position(
+            area,
+            origin,
+            scale,
+            was_above && !reset_position,
+            stack_active,
+        );
+        above = next_above;
+        if (current.x, current.y) != target {
+            window
+                .set_position(PhysicalPosition::new(target.0, target.1))
+                .map_err(|error| error.to_string())?;
         }
     }
     #[cfg(target_os = "macos")]
-    refresh_native_backdrop(window)?;
-    Ok(())
+    refresh_native_backdrop(window, !stack_active)?;
+    Ok(above)
 }
 
 fn work_area(area: &tauri::PhysicalRect<i32, u32>) -> geometry::WorkArea {
@@ -1077,65 +1171,6 @@ fn work_area(area: &tauri::PhysicalRect<i32, u32>) -> geometry::WorkArea {
         width: area.size.width,
         height: area.size.height,
     }
-}
-
-fn position_notice(overlay: &WebviewWindow, notice: &WebviewWindow) -> Result<bool, String> {
-    let monitor = overlay
-        .current_monitor()
-        .map_err(|error| error.to_string())?
-        .ok_or("recording overlay monitor is unavailable")?;
-    let origin = overlay
-        .outer_position()
-        .map_err(|error| error.to_string())?;
-    let size = notice.outer_size().map_err(|error| error.to_string())?;
-    let position = geometry::notice_position(
-        work_area(monitor.work_area()),
-        (origin.x, origin.y),
-        monitor.scale_factor(),
-        (size.width, size.height),
-    );
-    let target = PhysicalPosition::new(position.0, position.1);
-    let actual = notice.outer_position().map_err(|error| error.to_string())?;
-    if actual == target {
-        return Ok(true);
-    }
-    // macOS may apply the move after this call returns. A later refresh must observe the
-    // target before showing the notice, otherwise its first frame flashes at the old position.
-    notice
-        .set_position(target)
-        .map_err(|error| error.to_string())?;
-    Ok(false)
-}
-
-fn present_handoff_notice(
-    app: &AppHandle,
-    overlay: &WebviewWindow,
-    state: &DisplayState,
-    notice: Option<&mut HandoffNotice>,
-    now: u64,
-) -> Result<(), String> {
-    let Some(notice) = notice else {
-        hide_notice(app);
-        return Ok(());
-    };
-    let Some(window) = app.get_webview_window(NOTICE_LABEL) else {
-        return Ok(());
-    };
-    if !position_notice(overlay, &window)? && !window.is_visible().unwrap_or(false) {
-        // Only the first frame waits for the move; an already visible notice follows the
-        // capsule without disappearing between native drag events.
-        return Ok(());
-    }
-    let mut state = state.clone();
-    state.handoff_notice_id = Some(notice.id.clone());
-    let emitted = window.emit(STATE_EVENT, &state).is_ok();
-    if !window.is_visible().unwrap_or(false) {
-        window.show().map_err(|error| error.to_string())?;
-    }
-    if emitted && window.is_visible().unwrap_or(false) {
-        notice.presented_at_ms.get_or_insert(now);
-    }
-    Ok(())
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -1159,21 +1194,26 @@ fn apply_native_backdrop_opacity(backdrop: &objc2_app_kit::NSVisualEffectView) {
 
 /// Reuse the visible overlay's 500 ms watcher; keep at most one main-thread update queued.
 #[cfg(target_os = "macos")]
-fn refresh_native_backdrop(window: &WebviewWindow) -> Result<(), String> {
+fn refresh_native_backdrop(window: &WebviewWindow, visible: bool) -> Result<(), String> {
+    BACKDROP_VISIBLE.store(visible, Ordering::SeqCst);
     if BACKDROP_REFRESH_PENDING.swap(true, Ordering::SeqCst) {
         return Ok(());
     }
     let handle = window.clone();
     let result = window.run_on_main_thread(move || {
+        // Coalesced calls publish their latest intent even while this callback is queued.
+        // Release the slot first so an update arriving during this callback queues a successor.
+        BACKDROP_REFRESH_PENDING.store(false, Ordering::SeqCst);
+        let visible = BACKDROP_VISIBLE.load(Ordering::SeqCst);
         if let Ok(pointer) = handle.ns_view() {
             let content = unsafe { &*pointer.cast::<objc2_app_kit::NSView>() };
             for view in content.subviews().iter() {
                 if let Some(backdrop) = view.downcast_ref::<objc2_app_kit::NSVisualEffectView>() {
+                    backdrop.setHidden(!visible);
                     apply_native_backdrop_opacity(backdrop);
                 }
             }
         }
-        BACKDROP_REFRESH_PENDING.store(false, Ordering::SeqCst);
     });
     if result.is_err() {
         BACKDROP_REFRESH_PENDING.store(false, Ordering::SeqCst);
@@ -1304,6 +1344,7 @@ pub(crate) fn meeting_get_note_overlay_state(
             .get_webview_window("main")
             .is_some_and(|main| main_matches(&main, &binding))
     {
+        attach_deck_state(&app, &data, &binding, &mut state);
         state.handoff_notice_id = data
             .handoff_notice
             .as_ref()
@@ -1346,13 +1387,14 @@ pub(crate) fn meeting_note_overlay_action(
         .data
         .lock()
         .map_err(|_| "recording overlay lock unavailable")?;
-    let binding = data
-        .binding
-        .clone()
-        .ok_or("note overlay is no longer bound")?;
     let active = active_recording_id(&app.state::<MeetingManagerState>());
-    verify_action_recording(&binding, &expected_recording_id, active.as_deref())?;
-    verify_action_attempt(&binding, expected_result_attempt.as_deref(), action)?;
+    let (binding, current_recording_id) = resolve_action_binding(
+        &data,
+        &expected_recording_id,
+        expected_result_attempt.as_deref(),
+        active.as_deref(),
+        action,
+    )?;
     if main_origin != binding.origin {
         return Err("note overlay origin changed".into());
     }
@@ -1387,6 +1429,7 @@ pub(crate) fn meeting_note_overlay_action(
         recording_id: binding.recording_id,
         origin: binding.origin,
         action,
+        current_recording_id,
     };
     data.pending_action = Some(event.clone());
     drop(data);
@@ -1509,6 +1552,57 @@ fn verify_action_recording(
     Ok(())
 }
 
+fn resolve_action_binding(
+    data: &RuntimeData,
+    expected_recording_id: &str,
+    expected_attempt: Option<&str>,
+    active_recording_id: Option<&str>,
+    action: ActionKind,
+) -> Result<(Binding, Option<String>), String> {
+    let current = data
+        .binding
+        .as_ref()
+        .ok_or("note overlay is no longer bound")?;
+    if current.recording_id == expected_recording_id {
+        verify_action_recording(current, expected_recording_id, active_recording_id)?;
+        verify_action_attempt(current, expected_attempt, action)?;
+        return Ok((current.clone(), None));
+    }
+    let previous = data
+        .previous_binding
+        .as_ref()
+        .ok_or("previous note is no longer retained")?;
+    if !previous_open_allowed(
+        current,
+        previous,
+        expected_recording_id,
+        expected_attempt,
+        active_recording_id,
+        action,
+    ) {
+        return Err(
+            "previous note is only available for owned read-only navigation during capture".into(),
+        );
+    }
+    Ok((previous.clone(), Some(current.recording_id.clone())))
+}
+
+fn previous_open_allowed(
+    current: &Binding,
+    previous: &Binding,
+    expected_recording_id: &str,
+    expected_attempt: Option<&str>,
+    active_recording_id: Option<&str>,
+    action: ActionKind,
+) -> bool {
+    action == ActionKind::Open
+        && active_recording_id == Some(current.recording_id.as_str())
+        && previous.recording_id == expected_recording_id
+        && current.recording_id != previous.recording_id
+        && same_owner(current, previous)
+        && expected_attempt == Some(previous.result_attempt.as_str())
+}
+
 fn require_active_binding(app: &AppHandle, recording_id: &str) -> Result<(), String> {
     let binding = binding(app).ok_or("note overlay is no longer bound")?;
     let active = active_recording_id(&app.state::<MeetingManagerState>());
@@ -1557,6 +1651,10 @@ pub(crate) fn asset(path: &str, locale: &serde_json::Value) -> Option<(&'static 
         "/note.html" => {
             return Some(("text/html; charset=utf-8", render_html(locale).into_bytes()))
         }
+        "/note-assets/note-overlay-deck.js" => (
+            "text/javascript; charset=utf-8",
+            include_bytes!("note-overlay-deck.js"),
+        ),
         "/note-assets/logo.png" => ("image/png", include_bytes!("note-overlay-assets/logo.png")),
         "/note-assets/SourceHanSansCN-VF.woff2" => (
             "font/woff2",
@@ -1680,6 +1778,9 @@ mod tests {
             paused: false,
             can_dismiss: true,
             handoff_notice_id: None,
+            previous: None,
+            capsule_top: geometry::CAPSULE_TOP,
+            stack_above: false,
         };
         assert_eq!(lifecycle_activity(&binding, &state), Activity::Processing);
         let mut ready_binding = binding.clone();
@@ -1764,6 +1865,7 @@ mod tests {
             recording_id: "rec-a".into(),
             origin: "https://snack.mechlabs.cn".into(),
             action: ActionKind::Open,
+            current_recording_id: None,
         };
         let mut data = RuntimeData {
             binding: None,
@@ -1872,7 +1974,139 @@ mod tests {
     }
 
     #[test]
-    fn handoff_notice_expires_three_seconds_after_display_and_cannot_cross_bindings() {
+    fn a_handoff_candidate_cannot_revive_an_already_closed_or_dismissed_attempt() {
+        let previous = handoff_binding("rec-a", Phase::Transcribing);
+        let next = handoff_binding("rec-b", Phase::Recording);
+        let mut lifecycle = Lifecycle::default();
+        assert!(available_for_handoff(&lifecycle));
+        lifecycle.dismiss(Activity::Processing).unwrap();
+        assert!(!available_for_handoff(&lifecycle));
+        assert!(!retainable_handoff(
+            &previous,
+            &next,
+            Phase::Transcribing,
+            false,
+            None
+        ));
+        lifecycle.retire();
+        assert!(!available_for_handoff(&lifecycle));
+        let candidate = previous.lifecycle_key();
+        assert!(retainable_handoff(
+            &previous,
+            &next,
+            Phase::Transcribing,
+            false,
+            Some(&candidate)
+        ));
+        let mut stale_candidate = candidate;
+        stale_candidate.result_attempt = "earlier-attempt".into();
+        assert!(!retainable_handoff(
+            &previous,
+            &next,
+            Phase::Transcribing,
+            false,
+            Some(&stale_candidate)
+        ));
+    }
+
+    #[test]
+    fn previous_card_is_open_only_while_the_exact_current_capture_remains_active() {
+        let previous = handoff_binding("rec-a", Phase::Transcribing);
+        let current = handoff_binding("rec-b", Phase::Recording);
+        let mut data = RuntimeData {
+            binding: Some(current.clone()),
+            previous_binding: Some(previous.clone()),
+            ..RuntimeData::default()
+        };
+        let (opened, capture) = resolve_action_binding(
+            &data,
+            "rec-a",
+            Some("capture"),
+            Some("rec-b"),
+            ActionKind::Open,
+        )
+        .unwrap();
+        assert_eq!(opened.recording_id, "rec-a");
+        assert_eq!(capture.as_deref(), Some("rec-b"));
+        for action in [
+            ActionKind::Retry,
+            ActionKind::RetrySummary,
+            ActionKind::Dismiss,
+        ] {
+            assert!(
+                resolve_action_binding(&data, "rec-a", Some("capture"), Some("rec-b"), action)
+                    .is_err()
+            );
+        }
+        for active in [None, Some("rec-c")] {
+            assert!(resolve_action_binding(
+                &data,
+                "rec-a",
+                Some("capture"),
+                active,
+                ActionKind::Open
+            )
+            .is_err());
+        }
+        for attempt in [None, Some("earlier-attempt")] {
+            assert!(resolve_action_binding(
+                &data,
+                "rec-a",
+                attempt,
+                Some("rec-b"),
+                ActionKind::Open
+            )
+            .is_err());
+        }
+        data.previous_binding.as_mut().unwrap().scope_key = "another-owner".into();
+        assert!(resolve_action_binding(
+            &data,
+            "rec-a",
+            Some("capture"),
+            Some("rec-b"),
+            ActionKind::Open
+        )
+        .is_err());
+        data.previous_binding = None;
+        assert!(resolve_action_binding(
+            &data,
+            "rec-a",
+            Some("capture"),
+            Some("rec-b"),
+            ActionKind::Open
+        )
+        .is_err());
+        let (_, capture) = resolve_action_binding(
+            &data,
+            "rec-b",
+            Some("capture"),
+            Some("rec-b"),
+            ActionKind::Open,
+        )
+        .unwrap();
+        assert_eq!(capture, None);
+        // Being on the previous face never allows its identity to drive capture controls.
+        assert!(verify_action_recording(&current, "rec-a", Some("rec-b")).is_err());
+    }
+
+    #[test]
+    fn previous_open_action_identifies_the_current_capture_without_changing_its_target() {
+        let event = Action {
+            id: "open-a".into(),
+            scope_key: "owner".into(),
+            recording_id: "rec-a".into(),
+            origin: "https://snack.mechlabs.cn".into(),
+            action: ActionKind::Open,
+            current_recording_id: Some("rec-b".into()),
+        };
+        let value = serde_json::to_value(event).unwrap();
+        assert_eq!(value["recordingId"], "rec-a");
+        assert_eq!(value["currentRecordingId"], "rec-b");
+        assert_eq!(value["action"], "open");
+    }
+
+    #[test]
+    fn handoff_notice_allows_the_exchange_then_three_seconds_and_cannot_cross_bindings() {
         let next = handoff_binding("rec-b", Phase::Recording);
         let mut notice = HandoffNotice {
             id: "notice-1".into(),
@@ -1882,8 +2116,8 @@ mod tests {
         };
         assert!(notice.is_current(&next, 80_000));
         notice.presented_at_ms = Some(80_000);
-        assert!(notice.is_current(&next, 82_999));
-        assert!(!notice.is_current(&next, 83_000));
+        assert!(notice.is_current(&next, 83_559));
+        assert!(!notice.is_current(&next, 83_560));
         let mut other = next.clone();
         other.scope_key = "tenant-b:user-a".into();
         assert!(!notice.is_current(&other, 80_001));
@@ -1904,16 +2138,16 @@ mod tests {
             created_at_ms: 1_000,
             presented_at_ms: None,
         };
-        assert!(pending.is_current(&next, 3_999));
-        assert!(!pending.is_current(&next, 4_000));
+        assert!(pending.is_current(&next, 4_559));
+        assert!(!pending.is_current(&next, 4_560));
         assert!(!pending.is_current(&next, 60_000));
         // If the overlay does appear during the handoff, give the visible message its full time.
         let shown = HandoffNotice {
-            presented_at_ms: Some(3_999),
+            presented_at_ms: Some(4_559),
             ..pending
         };
-        assert!(shown.is_current(&next, 6_998));
-        assert!(!shown.is_current(&next, 6_999));
+        assert!(shown.is_current(&next, 8_118));
+        assert!(!shown.is_current(&next, 8_119));
     }
 
     #[test]
