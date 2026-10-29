@@ -97,6 +97,13 @@ pub(crate) fn serve_overlay_request(
     locale: &serde_json::Value,
 ) -> tauri::http::Response<Vec<u8>> {
     let path = request.uri().path();
+    if let Some((mime, body)) = super::note_overlay::asset(path, locale) {
+        return tauri::http::Response::builder()
+            .status(200)
+            .header("Content-Type", mime)
+            .body(body)
+            .unwrap_or_else(|_| tauri::http::Response::new(Vec::new()));
+    }
     let body = match path {
         "/" | "/index.html" => overlay_locale::render(OVERLAY_HTML, locale).into_bytes(),
         "/reminder.html" => overlay_locale::render(REMINDER_HTML, locale).into_bytes(),
@@ -129,14 +136,20 @@ pub(crate) fn handle_overlay_request(
         return serve_overlay_request(request, &overlay_locale::app_payload(app));
     }
 
-    if webview_label != OVERLAY_LABEL {
+    if webview_label != OVERLAY_LABEL && webview_label != super::note_overlay::LABEL {
         return text_response(403, &i18n::t(app, "desktop.overlay.overlayOnly"));
     }
     if request.method() != tauri::http::Method::POST {
         return text_response(405, &i18n::t(app, "desktop.overlay.postRequired"));
     }
 
-    match super::stop_recording_from_overlay(app.clone()) {
+    let result = if webview_label == super::note_overlay::LABEL {
+        std::str::from_utf8(request.body()).map_err(|_| "invalid recording identifier".to_string())
+            .and_then(|recording_id| super::note_overlay::stop_from_protocol(app.clone(), recording_id))
+    } else {
+        super::stop_recording_from_overlay(app.clone())
+    };
+    match result {
         Ok(()) => text_response(204, ""),
         Err(message) => text_response(409, &message),
     }
@@ -298,7 +311,7 @@ pub(crate) fn restore_overlay(app: &AppHandle) -> Result<(), String> {
 
 /// True when the given window is the overlay (used by origin checks).
 pub(crate) fn is_overlay_window(window: &tauri::WebviewWindow) -> bool {
-    window.label() == OVERLAY_LABEL
+    window.label() == OVERLAY_LABEL || window.label() == super::note_overlay::LABEL
 }
 
 fn is_reminder_window(window: &tauri::WebviewWindow) -> bool {
@@ -397,10 +410,11 @@ mod tests {
         assert!(!html.contains("meeting_set_recording_project"));
         assert!(html.contains("return stopViaProtocol();"));
         assert!(!html.contains("meeting_open_notes_in_chat"));
-        assert!(!html.contains("正在转写"));
-        assert!(!html.contains("转写完成"));
-        assert!(!html.contains("生成纪要"));
-        assert!(!html.contains("做会议纪要"));
+        // Shared locale payloads also contain note-capsule messages; only the legacy UI stays recording-only.
+        assert!(!OVERLAY_HTML.contains("meeting_note_overlay_action"));
+        assert!(!OVERLAY_HTML.contains("transcriptionCompleted"));
+        assert!(!OVERLAY_HTML.contains("retryTranscription"));
+        assert!(!OVERLAY_HTML.contains("current.phase"));
         assert!(html.contains("color-scheme: light"));
         assert!(html.contains(
             "html, body { width: 100%; height: 100%; overflow: hidden; background: transparent; }"

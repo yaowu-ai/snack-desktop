@@ -1,0 +1,196 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title data-i18n="windowTitle"></title>
+<style>
+  @font-face { font-family: "Source Han Sans CN"; src: url('/note-assets/SourceHanSansCN-VF.woff2') format('woff2'); font-weight: 100 900; font-style: normal; font-display: block; }
+  :root { color-scheme: light; }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { width: 100%; height: 100%; overflow: hidden; background: transparent; }
+  body { color: #0f172a; font-family: "Source Han Sans CN", "PingFang SC", "Microsoft YaHei", sans-serif; user-select: none; -webkit-user-select: none; }
+  button { font: inherit; -webkit-tap-highlight-color: transparent; }
+  button[hidden], [hidden] { display: none !important; }
+  .capsule { position: absolute; left: 33px; top: 13px; width: 197px; height: 72px; overflow: hidden; border: 1px solid #e2e8f0; border-radius: 40px; background: rgba(255,255,255,.8); backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px); box-shadow: 0 25px 50px -12px rgba(0,0,0,.25); }
+  html[data-backdrop="native"] .capsule { background: transparent; backdrop-filter: none; -webkit-backdrop-filter: none; }
+  .drag-region { position: absolute; inset: 0; cursor: grab; }
+  .drag-region:active { cursor: grabbing; }
+  .identity { position: absolute; left: 11px; top: 50%; display: flex; flex-direction: column; align-items: flex-start; width: 73px; transform: translateY(calc(-50% - .5px)); pointer-events: none; }
+  .logo { position: relative; width: 60px; height: 22px; overflow: hidden; }
+  .logo img { position: absolute; display: block; width: 100.23%; height: 97.5%; left: -.11%; top: 2.5%; max-width: none; }
+  .timer { display: flex; align-items: center; gap: 4px; width: 73px; height: 19px; }
+  .timer img { flex: 0 0 auto; }
+  .duration { white-space: nowrap; font-family: "DIN Alternate", "Arial Narrow", sans-serif; font-size: 16px; font-weight: 700; font-variant-numeric: tabular-nums; line-height: 19px; }
+  .recording-actions { position: absolute; left: 88px; top: 19px; display: flex; align-items: center; gap: 8px; }
+  .capture-actions { display: flex; gap: 4px; }
+  .round-action { position: relative; display: flex; align-items: center; justify-content: center; width: 32px; height: 32px; border-radius: 22.857px; border: 1px solid #e2e8f0; background: #fff; cursor: pointer; }
+  .pause-bars { position: relative; width: 18.286px; height: 18.286px; }
+  .pause-bars::before, .pause-bars::after { content: ""; position: absolute; top: 3.92px; width: 3.265px; height: 10.449px; border-radius: 1.306px; background: #475569; }
+  .pause-bars::before { left: 3.92px; }
+  .pause-bars::after { left: 11.1px; }
+  .stop { border: 0; background: #ff3131; }
+  .stop::after { content: ""; width: 10.667px; height: 10.667px; border-radius: 3.048px; background: #fff; }
+  .open-action { display: flex; align-items: center; justify-content: center; width: 20px; height: 32px; border: 0; background: transparent; cursor: pointer; }
+  .result .identity { left: 15px; width: 78px; transform: translateY(-50%); }
+  .status-line { display: flex; align-items: center; gap: 4px; width: max-content; white-space: nowrap; }
+  .status-line img { flex: 0 0 auto; }
+  .status-label { font-size: 14px; font-weight: 400; line-height: 20px; }
+  [data-phase="failed"] .status-label, [data-phase="summary_failed"] .status-label { font-weight: 500; }
+  [data-phase="recording_failed"] .status-label { font-size: 12px; }
+  .result-open { position: absolute; left: 164px; top: 50%; transform: translateY(-50%); }
+  .result-action { position: absolute; left: 118px; top: 50%; transform: translateY(-50%); min-height: 34px; padding: 6px 8px; border: 1px solid #f1f5f9; border-radius: 20px; background: #fff; color: #fe720a; font-size: 12px; font-weight: 500; line-height: 20px; white-space: nowrap; cursor: pointer; }
+  .dismiss-action { position: absolute; left: 226px; top: 4px; display: flex; align-items: center; justify-content: center; width: 24px; height: 24px; border: 1px solid #e2e8f0; border-radius: 50%; background: rgba(255,255,255,.95); color: #64748b; box-shadow: 0 2px 5px rgba(15,23,42,.08); cursor: pointer; }
+  .dismiss-action::before, .dismiss-action::after { content: ""; position: absolute; width: 10px; height: 1.5px; border-radius: 1px; background: currentColor; transform: rotate(45deg); }
+  .dismiss-action::after { transform: rotate(-45deg); }
+  button:focus-visible { outline: 2px solid #fe720a; outline-offset: 2px; }
+  button:hover { filter: brightness(.97); }
+  button:disabled { opacity: .55; cursor: default; }
+  .loading { animation: rotate 1s linear infinite; }
+  @keyframes rotate { to { transform: rotate(360deg); } }
+  @media (prefers-reduced-motion: reduce) { .loading { animation: none; } }
+  .sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; }
+</style>
+</head>
+<body>
+  <div class="capsule" id="capsule" data-phase="recording">
+    <div class="drag-region" data-tauri-drag-region data-i18n-label="drag"></div>
+    <div class="identity">
+      <div class="logo"><img src="/note-assets/logo.png" alt="Snack" /></div>
+      <div class="timer" id="timer"><img src="/note-assets/recording-dot.svg" alt="" /><span class="duration" id="duration">00:00:00</span></div>
+      <div class="status-line" id="status-line" hidden><img id="status-icon" src="/note-assets/transcribing.svg" alt="" /><span class="status-label" id="status-label"></span></div>
+    </div>
+    <div class="recording-actions" id="recording-actions">
+      <div class="capture-actions">
+        <button class="round-action" id="pause" type="button" data-i18n-label="pause"><span class="pause-bars" id="pause-bars" aria-hidden="true"></span><img id="resume-icon" src="/note-assets/resume.svg" alt="" hidden /></button>
+        <button class="round-action stop" id="stop" type="button" data-i18n-label="stop"></button>
+      </div>
+      <button class="open-action" id="open" type="button" data-i18n-label="openNote"><img src="/note-assets/open-note.svg" alt="" /></button>
+    </div>
+    <button class="open-action result-open" id="result-open" type="button" data-i18n-label="openNote" hidden><img src="/note-assets/open-note-processing.svg" alt="" /></button>
+    <button class="result-action" id="result-action" type="button" hidden></button>
+    <div class="sr-only" id="live-status" role="status" aria-live="polite"></div>
+  </div>
+  <button class="dismiss-action" id="dismiss" type="button" data-i18n-label="dismiss" hidden></button>
+  <!--SNACK_LOCALE-->
+  <script>
+    (function () {
+      var current = { recordingId: '', resultAttempt: '', phase: 'recording', elapsedMs: 0, paused: false, canDismiss: false };
+      var pending = false;
+      var errorKey = '';
+      var operation = 0;
+      var capsule = document.getElementById('capsule');
+      var timer = document.getElementById('timer');
+      var duration = document.getElementById('duration');
+      var statusLine = document.getElementById('status-line');
+      var statusIcon = document.getElementById('status-icon');
+      var statusLabel = document.getElementById('status-label');
+      var pause = document.getElementById('pause');
+      var stop = document.getElementById('stop');
+      var open = document.getElementById('open');
+      var resultOpen = document.getElementById('result-open');
+      var resultAction = document.getElementById('result-action');
+      var dismiss = document.getElementById('dismiss');
+      var liveStatus = document.getElementById('live-status');
+      var resultViews = {
+        transcribing: { status: 'transcribing', icon: 'transcribing', loading: true },
+        completed: { status: 'transcriptionCompleted', icon: 'success', action: 'viewNote' },
+        failed: { status: 'transcriptionFailed', icon: 'failure', action: 'retryTranscription' },
+        recording_failed: { status: 'recordingFailed', icon: 'failure', action: 'viewNote' },
+        transcription_paused: { status: 'transcriptionPaused', action: 'viewNote' },
+        ended: { status: 'recordingEnded', action: 'viewNote' },
+        summary_generating: { status: 'summaryGenerating', icon: 'transcribing', loading: true },
+        summary_completed: { status: 'summaryCompleted', icon: 'success', action: 'viewSummary' },
+        summary_failed: { status: 'summaryFailed', icon: 'failure', action: 'retrySummary' }
+      };
+      function invoke(command, args) {
+        if (window.__TAURI__ && window.__TAURI__.core) return window.__TAURI__.core.invoke(command, args || {});
+        if (window.__TAURI_INTERNALS__ && window.__TAURI_INTERNALS__.invoke) return window.__TAURI_INTERNALS__.invoke(command, args || {});
+        return Promise.reject(new Error(window.snackText('bridgeUnavailable')));
+      }
+      function withTimeout(promise) {
+        return Promise.race([promise, new Promise(function (_, reject) { setTimeout(function () { reject(new Error('timeout')); }, 4000); })]);
+      }
+      function render() {
+        var recording = current.phase === 'recording';
+        var view = resultViews[current.phase] || resultViews.ended;
+        var expandsNote = view.action === 'viewNote' && current.phase !== 'completed';
+        capsule.classList.toggle('result', !recording);
+        capsule.dataset.phase = current.phase;
+        timer.hidden = !recording;
+        statusLine.hidden = recording;
+        document.getElementById('recording-actions').hidden = !recording;
+        resultOpen.hidden = recording || (!expandsNote && current.phase !== 'transcribing' && current.phase !== 'summary_generating');
+        var openText = window.snackText(current.phase === 'summary_generating' ? 'viewSummary' : expandsNote ? 'viewNote' : 'openNote');
+        resultOpen.title = resultOpen.ariaLabel = openText;
+        resultAction.hidden = recording || !view.action || expandsNote;
+        dismiss.hidden = recording || !current.canDismiss;
+        document.getElementById('pause-bars').hidden = current.paused;
+        document.getElementById('resume-icon').hidden = !current.paused;
+        var pauseText = window.snackText(current.paused ? 'resume' : 'pause');
+        pause.title = pause.ariaLabel = pauseText;
+        var seconds = Math.floor((current.elapsedMs || 0) / 1000);
+        duration.textContent = [Math.floor(seconds / 3600), Math.floor(seconds / 60) % 60, seconds % 60].map(function (value) { return String(value).padStart(2, '0'); }).join(':');
+        statusLabel.textContent = window.snackText(view.status);
+        statusIcon.src = '/note-assets/' + (view.icon || 'transcribing') + '.svg';
+        statusIcon.hidden = !view.icon;
+        statusIcon.classList.toggle('loading', Boolean(view.loading));
+        resultAction.textContent = window.snackText(view.action || 'viewNote');
+        [pause, stop, open, resultOpen, resultAction, dismiss].forEach(function (button) { button.disabled = pending; });
+        var stateText = recording ? window.snackText(current.paused ? 'paused' : 'recording') : statusLabel.textContent;
+        liveStatus.textContent = errorKey ? window.snackText(errorKey) : stateText;
+        capsule.title = errorKey ? window.snackText(errorKey) : '';
+      }
+      function apply(next) {
+        if (!next) return;
+        if (next.recordingId !== current.recordingId || next.resultAttempt !== current.resultAttempt || next.phase !== current.phase || next.paused !== current.paused) {
+          operation += 1; pending = false; errorKey = '';
+        }
+        current = Object.assign({}, current, next);
+        render();
+      }
+      function perform(promise, failureKey) {
+        if (pending) return;
+        var version = ++operation;
+        pending = true; errorKey = ''; render();
+        promise.then(function () { if (version !== operation) return; pending = false; render(); }).catch(function () { if (version !== operation) return; pending = false; errorKey = failureKey; render(); });
+      }
+      pause.addEventListener('click', function () {
+        if (!pending) perform(withTimeout(invoke('meeting_note_overlay_control', { expectedRecordingId: current.recordingId, paused: !current.paused })), 'pauseFailed');
+      });
+      stop.addEventListener('click', function () {
+        if (pending) return;
+        var expectedId = current.recordingId;
+        var stopping = withTimeout(invoke('meeting_note_overlay_control', { expectedRecordingId: expectedId })).catch(function () {
+          return withTimeout(fetch('/stop', { method: 'POST', cache: 'no-store', body: expectedId })).then(function (response) {
+            if (!response.ok) throw new Error('stop failed');
+          });
+        });
+        perform(stopping, 'stopFailed');
+      });
+      function openNote() {
+        if (!pending) perform(withTimeout(invoke('meeting_note_overlay_action', { expectedRecordingId: current.recordingId, expectedResultAttempt: current.resultAttempt, action: 'open' })), 'openNoteFailed');
+      }
+      open.addEventListener('click', openNote);
+      resultOpen.addEventListener('click', openNote);
+      resultAction.addEventListener('click', function () {
+        var action = current.phase === 'failed' ? 'retry' : current.phase === 'summary_failed' ? 'retry_summary' : 'open';
+        var failureKey = action === 'retry' ? 'retryTranscriptionFailed' : action === 'retry_summary' ? 'retrySummaryFailed' : 'openNoteFailed';
+        if (!pending) perform(withTimeout(invoke('meeting_note_overlay_action', { expectedRecordingId: current.recordingId, expectedResultAttempt: current.resultAttempt, action: action })), failureKey);
+      });
+      dismiss.addEventListener('click', function () {
+        if (!pending && current.canDismiss && current.phase !== 'recording') {
+          perform(withTimeout(invoke('meeting_note_overlay_action', { expectedRecordingId: current.recordingId, expectedResultAttempt: current.resultAttempt, expectedPhase: current.phase, action: 'dismiss' })), 'dismissFailed');
+        }
+      });
+      window.renderSnackLocale = render;
+      render();
+      try {
+        var events = window.__TAURI__ && window.__TAURI__.event;
+        if (events) events.listen('meeting-note-overlay-state', function (event) { apply(event.payload); });
+        invoke('meeting_get_note_overlay_state').then(apply).catch(function () {});
+      } catch (error) {}
+    })();
+  </script>
+</body>
+</html>

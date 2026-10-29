@@ -69,6 +69,7 @@ pub(crate) fn refresh(app: &AppHandle) {
     );
     for (label, title_key) in [
         (super::overlay::OVERLAY_LABEL, "desktop.overlay.windowTitle"),
+        (super::note_overlay::LABEL, "desktop.overlay.windowTitle"),
         (
             super::overlay::REMINDER_LABEL,
             "desktop.overlay.reminderWindowTitle",

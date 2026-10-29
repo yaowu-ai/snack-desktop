@@ -207,7 +207,37 @@ mod tests {
         assert_eq!(old.code, Some("CONTRACT_TOO_OLD"));
         let current = resolve_probe(&request);
         assert_eq!(current.status, BridgeProbeStatus::Supported);
-        assert_eq!(current.current_contract_revision, 4);
+        assert_eq!(current.current_contract_revision, BRIDGE_CONTRACT_REVISION);
+    }
+
+    #[test]
+    fn recording_overlay_is_probed_before_using_the_contract_four_api() {
+        let request = probe("recording.overlay.sync", 4, 1);
+        assert_eq!(
+            resolve_probe_for_revision(&request, 3).status,
+            BridgeProbeStatus::UpdateRequired
+        );
+        assert_eq!(resolve_probe(&request).status, BridgeProbeStatus::Supported);
+    }
+
+    #[test]
+    fn summary_overlay_api_keeps_transcription_clients_compatible() {
+        assert_eq!(
+            resolve_probe(&probe("recording.overlay.sync", 4, 1)).status,
+            BridgeProbeStatus::Supported
+        );
+        assert_eq!(
+            resolve_probe(&probe("recording.overlay.sync", 4, 2)).status,
+            BridgeProbeStatus::Supported
+        );
+        assert_eq!(
+            resolve_probe(&probe("recording.overlay.sync", 5, 3)).status,
+            BridgeProbeStatus::Supported
+        );
+        assert_eq!(
+            resolve_probe_for_revision(&probe("recording.overlay.sync", 5, 3), 4).status,
+            BridgeProbeStatus::UpdateRequired
+        );
     }
 
     fn probe(method: &str, revision: u32, api_version: u32) -> BridgeProbeRequest {

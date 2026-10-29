@@ -70,6 +70,9 @@ pub fn run() {
             meeting::meeting_fail_transcript_asset_upload,
             meeting::meeting_get_recording_status,
             meeting::meeting_get_recording_overlay_state,
+            meeting::note_overlay::meeting_get_note_overlay_state,
+            meeting::note_overlay::meeting_note_overlay_action,
+            meeting::note_overlay::meeting_note_overlay_control,
             meeting::meeting_get_snapshot,
             meeting::meeting_choose_storage_directory,
             meeting::meeting_generate_notes,
@@ -217,14 +220,10 @@ pub fn run() {
         .expect("error while building Snack desktop client")
         .run(|app, event| {
             #[cfg(target_os = "macos")]
-            if let tauri::RunEvent::Reopen {
-                has_visible_windows,
-                ..
-            } = event
-            {
-                if app_menu::should_show_window_on_reopen(has_visible_windows) {
-                    app_menu::show_main_window(app);
-                }
+            if let tauri::RunEvent::Reopen { .. } = event {
+                // A visible recording overlay must never prevent a Dock click from restoring
+                // the main window. Restoring keeps the user's current route unchanged.
+                app_menu::show_main_window(app);
             }
         });
 }
