@@ -19,9 +19,12 @@ pub(crate) const LABEL: &str = "note_record_overlay";
 const STATE_EVENT: &str = "meeting-note-overlay-state";
 const ACTION_EVENT: &str = "meeting-note-overlay-action";
 const REFRESH_EVENT: &str = "meeting-note-overlay-refresh";
-// Transparent margins preserve the Figma card's shadow without changing its 197 × 72 geometry.
-const WINDOW_WIDTH: f64 = 263.0;
-const WINDOW_HEIGHT: f64 = 148.0;
+// Reserve the same transparent area with and without the notice so the capture controls stay put.
+const WINDOW_WIDTH: f64 = 360.0;
+const WINDOW_HEIGHT: f64 = 200.0;
+const CAPSULE_LEFT: f64 = 81.0;
+const CAPSULE_TOP: f64 = 100.0;
+const HANDOFF_NOTICE_MS: u64 = 3_000;
 static ACTION_COUNTER: AtomicU64 = AtomicU64::new(0);
 #[cfg(target_os = "macos")]
 static BACKDROP_REFRESH_PENDING: AtomicBool = AtomicBool::new(false);
@@ -58,6 +61,16 @@ pub(crate) struct SyncRequest {
     result_attempt: Option<String>,
     #[serde(default)]
     acknowledged_action_id: Option<String>,
+    /// API v4: permanently stop presenting this owner/recording/attempt without cancelling work.
+    #[serde(default)]
+    disposition: Option<Disposition>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum Disposition {
+    Active,
+    Retired,
 }
 
 #[derive(Debug, Clone)]
@@ -96,6 +109,23 @@ pub(crate) enum ActionKind {
 struct RuntimeData {
     binding: Option<Binding>,
     pending_action: Option<Action>,
+    handoff_notice: Option<HandoffNotice>,
+}
+
+#[derive(Debug)]
+struct HandoffNotice {
+    id: String,
+    key: LifecycleKey,
+    created_at_ms: u64,
+    presented_at_ms: Option<u64>,
+}
+
+impl HandoffNotice {
+    fn is_current(&self, binding: &Binding, now_ms: u64) -> bool {
+        self.key == binding.lifecycle_key()
+            && now_ms.saturating_sub(self.presented_at_ms.unwrap_or(self.created_at_ms))
+                < HANDOFF_NOTICE_MS
+    }
 }
 
 #[derive(Default)]
@@ -135,6 +165,8 @@ struct SavedLifecycle {
     processing_dismissed: bool,
     terminal_closed: bool,
     success_presented_at_ms: Option<u64>,
+    #[serde(default)]
+    handoff_notice_issued: bool,
 }
 
 impl SavedLifecycle {
@@ -143,6 +175,7 @@ impl SavedLifecycle {
             processing_dismissed: self.processing_dismissed,
             terminal_closed: self.terminal_closed,
             success_presented_at_ms: self.success_presented_at_ms,
+            handoff_notice_issued: self.handoff_notice_issued,
         }
     }
 
@@ -152,6 +185,7 @@ impl SavedLifecycle {
             processing_dismissed: state.processing_dismissed,
             terminal_closed: state.terminal_closed,
             success_presented_at_ms: state.success_presented_at_ms,
+            handoff_notice_issued: state.handoff_notice_issued,
         }
     }
 }
@@ -171,12 +205,19 @@ fn update_lifecycle<T>(
     binding: &Binding,
     update: impl FnOnce(&mut Lifecycle) -> T,
 ) -> Result<T, String> {
+    update_lifecycle_key(app, binding.lifecycle_key(), update)
+}
+
+fn update_lifecycle_key<T>(
+    app: &AppHandle,
+    key: LifecycleKey,
+    update: impl FnOnce(&mut Lifecycle) -> T,
+) -> Result<T, String> {
     let runtime = app.state::<Runtime>();
     let mut ledger = runtime
         .lifecycles
         .lock()
         .map_err(|_| "recording overlay lifecycle lock unavailable")?;
-    let key = binding.lifecycle_key();
     let index = ledger.entries.iter().position(|entry| entry.key == key);
     let before = index.map_or_else(Lifecycle::default, |index| ledger.entries[index].state());
     let mut after = before;
@@ -216,6 +257,8 @@ pub(crate) struct DisplayState {
     elapsed_ms: u64,
     paused: bool,
     can_dismiss: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    handoff_notice_id: Option<String>,
 }
 
 pub(crate) fn initialize(app: &AppHandle) {
@@ -316,10 +359,87 @@ pub(crate) fn sync(
             pending_action: None,
         });
     };
+    let requested_key = LifecycleKey {
+        origin: origin.clone(),
+        scope_key: request.scope_key.clone(),
+        recording_id: recording_id.clone(),
+        result_attempt: request
+            .result_attempt
+            .clone()
+            .unwrap_or_else(|| "capture".into()),
+    };
     let manager = app.state::<MeetingManagerState>();
     let active = active_recording_id(&manager);
+    if request.disposition == Some(Disposition::Retired) || is_summary_phase(request.phase) {
+        // A delayed Web snapshot cannot retire the live capture or remove its controls.
+        if active.as_deref() == Some(recording_id.as_str()) {
+            return Ok(SyncResponse {
+                pending_action: data.pending_action.clone(),
+            });
+        }
+        let native_task = manager.store.load_task_record(&recording_id);
+        if request.disposition != Some(Disposition::Retired)
+            && is_summary_phase(request.phase)
+            && native_task.as_ref().is_some_and(|task| {
+                matches!(
+                    task.state,
+                    TaskState::Recording
+                        | TaskState::Finalizing
+                        | TaskState::TranscribingLocal
+                        | TaskState::TranscriptionPaused
+                )
+            })
+        {
+            return Ok(SyncResponse {
+                pending_action: data.pending_action.clone(),
+            });
+        }
+        // A late retirement of A must succeed while B is capturing without rebinding or hiding B.
+        // Keep A's binding until replacement so the confirmed A -> B handoff can still explain it.
+        update_lifecycle_key(app, requested_key.clone(), Lifecycle::retire)?;
+        let matches_current = data.binding.as_ref().is_some_and(|current| {
+            current.lifecycle_key() == requested_key
+                || (is_summary_phase(request.phase)
+                    && summary_replaces_current_attempt(
+                        current,
+                        &requested_key,
+                        request.summary_source_version.as_deref(),
+                        native_task.as_ref(),
+                    ))
+        });
+        if matches_current {
+            if let Some(current) = data.binding.as_ref() {
+                update_lifecycle(app, current, Lifecycle::retire)?;
+            }
+            if is_summary_phase(request.phase) {
+                if let Some(current) = data.binding.as_mut() {
+                    current.phase = request.phase;
+                    current.summary_source_version = request.summary_source_version;
+                    current.result_attempt = requested_key.result_attempt;
+                }
+            }
+            data.pending_action = None;
+            data.handoff_notice = None;
+        }
+        drop(data);
+        if matches_current {
+            refresh(app, false)?;
+        }
+        return Ok(SyncResponse {
+            pending_action: None,
+        });
+    }
     if active.as_ref().is_some_and(|id| id != &recording_id) {
         return Err("a newer recording is active".into());
+    }
+    if active.as_deref() != Some(recording_id.as_str())
+        && update_lifecycle_key(app, requested_key, |lifecycle| lifecycle.terminal_closed)?
+    {
+        // Do not let a late result for retired A steal B's binding after B stops capturing.
+        // A deliberate retry has its own attempt key; a real live capture always wins above.
+        return Ok(SyncResponse {
+            pending_action: None,
+        });
     }
     let task = manager
         .store
@@ -333,12 +453,12 @@ pub(crate) fn sync(
             && binding.recording_id == recording_id
             && binding.origin == origin
     });
-    if changed
-        || data.binding.as_ref().is_some_and(|binding| {
-            binding.result_attempt != request.result_attempt.as_deref().unwrap_or("capture")
-        })
-    {
+    let attempt_changed = data.binding.as_ref().is_some_and(|binding| {
+        binding.result_attempt != request.result_attempt.as_deref().unwrap_or("capture")
+    });
+    if changed || attempt_changed {
         data.pending_action = None;
+        data.handoff_notice = None;
     }
     // Visibility/focus syncs must not erase evidence of native work that progressed while
     // Web was suspended. Reset this marker only for a new binding or a new requested phase.
@@ -350,7 +470,7 @@ pub(crate) fn sync(
             || task.updated_at.clone(),
             |binding| binding.native_task_updated_at.clone(),
         );
-    data.binding = Some(Binding {
+    let next = Binding {
         scope_key: request.scope_key,
         recording_id,
         origin,
@@ -360,7 +480,32 @@ pub(crate) fn sync(
         summary_source_version: request.summary_source_version,
         completion_ready: request.completion_ready,
         result_attempt: request.result_attempt.unwrap_or_else(|| "capture".into()),
-    });
+    };
+    if changed && active.as_deref() == Some(next.recording_id.as_str()) {
+        if let Some(previous) = data.binding.as_ref().filter(|previous| {
+            same_owner(previous, &next) && previous.recording_id != next.recording_id
+        }) {
+            let displaced_phase = display_state(app, previous).phase;
+            // Every displaced attempt stays retired, even if its later result arrives after B ends.
+            update_lifecycle(app, previous, Lifecycle::retire)?;
+            if should_issue_handoff(previous, &next, displaced_phase)
+                && update_lifecycle(app, &next, Lifecycle::issue_handoff_notice)?
+            {
+                let created_at_ms = super::state::unix_millis();
+                data.handoff_notice = Some(HandoffNotice {
+                    id: format!(
+                        "handoff-{}-{}",
+                        created_at_ms,
+                        ACTION_COUNTER.fetch_add(1, Ordering::SeqCst)
+                    ),
+                    key: next.lifecycle_key(),
+                    created_at_ms,
+                    presented_at_ms: None,
+                });
+            }
+        }
+    }
+    data.binding = Some(next);
     // Keep the action until Web has resolved the owned note and accepted the action.
     // A sync response may race listener registration, a reload, or a suspended page.
     let pending_action = data.pending_action.clone();
@@ -370,6 +515,45 @@ pub(crate) fn sync(
     refresh(app, changed)?;
     ensure_watcher(app);
     Ok(SyncResponse { pending_action })
+}
+
+fn same_owner(previous: &Binding, next: &Binding) -> bool {
+    previous.origin == next.origin && previous.scope_key == next.scope_key
+}
+
+fn should_issue_handoff(previous: &Binding, next: &Binding, displaced_phase: Phase) -> bool {
+    same_owner(previous, next)
+        && previous.recording_id != next.recording_id
+        && displaced_phase == Phase::Transcribing
+        && next.phase == Phase::Recording
+}
+
+/// Earlier Web clients create a new attempt for summary retry. Hide their previous completed
+/// card only when this summary is for the native transcript that actually finished.
+fn summary_replaces_current_attempt(
+    current: &Binding,
+    requested: &LifecycleKey,
+    source_version: Option<&str>,
+    task: Option<&MeetingTask>,
+) -> bool {
+    current.origin == requested.origin
+        && current.scope_key == requested.scope_key
+        && current.recording_id == requested.recording_id
+        && task.is_some_and(|task| {
+            !(current.phase == Phase::Transcribing
+                && task.updated_at == current.native_task_updated_at)
+                && matches!(
+                    task.state,
+                    TaskState::TranscriptReady
+                        | TaskState::WaitingForNetwork
+                        | TaskState::GeneratingNotes
+                        | TaskState::Ready
+                        | TaskState::NotesFailed
+                )
+                && task.transcript.as_ref().is_some_and(|transcript| {
+                    Some(transcript.generated_at.as_str()) == source_version
+                })
+        })
 }
 
 fn binding(app: &AppHandle) -> Option<Binding> {
@@ -445,6 +629,7 @@ fn display_state(app: &AppHandle, binding: &Binding) -> DisplayState {
         elapsed_ms: status.as_ref().map_or(0, |status| status.elapsed_ms),
         paused: status.as_ref().is_some_and(|status| status.paused),
         can_dismiss: phase != Phase::Recording,
+        handoff_notice_id: None,
     }
 }
 
@@ -666,13 +851,20 @@ fn refresh_on_main_thread(app: &AppHandle, reset_position: bool) -> Result<(), S
         main.is_visible().unwrap_or(false),
         main.is_minimized().unwrap_or(false),
     );
-    let state = display_state(app, &binding);
+    let mut state = display_state(app, &binding);
     let activity = lifecycle_activity(&binding, &state);
     // A route acknowledgement alone is insufficient. Web must have rendered this phase, and
     // the current note must actually be in the visible, focused main window.
     let result_viewed =
         note_visible && main.is_focused().unwrap_or(false) && binding.phase == state.phase;
     let now = super::state::unix_millis();
+    if data
+        .handoff_notice
+        .as_ref()
+        .is_some_and(|notice| state.phase != Phase::Recording || !notice.is_current(&binding, now))
+    {
+        data.handoff_notice = None;
+    }
     let show = update_lifecycle(app, &binding, |lifecycle| {
         lifecycle.should_show(activity, note_visible, result_viewed, now)
     })?;
@@ -690,12 +882,25 @@ fn refresh_on_main_thread(app: &AppHandle, reset_position: bool) -> Result<(), S
     }
     let window = window.expect("overlay window checked above");
     update_window_presentation(app, &window, reset_position)?;
-    let emitted = window.emit(STATE_EVENT, state).is_ok();
-    if !window.is_visible().unwrap_or(false) {
+    let was_visible = window.is_visible().unwrap_or(false);
+    if was_visible {
+        state.handoff_notice_id = data.handoff_notice.as_ref().map(|notice| notice.id.clone());
+    }
+    let mut emitted = window.emit(STATE_EVENT, &state).is_ok();
+    if !was_visible {
         window.show().map_err(|error| error.to_string())?;
     }
     // A failed native show/emit must not consume the five-second result opportunity.
     if emitted && window.is_visible().unwrap_or(false) {
+        if let Some(notice) = data.handoff_notice.as_mut() {
+            if !was_visible {
+                state.handoff_notice_id = Some(notice.id.clone());
+                emitted = window.emit(STATE_EVENT, &state).is_ok();
+            }
+            if emitted {
+                notice.presented_at_ms.get_or_insert(now);
+            }
+        }
         update_lifecycle(app, &binding, |lifecycle| {
             lifecycle.presented(activity, now)
         })?;
@@ -788,10 +993,10 @@ fn update_window_presentation(
                 .outer_size()
                 .map_or((WINDOW_WIDTH * scale) as u32, |size| size.width)
                 as i32;
-            // Capsule right/top sit 24 logical px from the current monitor's work area.
+            // Keep the full notice inside the work area; its content is inset 24 logical px.
             let _ = window.set_position(PhysicalPosition::new(
-                area.position.x + area.size.width as i32 - width + (9.0 * scale) as i32,
-                area.position.y + (11.0 * scale) as i32,
+                (area.position.x + area.size.width as i32 - width).max(area.position.x),
+                area.position.y + (8.0 * scale) as i32,
             ));
         }
     }
@@ -872,13 +1077,13 @@ fn install_native_backdrop(window: &WebviewWindow) -> Result<(), String> {
                     window.setBackgroundColor(Some(&NSColor::clearColor()));
                 }
                 let y = if content.isFlipped() {
-                    13.0
+                    CAPSULE_TOP
                 } else {
-                    content.bounds().size.height - 13.0 - 72.0
+                    content.bounds().size.height - CAPSULE_TOP - 72.0
                 };
                 let backdrop = NSVisualEffectView::initWithFrame(
                     NSVisualEffectView::alloc(mtm),
-                    NSRect::new(NSPoint::new(33.0, y), NSSize::new(197.0, 72.0)),
+                    NSRect::new(NSPoint::new(CAPSULE_LEFT, y), NSSize::new(197.0, 72.0)),
                 );
                 backdrop.setMaterial(NSVisualEffectMaterial::UnderWindowBackground);
                 backdrop
@@ -927,8 +1132,33 @@ pub(crate) fn meeting_get_note_overlay_state(
     window: WebviewWindow,
 ) -> Result<DisplayState, String> {
     require_overlay(&window)?;
-    let binding = binding(&app).ok_or("note overlay is no longer bound")?;
-    Ok(display_state(&app, &binding))
+    let visible = window.is_visible().unwrap_or(false);
+    let runtime = app.state::<Runtime>();
+    let mut data = runtime
+        .data
+        .lock()
+        .map_err(|_| "recording overlay lock unavailable")?;
+    let binding = data
+        .binding
+        .clone()
+        .ok_or("note overlay is no longer bound")?;
+    let mut state = display_state(&app, &binding);
+    let now = super::state::unix_millis();
+    if data
+        .handoff_notice
+        .as_ref()
+        .is_some_and(|notice| state.phase != Phase::Recording || !notice.is_current(&binding, now))
+    {
+        data.handoff_notice = None;
+    }
+    if visible {
+        state.handoff_notice_id = data
+            .handoff_notice
+            .as_ref()
+            .filter(|notice| notice.presented_at_ms.is_some())
+            .map(|notice| notice.id.clone());
+    }
+    Ok(state)
 }
 
 #[tauri::command]
@@ -1276,6 +1506,7 @@ mod tests {
             elapsed_ms: 0,
             paused: false,
             can_dismiss: true,
+            handoff_notice_id: None,
         };
         assert_eq!(lifecycle_activity(&binding, &state), Activity::Processing);
         let mut ready_binding = binding.clone();
@@ -1364,6 +1595,7 @@ mod tests {
         let mut data = RuntimeData {
             binding: None,
             pending_action: Some(event),
+            ..RuntimeData::default()
         };
         acknowledge_action(&mut data, None);
         assert!(data.pending_action.is_some());
@@ -1422,6 +1654,222 @@ mod tests {
             resolve_phase(Phase::SummaryCompleted, Some(&task), false, true, true),
             Phase::Failed
         );
+    }
+
+    fn handoff_binding(recording_id: &str, phase: Phase) -> Binding {
+        Binding {
+            scope_key: "tenant-a:user-a".into(),
+            recording_id: recording_id.into(),
+            origin: "https://snack.mechlabs.cn".into(),
+            phase,
+            note_visible: false,
+            native_task_updated_at: String::new(),
+            summary_source_version: None,
+            completion_ready: false,
+            result_attempt: "capture".into(),
+        }
+    }
+
+    #[test]
+    fn handoff_only_explains_same_owner_transcription_replaced_by_new_capture() {
+        let previous = handoff_binding("rec-a", Phase::Transcribing);
+        let mut next = handoff_binding("rec-b", Phase::Recording);
+        assert!(should_issue_handoff(&previous, &next, Phase::Transcribing));
+        for old_phase in [
+            Phase::Completed,
+            Phase::Failed,
+            Phase::TranscriptionPaused,
+            Phase::SummaryGenerating,
+            Phase::SummaryCompleted,
+            Phase::SummaryFailed,
+        ] {
+            assert!(!should_issue_handoff(&previous, &next, old_phase));
+        }
+        next.recording_id = previous.recording_id.clone();
+        assert!(!should_issue_handoff(&previous, &next, Phase::Transcribing));
+        next.recording_id = "rec-b".into();
+        next.phase = Phase::RecordingFailed;
+        assert!(!should_issue_handoff(&previous, &next, Phase::Transcribing));
+        next.phase = Phase::Recording;
+        next.scope_key = "tenant-b:user-a".into();
+        assert!(!should_issue_handoff(&previous, &next, Phase::Transcribing));
+        next.scope_key = previous.scope_key.clone();
+        next.origin = "https://qasnack.mechlabs.cn".into();
+        assert!(!should_issue_handoff(&previous, &next, Phase::Transcribing));
+    }
+
+    #[test]
+    fn handoff_notice_expires_three_seconds_after_display_and_cannot_cross_bindings() {
+        let next = handoff_binding("rec-b", Phase::Recording);
+        let mut notice = HandoffNotice {
+            id: "notice-1".into(),
+            key: next.lifecycle_key(),
+            created_at_ms: 78_000,
+            presented_at_ms: None,
+        };
+        assert!(notice.is_current(&next, 80_000));
+        notice.presented_at_ms = Some(80_000);
+        assert!(notice.is_current(&next, 82_999));
+        assert!(!notice.is_current(&next, 83_000));
+        let mut other = next.clone();
+        other.scope_key = "tenant-b:user-a".into();
+        assert!(!notice.is_current(&other, 80_001));
+        other = next.clone();
+        other.result_attempt = "retry".into();
+        assert!(!notice.is_current(&other, 80_001));
+        other = next.clone();
+        other.recording_id = "rec-c".into();
+        assert!(!notice.is_current(&other, 80_001));
+    }
+
+    #[test]
+    fn a_handoff_hidden_on_the_note_page_expires_without_a_late_replay() {
+        let next = handoff_binding("rec-b", Phase::Recording);
+        let pending = HandoffNotice {
+            id: "notice-pending".into(),
+            key: next.lifecycle_key(),
+            created_at_ms: 1_000,
+            presented_at_ms: None,
+        };
+        assert!(pending.is_current(&next, 3_999));
+        assert!(!pending.is_current(&next, 4_000));
+        assert!(!pending.is_current(&next, 60_000));
+        // If the overlay does appear during the handoff, give the visible message its full time.
+        let shown = HandoffNotice {
+            presented_at_ms: Some(3_999),
+            ..pending
+        };
+        assert!(shown.is_current(&next, 6_998));
+        assert!(!shown.is_current(&next, 6_999));
+    }
+
+    #[test]
+    fn retired_attempt_and_issued_notice_survive_ledger_reload_without_muting_new_attempt() {
+        let previous = handoff_binding("rec-a", Phase::Transcribing);
+        let next = handoff_binding("rec-b", Phase::Recording);
+        let mut old = Lifecycle::default();
+        old.retire();
+        let mut destination = Lifecycle::default();
+        assert!(destination.issue_handoff_notice());
+        let ledger = LifecycleLedger {
+            entries: vec![
+                SavedLifecycle::new(previous.lifecycle_key(), old),
+                SavedLifecycle::new(next.lifecycle_key(), destination),
+            ],
+        };
+        let reloaded: LifecycleLedger =
+            serde_json::from_slice(&serde_json::to_vec(&ledger).unwrap()).unwrap();
+        let mut old = reloaded.entries[0].state();
+        assert!(!old.should_show(Activity::Success, false, false, 1));
+        assert!(!old.should_show(Activity::Failure, false, false, 2));
+        assert!(!reloaded.entries[1].state().issue_handoff_notice());
+        let mut retry = previous.clone();
+        retry.result_attempt = "retry".into();
+        assert!(!reloaded
+            .entries
+            .iter()
+            .any(|entry| entry.key == retry.lifecycle_key()));
+        // Existing installations can read the new ledger without discarding older close records.
+        let mut legacy = serde_json::to_value(&ledger).unwrap();
+        legacy["entries"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("handoffNoticeIssued");
+        let legacy: LifecycleLedger = serde_json::from_value(legacy).unwrap();
+        assert!(legacy.entries[0].terminal_closed);
+        assert!(!legacy.entries[0].handoff_notice_issued);
+    }
+
+    #[test]
+    fn retirement_protocol_accepts_v4_and_legacy_summary_payloads_without_new_fields() {
+        let mut payload = serde_json::json!({"scopeKey":"owner", "recordingId":"rec-1",
+            "phase":"transcribing", "noteVisible":false, "disposition":"retired"});
+        let request: SyncRequest = serde_json::from_value(payload.clone()).unwrap();
+        assert_eq!(request.disposition, Some(Disposition::Retired));
+        payload.as_object_mut().unwrap().remove("disposition");
+        for phase in ["summary_generating", "summary_completed", "summary_failed"] {
+            payload["phase"] = phase.into();
+            let request: SyncRequest = serde_json::from_value(payload.clone()).unwrap();
+            assert!(is_summary_phase(request.phase));
+            assert_eq!(request.disposition, None);
+        }
+        payload["disposition"] = "unsupported".into();
+        assert!(serde_json::from_value::<SyncRequest>(payload).is_err());
+    }
+
+    #[test]
+    fn summary_retry_hides_the_previous_completed_attempt_without_hiding_new_transcription() {
+        let current = handoff_binding("rec-a", Phase::Completed);
+        let mut requested = current.lifecycle_key();
+        requested.result_attempt = "summary-retry".into();
+        let mut task = MeetingTask::new("rec-a".into(), "zh".into());
+        task.state = TaskState::TranscriptReady;
+        task.transcript = Some(super::super::state::Transcript {
+            text: "Meeting transcript".into(),
+            language: "zh".into(),
+            segments: vec![],
+            model_key: "test".into(),
+            engine: "test".into(),
+            generated_at: "version-1".into(),
+        });
+        assert!(summary_replaces_current_attempt(
+            &current,
+            &requested,
+            Some("version-1"),
+            Some(&task)
+        ));
+        assert!(!summary_replaces_current_attempt(
+            &current,
+            &requested,
+            Some("version-0"),
+            Some(&task)
+        ));
+        let mut pending_retry = current.clone();
+        pending_retry.phase = Phase::Transcribing;
+        pending_retry.result_attempt = "transcription-retry".into();
+        pending_retry.native_task_updated_at = task.updated_at.clone();
+        assert!(!summary_replaces_current_attempt(
+            &pending_retry,
+            &requested,
+            Some("version-1"),
+            Some(&task)
+        ));
+        pending_retry.native_task_updated_at = "before-transcript-completed".into();
+        assert!(summary_replaces_current_attempt(
+            &pending_retry,
+            &requested,
+            Some("version-1"),
+            Some(&task)
+        ));
+        assert!(!summary_replaces_current_attempt(
+            &current,
+            &requested,
+            None,
+            Some(&task)
+        ));
+        requested.scope_key = "tenant-b:user-a".into();
+        assert!(!summary_replaces_current_attempt(
+            &current,
+            &requested,
+            Some("version-1"),
+            Some(&task)
+        ));
+        requested.scope_key = current.scope_key.clone();
+        for state in [
+            TaskState::Recording,
+            TaskState::Finalizing,
+            TaskState::TranscribingLocal,
+            TaskState::TranscriptionPaused,
+            TaskState::TranscriptionFailed,
+        ] {
+            task.state = state;
+            assert!(!summary_replaces_current_attempt(
+                &current,
+                &requested,
+                Some("version-1"),
+                Some(&task)
+            ));
+        }
     }
 
     #[test]
