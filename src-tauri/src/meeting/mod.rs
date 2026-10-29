@@ -164,6 +164,7 @@ impl MeetingCapabilities {
 
 pub(crate) fn build_snapshot(store: &MeetingStore) -> MeetingSnapshot {
     let resource = store.load_resource();
+    let tasks = store.load_task_records();
     // Permissions are NOT probed here: the ScreenCaptureKit probe can trigger
     // the system permission prompt, and snapshots are emitted frequently
     // (and polled). Explicit checks only (meeting_check_permissions /
@@ -176,7 +177,7 @@ pub(crate) fn build_snapshot(store: &MeetingStore) -> MeetingSnapshot {
         platform: platform_label(),
         resource,
         task: store.load_task(),
-        tasks: store.load_task_records(),
+        tasks,
         settings: store.load_settings(),
         shortcut_policy: shortcut_policy::snapshot(store),
         catalog: catalog().iter().map(CatalogInfo::from).collect(),
@@ -340,6 +341,7 @@ pub(crate) fn initialize(app: &AppHandle) -> Result<(), String> {
 }
 
 fn reconcile_tasks(app: &AppHandle, store: &MeetingStore) {
+    let tasks = store.load_task_records();
     let current_task_id = store.load_task().map(|task| task.recording_id);
     if let Some(mut task) = store.load_task() {
         if normalize_retained_task(&mut task) {
@@ -347,7 +349,7 @@ fn reconcile_tasks(app: &AppHandle, store: &MeetingStore) {
         }
         let _ = store.save_task_record(&task);
     }
-    for mut task in store.load_task_records() {
+    for mut task in tasks {
         if normalize_retained_task(&mut task) {
             let _ = store.save_task_progress(&task);
         }
@@ -1306,6 +1308,7 @@ fn update_task_record(
         .recording_task_update
         .lock()
         .expect("recording task update poisoned");
+    let transcript_guard = state::lock_transcript_file_changes();
     let mut task = state
         .store
         .load_task_record(recording_id)
@@ -1313,6 +1316,7 @@ fn update_task_record(
     update(&mut task)?;
     task.updated_at = now_rfc3339();
     state.store.save_task_progress(&task)?;
+    drop(transcript_guard);
     emit_state(app, &state.store);
     refresh_recording_overlay(app);
     Ok(())
@@ -1910,6 +1914,7 @@ pub(crate) fn meeting_rename_task_record(
     require_allowed_window(&window)?;
     let state = app.state::<MeetingManagerState>();
     let store = state.store.clone_for_task();
+    let guard = state::lock_transcript_file_changes();
     let mut task = store
         .load_task_record(&recording_id)
         .ok_or_else(|| "没有找到本地转写记录".to_string())?;
@@ -1918,6 +1923,7 @@ pub(crate) fn meeting_rename_task_record(
     task.display_name = Some(display_name);
     task.updated_at = now_rfc3339();
     store.save_task_progress(&task)?;
+    drop(guard);
     emit_state(&app, &store);
     Ok(())
 }
@@ -2004,6 +2010,7 @@ pub(crate) fn meeting_retranscribe(
     require_allowed_window(&window)?;
     let state = app.state::<MeetingManagerState>();
     let store = state.store.clone_for_task();
+    let transcript_guard = state::lock_transcript_file_changes();
     let mut task = store
         .load_task_record(&recording_id)
         .ok_or_else(|| "没有找到本地录音".to_string())?;
@@ -2038,6 +2045,7 @@ pub(crate) fn meeting_retranscribe(
     task.error = None;
     task.updated_at = now_rfc3339();
     store.save_task_progress(&task)?;
+    drop(transcript_guard);
     emit_state(&app, &store);
     spawn_transcription(app, store, recording_id);
     Ok(())
@@ -2826,17 +2834,57 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         let audio_path = root.join("recording.wav");
         let transcript_path = root.join("before.txt");
+        let store = super::MeetingStore::for_test(root.join("state"), root.clone());
         fs::write(&audio_path, b"audio").unwrap();
         fs::write(&transcript_path, b"transcript").unwrap();
         let mut task = MeetingTask::new("rec-title".to_string(), "zh".to_string());
+        task.state = TaskState::TranscriptReady;
         task.audio_path = Some(audio_path.to_string_lossy().into_owned());
         task.transcript_path = Some(transcript_path.to_string_lossy().into_owned());
+        store.save_task(&task).unwrap();
 
+        let guard = super::state::lock_transcript_file_changes();
         rename_transcript_text_file(&mut task, "after.txt").unwrap();
+        // A concurrent history poll must wait until the new path is persisted.
+        let scanner = store.clone_for_task();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            finished_tx.send(scanner.load_task_records()).unwrap();
+        });
+        started_rx.recv().unwrap();
+        assert!(matches!(finished_rx.recv_timeout(std::time::Duration::from_millis(20)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)));
+        store.save_task_progress(&task).unwrap();
+        drop(guard);
+        let records = finished_rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+        reader.join().unwrap();
 
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].transcript_path, task.transcript_path);
+        assert_eq!(store.load_task().unwrap().transcript_path, task.transcript_path);
         assert_eq!(fs::read(&audio_path).unwrap(), b"audio");
         assert!(!transcript_path.exists());
         assert_eq!(fs::read(root.join("after.txt")).unwrap(), b"transcript");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn snapshot_removes_deleted_transcript_history_and_current_pointer_together() {
+        let root = std::env::temp_dir().join(format!(
+            "snack-deleted-transcript-snapshot-{}", super::unix_millis()
+        ));
+        let store = super::MeetingStore::for_test(root.join("state"), root.join("recordings"));
+        let mut task = MeetingTask::new("deleted".into(), "zh".into());
+        task.state = TaskState::TranscriptReady;
+        task.transcript_path = Some(root.join("missing.txt").to_string_lossy().into_owned());
+        store.save_task(&task).unwrap();
+
+        let snapshot = super::build_snapshot(&store);
+
+        assert!(snapshot.tasks.is_empty());
+        assert!(snapshot.task.is_none());
         fs::remove_dir_all(root).unwrap();
     }
 
