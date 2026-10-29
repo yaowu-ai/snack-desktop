@@ -30,6 +30,14 @@ struct BridgeMethodRegistration {
 const METHODS: &[BridgeMethodRegistration] = &[
     BridgeMethodRegistration {
         descriptor: BridgeMethodDescriptor {
+            method: "files.preview",
+            introduced_contract_revision: 5,
+            api_versions: &[1],
+        },
+        handler: file_preview_handler,
+    },
+    BridgeMethodRegistration {
+        descriptor: BridgeMethodDescriptor {
             method: "locale.get",
             introduced_contract_revision: 1,
             api_versions: &[1],
@@ -132,6 +140,22 @@ fn recording_overlay_sync_handler(
         serde_json::to_value(result).map_err(|error| BridgeHandlerError {
             code: "SERIALIZATION_FAILED",
             message: error.to_string(),
+        })
+    })
+}
+
+fn file_preview_handler(context: BridgeContext, payload: serde_json::Value) -> BridgeHandlerFuture {
+    Box::pin(async move {
+        let request = parse_payload(payload)?;
+        let response = crate::file_preview::preview(context.app, context.window, request)
+            .await
+            .map_err(|message| BridgeHandlerError {
+                code: "FILE_PREVIEW_FAILED",
+                message,
+            })?;
+        serde_json::to_value(response).map_err(|_| BridgeHandlerError {
+            code: "SERIALIZATION_FAILED",
+            message: "Preview result unavailable".into(),
         })
     })
 }
@@ -441,7 +465,8 @@ mod tests {
 
     #[test]
     fn registry_exposes_only_explicit_methods() {
-        assert_eq!(descriptors().len(), 11);
+        assert_eq!(descriptors().len(), 12);
+        assert!(find("files.preview").is_some());
         assert!(find("bridge.info").is_some());
         assert!(find("locale.get").is_some());
         assert!(find("locale.set").is_some());

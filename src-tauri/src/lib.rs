@@ -4,6 +4,7 @@ mod bridge;
 mod commands;
 mod constants;
 mod download;
+mod file_preview;
 mod i18n;
 mod logging;
 mod meeting;
