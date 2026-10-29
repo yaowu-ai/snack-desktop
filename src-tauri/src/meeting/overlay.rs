@@ -31,6 +31,7 @@ pub(crate) enum OverlayPhase {
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct OverlayState {
+    pub(crate) audio_level_db: Option<f32>,
     pub(crate) phase: OverlayPhase,
     pub(crate) elapsed_ms: u64,
     pub(crate) mic_active: bool,
@@ -54,6 +55,7 @@ pub(crate) struct RecordingProjectOption {
 }
 
 pub(crate) struct RecordingOverlayState {
+    pub(crate) audio_level_db: Option<f32>,
     pub(crate) recording_id: String,
     pub(crate) elapsed_ms: u64,
     pub(crate) mic_active: bool,
@@ -72,6 +74,7 @@ impl OverlayState {
     pub(crate) fn recording(state: RecordingOverlayState) -> Self {
         Self {
             phase: OverlayPhase::Recording,
+            audio_level_db: state.audio_level_db,
             elapsed_ms: state.elapsed_ms,
             mic_active: state.mic_active,
             system_audio_active: state.system_audio_active,
@@ -535,6 +538,7 @@ mod tests {
     #[test]
     fn recording_state_serializes_the_recording_identity() {
         let value = serde_json::to_value(OverlayState::recording(RecordingOverlayState {
+            audio_level_db: Some(-24.0),
             recording_id: "rec-1".to_string(),
             elapsed_ms: 2500,
             mic_active: true,
@@ -554,6 +558,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(value["phase"], "recording");
+        assert_eq!(value["audioLevelDb"], -24.0);
         assert_eq!(value["recordingId"], "rec-1");
         assert_eq!(value["elapsedMs"], 2500);
         assert_eq!(value["displayName"], "Snack会议");

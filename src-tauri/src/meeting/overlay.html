@@ -48,6 +48,8 @@
   @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: .3; } }
   .title { overflow: hidden; font-size: 12px; font-weight: 650; text-overflow: ellipsis; white-space: nowrap; }
   .metric { margin-top: 3px; font-size: 19px; font-weight: 700; font-variant-numeric: tabular-nums; }
+  .waveform { display: flex; align-items: center; justify-content: space-between; width: 94px; height: 20px; margin: 2px auto 0; pointer-events: none; }
+  .waveform span { width: 2px; height: 2px; border-radius: 1px; background: #cbd5e1; }
   .expand-action {
     position: absolute; bottom: 1px; left: 50%; display: inline-flex; width: 28px; height: 20px;
     transform: translateX(-50%); align-items: center;
@@ -103,6 +105,7 @@
       <div class="status">
         <div class="title-row"><span class="status-dot"></span><span class="title" id="title" data-i18n="recording"></span></div>
         <div class="metric" id="metric">00:00</div>
+        <div class="waveform" id="waveform" aria-hidden="true"></div>
       </div>
       <button class="icon-button stop-action" id="stop-action" type="button" data-i18n-label="stop">
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6h12v12H6z" /></svg>
@@ -147,6 +150,29 @@
       var filenameInput = document.getElementById('filename-input');
       var autoNotes = document.getElementById('auto-notes');
       var projectSelect = document.getElementById('project-select');
+      var waveform = document.getElementById('waveform');
+      var levels = Array(20).fill(0);
+      var meterExpiry;
+      var meterBars = levels.map(function () {
+        var bar = document.createElement('span');
+        waveform.appendChild(bar);
+        return bar;
+      });
+
+      function renderMeter() {
+        meterBars.forEach(function (bar, index) {
+          bar.style.height = (2 + levels[index] * 14) + 'px';
+          bar.style.backgroundColor = levels[index] > 0 ? '#fe720a' : '#cbd5e1';
+        });
+      }
+      function updateMeter(reset) {
+        clearTimeout(meterExpiry);
+        var value = current.audioLevelDb;
+        var available = !reset && !current.paused && typeof value === 'number' && Number.isFinite(value);
+        levels = available ? levels.slice(1).concat(Math.max(0, Math.min(1, (value + 60) / 60))) : Array(20).fill(0);
+        renderMeter();
+        meterExpiry = setTimeout(function () { levels = Array(20).fill(0); renderMeter(); }, 750);
+      }
 
       function invoke(command, args) {
         if (window.__TAURI__ && window.__TAURI__.core) return window.__TAURI__.core.invoke(command, args || {});
@@ -206,6 +232,7 @@
         var changed = next.recordingId && next.recordingId !== current.recordingId;
         current = Object.assign({}, current, next);
         if (changed) { pending = false; errorMessage = ''; expanded = false; }
+        updateMeter(changed);
         render();
       }
       function togglePause() {

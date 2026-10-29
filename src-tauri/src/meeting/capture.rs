@@ -95,6 +95,7 @@ pub(crate) struct CaptureShared {
     discard_pending: AtomicBool,
     write_gate: Mutex<()>,
     active_timer: Mutex<ActiveTimer>,
+    audio_level: Mutex<Option<(f32, Instant)>>,
 }
 
 #[derive(Debug)]
@@ -149,6 +150,7 @@ impl CaptureShared {
             mic_live: AtomicBool::new(false),
             system_live: AtomicBool::new(false),
             recorded_samples: AtomicU64::new(0),
+            audio_level: Mutex::new(None),
             discard_pending: AtomicBool::new(false),
             write_gate: Mutex::new(()),
             active_timer: Mutex::new(ActiveTimer::new(Instant::now())),
@@ -206,6 +208,7 @@ impl CaptureShared {
                 .set_paused(paused, Instant::now());
         }
         if paused {
+            *self.audio_level.lock().expect("capture audio level poisoned") = None;
             self.discard_pending.store(true, Ordering::SeqCst);
             self.mic_live.store(false, Ordering::SeqCst);
             self.system_live.store(false, Ordering::SeqCst);
@@ -214,6 +217,17 @@ impl CaptureShared {
 
     pub(crate) fn is_paused(&self) -> bool {
         self.paused.load(Ordering::SeqCst)
+    }
+
+    fn audio_level_db(&self) -> Option<f32> {
+        if self.is_paused() || self.should_stop() {
+            return None;
+        }
+        self.audio_level
+            .lock()
+            .expect("capture audio level poisoned")
+            .filter(|(_, measured_at)| measured_at.elapsed() < Duration::from_millis(750))
+            .map(|(level, _)| level)
     }
 
     pub(crate) fn accepts_audio(&self) -> bool {
@@ -248,6 +262,7 @@ impl CaptureShared {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct LiveCaptureStatus {
+    pub(crate) audio_level_db: Option<f32>,
     pub(crate) mic_active: bool,
     pub(crate) system_audio_active: bool,
     pub(crate) elapsed_ms: u64,
@@ -257,6 +272,7 @@ pub(crate) struct LiveCaptureStatus {
 impl LiveCaptureStatus {
     pub(crate) fn from_shared(shared: &CaptureShared) -> Self {
         Self {
+            audio_level_db: shared.audio_level_db(),
             mic_active: shared.mic_live.load(Ordering::SeqCst),
             system_audio_active: shared.system_live.load(Ordering::SeqCst),
             elapsed_ms: shared.elapsed_millis(),
@@ -430,8 +446,25 @@ pub(crate) fn write_mixed_samples(
         return Ok(());
     }
     writer.write_samples(samples)?;
+    *shared.audio_level.lock().expect("capture audio level poisoned") =
+        pcm_level_db(samples).map(|level| (level, Instant::now()));
     shared.record_samples(samples.len());
     Ok(())
+}
+
+fn pcm_level_db(samples: &[i16]) -> Option<f32> {
+    if samples.is_empty() {
+        return None;
+    }
+    let mean_square = samples
+        .iter()
+        .map(|sample| {
+            let normalized = f64::from(*sample) / 32768.0;
+            normalized * normalized
+        })
+        .sum::<f64>()
+        / samples.len() as f64;
+    Some((10.0 * mean_square.max(1e-12).log10()) as f32)
 }
 
 #[cfg(test)]
@@ -442,6 +475,52 @@ mod tests {
         downmix_f32, mix_timeline_chunk, pcm_bytes_to_f32_mono, prepare_audio_output,
         resample_to_target, ActiveTimer, CaptureShared, Recorder, CAPTURE_CHUNK_SAMPLES,
     };
+
+    #[test]
+    fn recording_meter_reports_pcm_rms_without_fake_motion() {
+        assert_eq!(super::pcm_level_db(&[]), None);
+        assert_eq!(super::pcm_level_db(&[0; 1600]), Some(-120.0));
+        let half_scale = super::pcm_level_db(&[16384, -16384]).unwrap();
+        assert!((half_scale + 6.0206).abs() < 0.001);
+        assert_eq!(super::pcm_level_db(&[i16::MIN]), Some(0.0));
+    }
+
+    #[test]
+    fn recording_meter_expires_and_clears_on_pause() {
+        let shared = super::CaptureShared::new(0);
+        assert_eq!(shared.audio_level_db(), None);
+        *shared.audio_level.lock().unwrap() = Some((-12.0, Instant::now()));
+        assert_eq!(
+            super::LiveCaptureStatus::from_shared(&shared).audio_level_db,
+            Some(-12.0)
+        );
+        *shared.audio_level.lock().unwrap() =
+            Some((-12.0, Instant::now() - Duration::from_secs(1)));
+        assert_eq!(shared.audio_level_db(), None);
+        *shared.audio_level.lock().unwrap() = Some((-12.0, Instant::now()));
+        shared.set_paused(true);
+        assert_eq!(shared.audio_level_db(), None);
+        assert!(shared.audio_level.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn recording_meter_uses_written_mix_and_does_not_record_while_paused() {
+        let path = std::env::temp_dir().join(format!(
+            "snack-meter-{}.wav",
+            crate::meeting::state::unix_millis()
+        ));
+        let shared = CaptureShared::new(0);
+        let mut writer = crate::meeting::audio::WavWriter::create(&path).unwrap();
+        super::write_mixed_samples(&shared, &mut writer, &[16384, -16384]).unwrap();
+        assert!((shared.audio_level_db().unwrap() + 6.0206).abs() < 0.001);
+        shared.set_paused(true);
+        super::write_mixed_samples(&shared, &mut writer, &[i16::MIN; 1600]).unwrap();
+        assert_eq!(shared.audio_level_db(), None);
+        assert_eq!(shared.recorded_samples.load(std::sync::atomic::Ordering::SeqCst), 2);
+        writer.finalize().unwrap();
+        drop(writer);
+        std::fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn pcm_i16_bytes_decode() {
