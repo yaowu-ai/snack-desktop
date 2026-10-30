@@ -4,9 +4,7 @@ use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 use tauri::window::Color;
-use tauri::{
-    AppHandle, Emitter, Manager, PhysicalPosition, WebviewUrl, WebviewWindow, WebviewWindowBuilder,
-};
+use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
 
 #[path = "note_overlay_geometry.rs"]
 mod geometry;
@@ -1204,9 +1202,24 @@ fn update_window_presentation(
             stack_active,
         );
         above = next_above;
-        if (current.x, current.y) != target {
+        if reset_position {
+            crate::logging::write_app_log(
+                app,
+                "info",
+                "note-overlay",
+                "recording overlay initial placement",
+                Some(&serde_json::json!({
+                    "windowScale": window.scale_factor().ok(),
+                    "targetMonitorScale": scale,
+                    "targetPhysicalX": target.0,
+                    "targetPhysicalY": target.1,
+                    "coordinateMode": if cfg!(target_os = "macos") { "target-monitor-logical" } else { "physical" },
+                })),
+            );
+        }
+        if reset_position || (current.x, current.y) != target {
             window
-                .set_position(PhysicalPosition::new(target.0, target.1))
+                .set_position(geometry::native_position(target, scale))
                 .map_err(|error| error.to_string())?;
         }
     }

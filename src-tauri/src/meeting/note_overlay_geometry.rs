@@ -29,6 +29,23 @@ pub(super) fn default_position(area: WorkArea, scale: f64) -> (i32, i32) {
     (x.max(area.x), y)
 }
 
+/// A hidden macOS window can still report another monitor's backing scale.
+/// Resolve logical coordinates using the target monitor before calling its native setter.
+pub(super) fn native_position(target: (i32, i32), _target_scale: f64) -> tauri::Position {
+    #[cfg(target_os = "macos")]
+    {
+        tauri::LogicalPosition::new(
+            target.0 as f64 / _target_scale,
+            target.1 as f64 / _target_scale,
+        )
+        .into()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        tauri::PhysicalPosition::new(target.0, target.1).into()
+    }
+}
+
 /// Changing the available expansion side moves the transparent window, not the visible capsule.
 /// Only the card stack is placed above/below; the user's dragged capsule position is preserved.
 pub(super) fn stack_position(
@@ -68,6 +85,55 @@ mod tests {
         assert_eq!(capsule_top(true), 97.0);
         assert_eq!(NOTICE_WIDTH, 188.0);
         assert_eq!(NOTICE_HEIGHT, 64.0);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn initial_retina_position_does_not_depend_on_hidden_window_scale() {
+        let screen = WorkArea {
+            x: 0,
+            y: 68,
+            width: 2940,
+            height: 1736,
+        };
+        let target = default_position(screen, 2.0);
+        assert_eq!(target, (2432, 90));
+        let position = native_position(target, 2.0);
+        let hidden_window = position.to_logical::<f64>(1.0);
+        let visible_window = position.to_logical::<f64>(2.0);
+        assert_eq!(hidden_window, tauri::LogicalPosition::new(1216.0, 45.0));
+        assert_eq!(hidden_window, visible_window);
+    }
+
+    #[test]
+    fn native_position_preserves_unscaled_monitor_coordinates() {
+        let target = default_position(area(), 1.0);
+        assert_eq!(
+            native_position(target, 1.0).to_logical::<f64>(1.0),
+            tauri::LogicalPosition::new(1186.0, 35.0)
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_position_preserves_negative_retina_and_stack_coordinates() {
+        let screen = WorkArea {
+            x: -2880,
+            y: -400,
+            width: 2880,
+            height: 1800,
+        };
+        let (target, above) = stack_position(screen, (-508, 0), 2.0, false, true);
+        assert!(above);
+        let position = native_position(target, 2.0);
+        assert_eq!(
+            position.to_logical::<f64>(1.0),
+            tauri::LogicalPosition::new(-254.0, -84.0)
+        );
+        assert_eq!(
+            position.to_logical::<f64>(1.0),
+            position.to_logical::<f64>(2.0)
+        );
     }
 
     #[test]
