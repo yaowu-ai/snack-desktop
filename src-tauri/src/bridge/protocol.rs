@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-pub(crate) const BRIDGE_CONTRACT_REVISION: u32 = 3;
+pub(crate) const BRIDGE_CONTRACT_REVISION: u32 = 6;
 pub(crate) const BRIDGE_UPDATE_PROGRESS_EVENT: &str = "bridge-update-progress";
 
 #[derive(Debug, Clone, Deserialize)]

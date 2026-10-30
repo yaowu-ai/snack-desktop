@@ -55,8 +55,49 @@ fn main() {
 
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
         build_audio_tap();
+        build_file_preview();
     }
     tauri_build::build()
+}
+
+fn build_file_preview() {
+    use std::{path::PathBuf, process::Command};
+    let out = PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR"));
+    let arch = if std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("aarch64") {
+        "arm64"
+    } else {
+        "x86_64"
+    };
+    println!("cargo:rerun-if-changed=src/file_preview.m");
+    let object = out.join("file_preview.o");
+    assert!(Command::new("xcrun")
+        .args([
+            "clang",
+            "-fobjc-arc",
+            "-arch",
+            arch,
+            "-mmacosx-version-min=12.3",
+            "-Wall",
+            "-Werror",
+            "-c",
+            "src/file_preview.m",
+            "-o"
+        ])
+        .arg(&object)
+        .status()
+        .expect("compile native preview")
+        .success());
+    assert!(Command::new("xcrun")
+        .args(["ar", "crs"])
+        .arg(out.join("libsnack_file_preview.a"))
+        .arg(object)
+        .status()
+        .expect("archive native preview")
+        .success());
+    println!("cargo:rustc-link-search=native={}", out.display());
+    println!("cargo:rustc-link-lib=static=snack_file_preview");
+    println!("cargo:rustc-link-lib=framework=Quartz");
+    println!("cargo:rustc-link-lib=framework=AppKit");
 }
 
 fn configure_default_locale() {

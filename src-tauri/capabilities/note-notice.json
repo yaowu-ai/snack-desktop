@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "note-notice",
+  "description": "Read-only capabilities for the passive recording handoff notice.",
+  "windows": ["note_record_notice"],
+  "permissions": ["core:event:allow-listen", "core:event:allow-unlisten", "allow-note-notice-state"]
+}

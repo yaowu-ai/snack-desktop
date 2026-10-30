@@ -41,6 +41,45 @@ async function openSurface(page: Page, name: string, locale: 'en' | 'zh') {
   await page.goto('https://overlay.test/');
 }
 
+async function openNoteDeck(page: Page, locale: 'en' | 'zh') {
+  const html = readFileSync(path.join(root, 'src/meeting/note_overlay.html'), 'utf8').replace(
+    '<!--SNACK_LOCALE-->', `<script>window.__SNACK_LOCALE__=${JSON.stringify(payload(locale))};</script><script>${localeScript}</script>`,
+  );
+  await page.setViewportSize({ width: 263, height: 192 });
+  await page.emulateMedia({ reducedMotion: 'reduce' });
+  await page.addInitScript(() => {
+    const host = window as any;
+    host.__TAURI__ = {
+      core: { invoke: async () => ({
+        recordingId: 'rec-b', resultAttempt: 'capture', phase: 'recording', paused: false,
+        elapsedMs: 8000, capsuleTop: 13, stackAbove: false, handoffNoticeId: 'locale-handoff',
+        previous: { recordingId: 'rec-a', resultAttempt: 'capture', phase: 'transcribing' },
+      }) },
+      event: { listen: (_name: string, handler: unknown) => { host.noteStateHandler = handler; return Promise.resolve(() => {}); } },
+    };
+  });
+  await page.route('https://overlay.test/**', (route) => {
+    const filename = path.basename(new URL(route.request().url()).pathname);
+    if (filename === 'note-overlay-deck.js') return route.fulfill({ contentType: 'text/javascript', body: readFileSync(path.join(root, 'src/meeting', filename)) });
+    if (filename.endsWith('.svg') || filename.endsWith('.png') || filename.endsWith('.woff2')) {
+      return route.fulfill({ contentType: filename.endsWith('.woff2') ? 'font/woff2' : filename.endsWith('.png') ? 'image/png' : 'image/svg+xml', body: readFileSync(path.join(root, 'src/meeting/note-overlay-assets', filename)) });
+    }
+    return route.fulfill({ contentType: 'text/html', body: html });
+  });
+  await page.goto('https://overlay.test/note.html');
+  await page.evaluate(() => document.fonts.ready);
+}
+
+async function expectPreviousRetired(page: Page) {
+  for (const selector of ['#previous-card', '#previous-full', '#previous-peek', '#previous-open', '#recording-peek']) {
+    const elements = page.locator(selector);
+    await expect(elements).toBeHidden();
+    expect(await elements.evaluateAll((items) => items.every((item) => Boolean(item.closest('[inert]'))))).toBe(true);
+  }
+  await expect(page.locator('#handoff-notice')).toBeHidden();
+  await expect(page.locator('#current-content')).toHaveJSProperty('inert', false);
+}
+
 for (const locale of ['en', 'zh'] as const) {
   test(`recording card renders ${locale} offline and retains drafts on switch`, async ({ page }) => {
     const errors: string[] = [];
@@ -90,3 +129,33 @@ test('native protocol can stop recording when IPC fails', async ({ page }) => {
   await expect.poll(() => stopped).toBe(true);
   await expect(page.locator('#error')).toBeHidden();
 });
+
+for (const locale of ['en', 'zh'] as const) {
+  test(`card deck localizes ${locale} and locale refresh does not extend its confirmation`, async ({ page }) => {
+    await page.clock.install();
+    await page.clock.pauseAt(new Date(Date.now() + 60_000));
+    await openNoteDeck(page, locale);
+    await page.clock.runFor(81);
+    await expect(page.locator('#handoff-title')).toHaveText(payload(locale).messages.backgroundTranscriptionTitle);
+    await expect(page.locator('#handoff-description')).toHaveText(payload(locale).messages.backgroundTranscriptionDescription);
+    await expect(page.locator('#handoff-notice')).toBeVisible();
+    await page.clock.runFor(1000);
+    const other = locale === 'en' ? 'zh' : 'en';
+    await page.evaluate((next) => (window as any).setSnackLocale(next), payload(other));
+    await expect(page.locator('#handoff-title')).toHaveText(payload(other).messages.backgroundTranscriptionTitle);
+    await expect(page.locator('#duration')).toHaveText('00:00:08');
+    await page.clock.runFor(2201);
+    await expectPreviousRetired(page);
+    await expect(page.locator('#pause')).toHaveAccessibleName(payload(other).messages.pause);
+    await page.evaluate((next) => (window as any).setSnackLocale(next), payload(locale));
+    await expectPreviousRetired(page);
+    await page.evaluate(() => (window as any).noteStateHandler({ payload: {
+      recordingId: 'rec-b', resultAttempt: 'capture', phase: 'recording', elapsedMs: 41000,
+      capsuleTop: 13, stackAbove: false,
+      previous: { recordingId: 'rec-a', resultAttempt: 'capture', phase: 'failed' },
+    } }));
+    await page.clock.runFor(1000);
+    await expectPreviousRetired(page);
+    await expect(page.locator('#duration')).toHaveText('00:00:41');
+  });
+}

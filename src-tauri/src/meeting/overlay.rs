@@ -31,6 +31,7 @@ pub(crate) enum OverlayPhase {
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct OverlayState {
+    pub(crate) audio_level_db: Option<f32>,
     pub(crate) phase: OverlayPhase,
     pub(crate) elapsed_ms: u64,
     pub(crate) mic_active: bool,
@@ -54,6 +55,7 @@ pub(crate) struct RecordingProjectOption {
 }
 
 pub(crate) struct RecordingOverlayState {
+    pub(crate) audio_level_db: Option<f32>,
     pub(crate) recording_id: String,
     pub(crate) elapsed_ms: u64,
     pub(crate) mic_active: bool,
@@ -72,6 +74,7 @@ impl OverlayState {
     pub(crate) fn recording(state: RecordingOverlayState) -> Self {
         Self {
             phase: OverlayPhase::Recording,
+            audio_level_db: state.audio_level_db,
             elapsed_ms: state.elapsed_ms,
             mic_active: state.mic_active,
             system_audio_active: state.system_audio_active,
@@ -94,9 +97,17 @@ pub(crate) fn serve_overlay_request(
     locale: &serde_json::Value,
 ) -> tauri::http::Response<Vec<u8>> {
     let path = request.uri().path();
+    if let Some((mime, body)) = super::note_overlay::asset(path, locale) {
+        return tauri::http::Response::builder()
+            .status(200)
+            .header("Content-Type", mime)
+            .body(body)
+            .unwrap_or_else(|_| tauri::http::Response::new(Vec::new()));
+    }
     let body = match path {
         "/" | "/index.html" => overlay_locale::render(OVERLAY_HTML, locale).into_bytes(),
         "/reminder.html" => overlay_locale::render(REMINDER_HTML, locale).into_bytes(),
+        "/note-notice.html" => super::note_overlay::render_notice_html(locale).into_bytes(),
         _ => Vec::new(),
     };
     let status = if body.is_empty() { 404 } else { 200 };
@@ -126,14 +137,20 @@ pub(crate) fn handle_overlay_request(
         return serve_overlay_request(request, &overlay_locale::app_payload(app));
     }
 
-    if webview_label != OVERLAY_LABEL {
+    if webview_label != OVERLAY_LABEL && webview_label != super::note_overlay::LABEL {
         return text_response(403, &i18n::t(app, "desktop.overlay.overlayOnly"));
     }
     if request.method() != tauri::http::Method::POST {
         return text_response(405, &i18n::t(app, "desktop.overlay.postRequired"));
     }
 
-    match super::stop_recording_from_overlay(app.clone()) {
+    let result = if webview_label == super::note_overlay::LABEL {
+        std::str::from_utf8(request.body()).map_err(|_| "invalid recording identifier".to_string())
+            .and_then(|recording_id| super::note_overlay::stop_from_protocol(app.clone(), recording_id))
+    } else {
+        super::stop_recording_from_overlay(app.clone())
+    };
+    match result {
         Ok(()) => text_response(204, ""),
         Err(message) => text_response(409, &message),
     }
@@ -295,7 +312,7 @@ pub(crate) fn restore_overlay(app: &AppHandle) -> Result<(), String> {
 
 /// True when the given window is the overlay (used by origin checks).
 pub(crate) fn is_overlay_window(window: &tauri::WebviewWindow) -> bool {
-    window.label() == OVERLAY_LABEL
+    window.label() == OVERLAY_LABEL || window.label() == super::note_overlay::LABEL
 }
 
 fn is_reminder_window(window: &tauri::WebviewWindow) -> bool {
@@ -369,6 +386,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn handoff_notice_route_is_localized_and_contains_no_recording_controls() {
+        let request = tauri::http::Request::builder()
+            .uri("snack-overlay://localhost/note-notice.html")
+            .body(Vec::new())
+            .unwrap();
+        let response = serve_overlay_request(
+            request,
+            &overlay_locale::payload(i18n::Locale::Zh, i18n::Locale::Zh),
+        );
+        assert_eq!(response.status(), 200);
+        let html = String::from_utf8(response.into_body()).unwrap();
+        assert!(html.contains("上一条录音继续转写"));
+        assert!(html.contains("meeting_get_note_overlay_state"));
+        for control in ["meeting_note_overlay_control", "meeting_note_overlay_action", "fetch('/stop'"] {
+            assert!(!html.contains(control), "notice must remain passive: {control}");
+        }
+    }
+
+    #[test]
     fn overlay_html_includes_native_protocol_stop_fallback() {
         let request = tauri::http::Request::builder()
             .uri("snack-overlay://localhost/index.html")
@@ -394,10 +430,11 @@ mod tests {
         assert!(!html.contains("meeting_set_recording_project"));
         assert!(html.contains("return stopViaProtocol();"));
         assert!(!html.contains("meeting_open_notes_in_chat"));
-        assert!(!html.contains("正在转写"));
-        assert!(!html.contains("转写完成"));
-        assert!(!html.contains("生成纪要"));
-        assert!(!html.contains("做会议纪要"));
+        // Shared locale payloads also contain note-capsule messages; only the legacy UI stays recording-only.
+        assert!(!OVERLAY_HTML.contains("meeting_note_overlay_action"));
+        assert!(!OVERLAY_HTML.contains("transcriptionCompleted"));
+        assert!(!OVERLAY_HTML.contains("retryTranscription"));
+        assert!(!OVERLAY_HTML.contains("current.phase"));
         assert!(html.contains("color-scheme: light"));
         assert!(html.contains(
             "html, body { width: 100%; height: 100%; overflow: hidden; background: transparent; }"
@@ -521,6 +558,7 @@ mod tests {
     #[test]
     fn recording_state_serializes_the_recording_identity() {
         let value = serde_json::to_value(OverlayState::recording(RecordingOverlayState {
+            audio_level_db: Some(-24.0),
             recording_id: "rec-1".to_string(),
             elapsed_ms: 2500,
             mic_active: true,
@@ -540,6 +578,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(value["phase"], "recording");
+        assert_eq!(value["audioLevelDb"], -24.0);
         assert_eq!(value["recordingId"], "rec-1");
         assert_eq!(value["elapsedMs"], 2500);
         assert_eq!(value["displayName"], "Snack会议");

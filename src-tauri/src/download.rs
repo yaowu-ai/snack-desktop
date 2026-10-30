@@ -407,7 +407,7 @@ fn validate_download_id(download_id: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn resolve_snack_file_url(current_url: &Url, raw_url: &str) -> Result<Url, String> {
+pub(crate) fn resolve_snack_file_url(current_url: &Url, raw_url: &str) -> Result<Url, String> {
     let url = if raw_url.starts_with('/') {
         current_url
             .join(raw_url)
@@ -423,17 +423,26 @@ fn resolve_snack_file_url(current_url: &Url, raw_url: &str) -> Result<Url, Strin
     Ok(url)
 }
 
-fn ensure_supported_file_endpoint(url: &Url) -> Result<(), String> {
+pub(crate) fn ensure_supported_file_endpoint(url: &Url) -> Result<(), String> {
     let segments = url
         .path_segments()
         .map(|segments| segments.collect::<Vec<_>>())
         .unwrap_or_default();
 
-    let supported = segments.len() == 5
-        && segments[0] == "api"
-        && is_supported_file_namespace(&segments)
+    let direct_chat = segments.len() == 6
+        && segments[0..3] == ["api", "snack", "direct-chats"]
+        && !segments[3].is_empty()
         && segments[3].chars().all(|ch| ch.is_ascii_digit())
-        && segments[4] == "content";
+        && segments[4] == "attachments"
+        && !segments[5].is_empty()
+        && segments[5].chars().all(|ch| ch.is_ascii_digit());
+    let supported = direct_chat
+        || (segments.len() == 5
+            && segments[0] == "api"
+            && is_supported_file_namespace(&segments)
+            && segments[3].chars().all(|ch| ch.is_ascii_digit())
+            && !segments[3].is_empty()
+            && segments[4] == "content");
 
     if supported {
         Ok(())
@@ -454,7 +463,7 @@ fn ensure_download_query(url: &mut Url) {
     }
 }
 
-fn read_auth_token_cookie(window: &WebviewWindow, url: Url) -> Result<String, String> {
+pub(crate) fn read_auth_token_cookie(window: &WebviewWindow, url: Url) -> Result<String, String> {
     let cookies = window
         .cookies_for_url(url.clone())
         .map_err(|_| "failed to read desktop session cookies".to_string())?;
@@ -499,7 +508,7 @@ fn cookie_domain_matches(cookie_domain: Option<&str>, host: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn sanitize_filename(filename: &str) -> Result<String, String> {
+pub(crate) fn sanitize_filename(filename: &str) -> Result<String, String> {
     let trimmed = filename.trim();
     if trimmed.is_empty() {
         return Err("filename is required".to_string());
@@ -650,6 +659,23 @@ mod tests {
                 .unwrap();
 
         assert!(ensure_supported_file_endpoint(&url).is_ok());
+    }
+
+    #[test]
+    fn accepts_direct_chat_content_without_losing_the_session_context() {
+        let url =
+            Url::parse("https://snack.test/api/snack/direct-chats/7/attachments/42?context=keep")
+                .unwrap();
+        assert!(ensure_supported_file_endpoint(&url).is_ok());
+        for path in [
+            "/api/snack/direct-chats/not-a-session/attachments/42",
+            "/api/snack/direct-chats/7/attachments/not-a-file",
+        ] {
+            assert!(ensure_supported_file_endpoint(
+                &Url::parse(&format!("https://snack.test{path}")).unwrap()
+            )
+            .is_err());
+        }
     }
 
     #[test]

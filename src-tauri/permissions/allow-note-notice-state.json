@@ -1,0 +1,13 @@
+{
+  "default": null,
+  "permission": [
+    {
+      "identifier": "allow-note-notice-state",
+      "description": "Allow the passive recording notice to read its current presentation state.",
+      "commands": {
+        "allow": ["meeting_get_note_overlay_state"],
+        "deny": []
+      }
+    }
+  ]
+}

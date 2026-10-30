@@ -303,11 +303,6 @@ pub(crate) fn show_main_window(app: &AppHandle) {
     }
 }
 
-#[cfg(target_os = "macos")]
-pub(crate) fn should_show_window_on_reopen(has_visible_windows: bool) -> bool {
-    !has_visible_windows
-}
-
 #[cfg(any(target_os = "macos", windows))]
 fn register_status_menu_events(app: &mut tauri::App) {
     app.on_menu_event(|app, event| match event.id().as_ref() {
@@ -515,21 +510,8 @@ pub(crate) fn setup_macos_status_menu(app: &mut tauri::App) -> tauri::Result<()>
 #[cfg(test)]
 #[cfg(target_os = "macos")]
 mod tests {
-    use super::{
-        should_show_window_on_reopen, site_switch_confirmation_description,
-        site_switch_confirmation_title,
-    };
+    use super::{site_switch_confirmation_description, site_switch_confirmation_title};
     use crate::site::SiteKey;
-
-    #[test]
-    fn reopens_hidden_main_window_from_dock() {
-        assert!(should_show_window_on_reopen(false));
-    }
-
-    #[test]
-    fn does_not_steal_focus_when_reopen_finds_visible_windows() {
-        assert!(!should_show_window_on_reopen(true));
-    }
 
     #[test]
     fn site_switch_confirmation_uses_the_target_site_name() {

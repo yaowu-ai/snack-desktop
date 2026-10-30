@@ -16,6 +16,8 @@ mod catalog;
 mod install;
 mod notifications;
 mod note_notifications;
+pub(crate) mod note_overlay;
+mod note_overlay_lifecycle;
 pub(crate) mod overlay;
 pub(crate) mod overlay_locale;
 mod permissions;
@@ -24,6 +26,7 @@ pub(crate) mod quick_access;
 mod reminder;
 #[cfg(target_os = "macos")]
 mod reminder_macos;
+pub(crate) mod shortcut_policy;
 mod state;
 mod transcribe;
 
@@ -129,6 +132,7 @@ pub(crate) struct MeetingSnapshot {
     task: Option<MeetingTask>,
     tasks: Vec<MeetingTask>,
     settings: MeetingSettings,
+    shortcut_policy: Option<shortcut_policy::PolicySnapshot>,
     catalog: Vec<CatalogInfo>,
     permissions: Option<PermissionStatus>,
     disk_free_bytes: Option<u64>,
@@ -141,6 +145,8 @@ struct MeetingCapabilities {
     transcription_task_controls: bool,
     inline_recording: bool,
     deferred_transcription: bool,
+    local_audio_retention: bool,
+    shortcut_policy_migration: bool,
 }
 
 impl MeetingCapabilities {
@@ -150,12 +156,15 @@ impl MeetingCapabilities {
             transcription_task_controls: true,
             inline_recording: true,
             deferred_transcription: true,
+            local_audio_retention: true,
+            shortcut_policy_migration: true,
         }
     }
 }
 
 pub(crate) fn build_snapshot(store: &MeetingStore) -> MeetingSnapshot {
     let resource = store.load_resource();
+    let tasks = store.load_task_records();
     // Permissions are NOT probed here: the ScreenCaptureKit probe can trigger
     // the system permission prompt, and snapshots are emitted frequently
     // (and polled). Explicit checks only (meeting_check_permissions /
@@ -168,8 +177,9 @@ pub(crate) fn build_snapshot(store: &MeetingStore) -> MeetingSnapshot {
         platform: platform_label(),
         resource,
         task: store.load_task(),
-        tasks: store.load_task_records(),
+        tasks,
         settings: store.load_settings(),
+        shortcut_policy: shortcut_policy::snapshot(store),
         catalog: catalog().iter().map(CatalogInfo::from).collect(),
         permissions: None,
         disk_free_bytes: install::free_disk_bytes(store).ok(),
@@ -267,6 +277,15 @@ fn site_switch_is_blocked_by_state(state: TaskState) -> bool {
 
 pub(crate) fn initialize(app: &AppHandle) -> Result<(), String> {
     let store = MeetingStore::open(app)?;
+    if let Err(error) = shortcut_policy::initialize(&store) {
+        crate::logging::write_app_log(
+            app,
+            "warn",
+            "meeting",
+            "shortcut policy unavailable; preserving settings",
+            Some(&serde_json::json!({ "error": error })),
+        );
+    }
     let manager = Arc::new(InstallManager::new());
     let reminder_enabled = store.load_settings().recording_reminder_enabled;
     let reminder = reminder::RecordingReminderMonitor::new(app.clone());
@@ -281,6 +300,7 @@ pub(crate) fn initialize(app: &AppHandle) -> Result<(), String> {
         reminder,
         background_notes_active: AtomicBool::new(false),
     });
+    note_overlay::initialize(app);
 
     // Resource reconciliation (downloads/verification never survive a crash).
     let resource = install::reconcile_resource(&store, &manager);
@@ -321,6 +341,7 @@ pub(crate) fn initialize(app: &AppHandle) -> Result<(), String> {
 }
 
 fn reconcile_tasks(app: &AppHandle, store: &MeetingStore) {
+    let tasks = store.load_task_records();
     let current_task_id = store.load_task().map(|task| task.recording_id);
     if let Some(mut task) = store.load_task() {
         if normalize_retained_task(&mut task) {
@@ -328,7 +349,7 @@ fn reconcile_tasks(app: &AppHandle, store: &MeetingStore) {
         }
         let _ = store.save_task_record(&task);
     }
-    for mut task in store.load_task_records() {
+    for mut task in tasks {
         if normalize_retained_task(&mut task) {
             let _ = store.save_task_progress(&task);
         }
@@ -583,33 +604,16 @@ pub(crate) fn meeting_update_settings(
     app: AppHandle,
     window: WebviewWindow,
     settings: MeetingSettings,
+    shortcut_explicit: Option<bool>,
 ) -> Result<(), String> {
     require_allowed_window(&window)?;
     let state = app.state::<MeetingManagerState>();
-    let previous = state.store.load_settings();
     state.store.prepare_settings(&settings)?;
-    save_and_activate_settings(&app, &state.store, &previous, &settings)?;
+    shortcut_policy::save_user_settings(&app, &state.store, &settings, shortcut_explicit)?;
     state
         .reminder
         .set_enabled(settings.recording_reminder_enabled);
     emit_state(&app, &state.store);
-    Ok(())
-}
-
-fn save_and_activate_settings(
-    app: &AppHandle,
-    store: &MeetingStore,
-    previous: &MeetingSettings,
-    settings: &MeetingSettings,
-) -> Result<(), String> {
-    quick_access::replace_shortcut(app, &previous.shortcut, &settings.shortcut)?;
-    if let Err(error) = store.save_settings(settings) {
-        let rollback = quick_access::replace_shortcut(app, &settings.shortcut, &previous.shortcut);
-        return match rollback {
-            Ok(()) => Err(error),
-            Err(rollback_error) => Err(format!("{error}; 恢复原快捷键失败: {rollback_error}")),
-        };
-    }
     Ok(())
 }
 
@@ -891,12 +895,23 @@ fn start_recording(
 
     let audio_path = store.audio_path(&recording_id);
     let started_millis = unix_millis();
+    let recording_account = shortcut_policy::account_key();
     state.reminder.set_recording_active(true);
     match capture::start_recording(audio_path.clone(), started_millis) {
         Ok(recorder) => {
             *state.recorder.lock().expect("recorder poisoned") = Some(recorder);
+            if let Err(error) = shortcut_policy::mark_started(store, recording_account.as_deref()) {
+                crate::logging::write_app_log(
+                    &app,
+                    "warn",
+                    "meeting",
+                    "recording usage persistence failed",
+                    Some(&serde_json::json!({ "error": error })),
+                );
+            }
             let mut task = store.load_task().ok_or("任务丢失")?;
             task.state = TaskState::Recording;
+            task.recording_account_key = recording_account;
             task.audio_path = Some(audio_path.to_string_lossy().to_string());
             store.save_task(&task)?;
             state.recording_overlay_enabled.store(show_overlay, Ordering::SeqCst);
@@ -942,6 +957,7 @@ fn build_overlay_state(
     status: LiveCaptureStatus,
 ) -> overlay::OverlayState {
     overlay::OverlayState::recording(overlay::RecordingOverlayState {
+        audio_level_db: status.audio_level_db,
         recording_id: task.recording_id.clone(),
         elapsed_ms: status.elapsed_ms,
         mic_active: status.mic_active,
@@ -1292,6 +1308,7 @@ fn update_task_record(
         .recording_task_update
         .lock()
         .expect("recording task update poisoned");
+    let transcript_guard = state::lock_transcript_file_changes();
     let mut task = state
         .store
         .load_task_record(recording_id)
@@ -1299,6 +1316,7 @@ fn update_task_record(
     update(&mut task)?;
     task.updated_at = now_rfc3339();
     state.store.save_task_progress(&task)?;
+    drop(transcript_guard);
     emit_state(app, &state.store);
     refresh_recording_overlay(app);
     Ok(())
@@ -1607,11 +1625,17 @@ fn fail_finalize(app: &AppHandle, store: &MeetingStore, message: String) {
 pub(crate) fn meeting_get_recording_status(
     app: AppHandle,
     window: WebviewWindow,
+    recording_id: Option<String>,
 ) -> Result<Option<LiveCaptureStatus>, String> {
     if !overlay::is_overlay_window(&window) {
         require_allowed_window(&window)?;
     }
     let state = app.state::<MeetingManagerState>();
+    if recording_id.as_ref().is_some_and(|expected| {
+        !state.store.load_task().is_some_and(|task| task.recording_id == *expected)
+    }) {
+        return Ok(None);
+    }
     let guard = state.recorder.lock().expect("recorder poisoned");
     Ok(guard
         .as_ref()
@@ -1890,6 +1914,7 @@ pub(crate) fn meeting_rename_task_record(
     require_allowed_window(&window)?;
     let state = app.state::<MeetingManagerState>();
     let store = state.store.clone_for_task();
+    let guard = state::lock_transcript_file_changes();
     let mut task = store
         .load_task_record(&recording_id)
         .ok_or_else(|| "没有找到本地转写记录".to_string())?;
@@ -1898,6 +1923,7 @@ pub(crate) fn meeting_rename_task_record(
     task.display_name = Some(display_name);
     task.updated_at = now_rfc3339();
     store.save_task_progress(&task)?;
+    drop(guard);
     emit_state(&app, &store);
     Ok(())
 }
@@ -1984,6 +2010,7 @@ pub(crate) fn meeting_retranscribe(
     require_allowed_window(&window)?;
     let state = app.state::<MeetingManagerState>();
     let store = state.store.clone_for_task();
+    let transcript_guard = state::lock_transcript_file_changes();
     let mut task = store
         .load_task_record(&recording_id)
         .ok_or_else(|| "没有找到本地录音".to_string())?;
@@ -2018,6 +2045,7 @@ pub(crate) fn meeting_retranscribe(
     task.error = None;
     task.updated_at = now_rfc3339();
     store.save_task_progress(&task)?;
+    drop(transcript_guard);
     emit_state(&app, &store);
     spawn_transcription(app, store, recording_id);
     Ok(())
@@ -2454,7 +2482,7 @@ fn spawn_overlay_updater(app: AppHandle, recording_id: String) {
                 return;
             };
             overlay::update_overlay(&window, build_overlay_state(&state, &task, status));
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
         }
     });
 }
@@ -2607,6 +2635,7 @@ mod tests {
         value.as_object_mut().unwrap().remove("deferTranscription");
         assert!(!serde_json::from_value::<MeetingTask>(value).unwrap().defer_transcription);
         assert_eq!(serde_json::to_value(MeetingCapabilities::current()).unwrap()["deferredTranscription"], true);
+        assert_eq!(serde_json::to_value(MeetingCapabilities::current()).unwrap()["localAudioRetention"], true);
     }
 
     #[test]
@@ -2805,17 +2834,57 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         let audio_path = root.join("recording.wav");
         let transcript_path = root.join("before.txt");
+        let store = super::MeetingStore::for_test(root.join("state"), root.clone());
         fs::write(&audio_path, b"audio").unwrap();
         fs::write(&transcript_path, b"transcript").unwrap();
         let mut task = MeetingTask::new("rec-title".to_string(), "zh".to_string());
+        task.state = TaskState::TranscriptReady;
         task.audio_path = Some(audio_path.to_string_lossy().into_owned());
         task.transcript_path = Some(transcript_path.to_string_lossy().into_owned());
+        store.save_task(&task).unwrap();
 
+        let guard = super::state::lock_transcript_file_changes();
         rename_transcript_text_file(&mut task, "after.txt").unwrap();
+        // A concurrent history poll must wait until the new path is persisted.
+        let scanner = store.clone_for_task();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            finished_tx.send(scanner.load_task_records()).unwrap();
+        });
+        started_rx.recv().unwrap();
+        assert!(matches!(finished_rx.recv_timeout(std::time::Duration::from_millis(20)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)));
+        store.save_task_progress(&task).unwrap();
+        drop(guard);
+        let records = finished_rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+        reader.join().unwrap();
 
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].transcript_path, task.transcript_path);
+        assert_eq!(store.load_task().unwrap().transcript_path, task.transcript_path);
         assert_eq!(fs::read(&audio_path).unwrap(), b"audio");
         assert!(!transcript_path.exists());
         assert_eq!(fs::read(root.join("after.txt")).unwrap(), b"transcript");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn snapshot_removes_deleted_transcript_history_and_current_pointer_together() {
+        let root = std::env::temp_dir().join(format!(
+            "snack-deleted-transcript-snapshot-{}", super::unix_millis()
+        ));
+        let store = super::MeetingStore::for_test(root.join("state"), root.join("recordings"));
+        let mut task = MeetingTask::new("deleted".into(), "zh".into());
+        task.state = TaskState::TranscriptReady;
+        task.transcript_path = Some(root.join("missing.txt").to_string_lossy().into_owned());
+        store.save_task(&task).unwrap();
+
+        let snapshot = super::build_snapshot(&store);
+
+        assert!(snapshot.tasks.is_empty());
+        assert!(snapshot.task.is_none());
         fs::remove_dir_all(root).unwrap();
     }
 
