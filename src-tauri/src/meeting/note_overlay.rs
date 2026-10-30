@@ -663,6 +663,29 @@ fn should_show(note_visible: bool, main_visible: bool, main_minimized: bool) -> 
     !note_visible || !main_visible || main_minimized
 }
 
+struct OverlayPresentation<'a> {
+    lifecycle_visible: bool,
+    binding: &'a Binding,
+    state: &'a DisplayState,
+    notice: Option<&'a HandoffNotice>,
+    now_ms: u64,
+}
+
+/// Keep foreground handoff presentation independent of the normal note visibility policy.
+fn should_present_overlay(context: OverlayPresentation<'_>) -> bool {
+    context.lifecycle_visible
+        || (context.state.phase == Phase::Recording
+            && context.state.recording_id == context.binding.recording_id
+            && context.state.result_attempt == context.binding.result_attempt
+            && context.state.previous.as_ref().is_some_and(|previous| {
+                previous.phase == Phase::Transcribing
+                    && previous.recording_id != context.binding.recording_id
+            })
+            && context
+                .notice
+                .is_some_and(|notice| notice.is_current(context.binding, context.now_ms)))
+}
+
 fn display_state(app: &AppHandle, binding: &Binding) -> DisplayState {
     let manager = app.state::<MeetingManagerState>();
     let task = manager
@@ -977,9 +1000,16 @@ fn refresh_on_main_thread(app: &AppHandle, reset_position: bool) -> Result<(), S
         data.previous_binding = None;
     }
     attach_deck_state(app, &data, &binding, &mut state);
-    let show = update_lifecycle(app, &binding, |lifecycle| {
+    let lifecycle_visible = update_lifecycle(app, &binding, |lifecycle| {
         lifecycle.should_show(activity, note_visible, result_viewed, now)
     })?;
+    let show = should_present_overlay(OverlayPresentation {
+        lifecycle_visible,
+        binding: &binding,
+        state: &state,
+        notice: data.handoff_notice.as_ref(),
+        now_ms: now,
+    });
     if !show {
         hide(app);
         return Ok(());
@@ -1010,7 +1040,28 @@ fn refresh_on_main_thread(app: &AppHandle, reset_position: bool) -> Result<(), S
     // A failed native show/emit must not consume the five-second result opportunity.
     if emitted && window.is_visible().unwrap_or(false) {
         if let Some(notice) = data.handoff_notice.as_mut() {
+            let first_presentation = notice.presented_at_ms.is_none();
             notice.presented_at_ms.get_or_insert(now);
+            if first_presentation
+                && state
+                    .previous
+                    .as_ref()
+                    .is_some_and(|previous| previous.phase == Phase::Transcribing)
+            {
+                crate::logging::write_app_log(
+                    app,
+                    "info",
+                    "note-overlay",
+                    "recording handoff presented",
+                    Some(&serde_json::json!({
+                        "handoffId": notice.id,
+                        "recordingId": binding.recording_id,
+                        "previousRecordingId": state.previous.as_ref().map(|previous| &previous.recording_id),
+                        "noteVisible": note_visible,
+                        "mainVisible": main.is_visible().unwrap_or(false),
+                    })),
+                );
+            }
         }
         update_lifecycle(app, &binding, |lifecycle| {
             lifecycle.presented(activity, now)
@@ -2127,6 +2178,89 @@ mod tests {
         other = next.clone();
         other.recording_id = "rec-c".into();
         assert!(!notice.is_current(&other, 80_001));
+    }
+
+    fn handoff_display_state(current: &Binding, previous_phase: Phase) -> DisplayState {
+        DisplayState {
+            recording_id: current.recording_id.clone(),
+            result_attempt: current.result_attempt.clone(),
+            phase: Phase::Recording,
+            elapsed_ms: 0,
+            paused: false,
+            can_dismiss: false,
+            handoff_notice_id: None,
+            previous: Some(PreviousDisplayState {
+                recording_id: "rec-a".into(),
+                result_attempt: "capture".into(),
+                phase: previous_phase,
+            }),
+            capsule_top: geometry::CAPSULE_TOP,
+            stack_above: false,
+        }
+    }
+
+    #[test]
+    fn foreground_handoff_overrides_note_visibility_only_during_the_intro() {
+        let binding = handoff_binding("rec-b", Phase::Recording);
+        let state = handoff_display_state(&binding, Phase::Transcribing);
+        let mut notice = HandoffNotice {
+            id: "foreground-intro".into(),
+            key: binding.lifecycle_key(),
+            created_at_ms: 1_000,
+            presented_at_ms: None,
+        };
+        let present = |notice: &HandoffNotice, now_ms| {
+            should_present_overlay(OverlayPresentation {
+                lifecycle_visible: should_show(true, true, false),
+                binding: &binding,
+                state: &state,
+                notice: Some(notice),
+                now_ms,
+            })
+        };
+        assert!(
+            present(&notice, 1_001),
+            "the new note page must not suppress its handoff intro"
+        );
+        notice.presented_at_ms = Some(2_000);
+        assert!(present(&notice, 5_559));
+        assert!(
+            !present(&notice, 5_560),
+            "the normal foreground hiding policy resumes after the intro"
+        );
+    }
+
+    #[test]
+    fn foreground_handoff_requires_the_owned_current_capture_and_a_transcribing_previous_card() {
+        let binding = handoff_binding("rec-b", Phase::Recording);
+        let mut state = handoff_display_state(&binding, Phase::Transcribing);
+        let mut notice = HandoffNotice {
+            id: "foreground-intro".into(),
+            key: binding.lifecycle_key(),
+            created_at_ms: 1_000,
+            presented_at_ms: None,
+        };
+        let present = |state: &DisplayState, notice: Option<&HandoffNotice>| {
+            should_present_overlay(OverlayPresentation {
+                lifecycle_visible: false,
+                binding: &binding,
+                state,
+                notice,
+                now_ms: 1_001,
+            })
+        };
+        assert!(!present(&state, None));
+        state.previous.as_mut().unwrap().phase = Phase::Completed;
+        assert!(!present(&state, Some(&notice)));
+        state.previous.as_mut().unwrap().phase = Phase::Transcribing;
+        state.phase = Phase::Ended;
+        assert!(!present(&state, Some(&notice)));
+        state.phase = Phase::Recording;
+        notice.key.scope_key = "another-owner".into();
+        assert!(!present(&state, Some(&notice)));
+        notice.key = binding.lifecycle_key();
+        notice.key.recording_id = "rec-c".into();
+        assert!(!present(&state, Some(&notice)));
     }
 
     #[test]
