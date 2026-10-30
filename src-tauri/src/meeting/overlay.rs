@@ -387,17 +387,20 @@ mod tests {
 
     #[test]
     fn handoff_notice_route_is_localized_and_contains_no_recording_controls() {
+        let locale = overlay_locale::payload(i18n::Locale::Zh, i18n::Locale::Zh);
+        let message = locale["messages"]["backgroundTranscription"]
+            .as_str()
+            .unwrap();
+        assert!(!message.trim().is_empty());
         let request = tauri::http::Request::builder()
             .uri("snack-overlay://localhost/note-notice.html")
             .body(Vec::new())
             .unwrap();
-        let response = serve_overlay_request(
-            request,
-            &overlay_locale::payload(i18n::Locale::Zh, i18n::Locale::Zh),
-        );
+        let response = serve_overlay_request(request, &locale);
         assert_eq!(response.status(), 200);
         let html = String::from_utf8(response.into_body()).unwrap();
-        assert!(html.contains("上一条录音继续转写"));
+        assert!(html.contains(&overlay_locale::serialize(&locale)));
+        assert!(html.contains("window.snackText('backgroundTranscription')"));
         assert!(html.contains("meeting_get_note_overlay_state"));
         for control in ["meeting_note_overlay_control", "meeting_note_overlay_action", "fetch('/stop'"] {
             assert!(!html.contains(control), "notice must remain passive: {control}");
