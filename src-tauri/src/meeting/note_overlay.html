@@ -49,11 +49,6 @@
   .previous-card[data-mode="receipt"] .previous-surface { width: 188px; height: 64px; margin-left: 4.5px; border-radius: 36px; box-shadow: 0 3px 8px -3px rgba(0,0,0,.12); }
   .previous-identity { position: absolute; left: 15px; top: 50%; transform: translateY(-50%); }
   .previous-status { display: flex; align-items: center; gap: 4px; font-size: 14px; line-height: 20px; white-space: nowrap; }
-  #previous-open { position: absolute; left: 164px; top: 19px; }
-  .deck-peek { position: absolute; bottom: 0; left: 0; width: 100%; height: 28px; display: flex; align-items: center; justify-content: center; gap: 6px; padding: 0 14px; border: 0; background: transparent; color: #475569; font-size: 11px; line-height: 16px; white-space: nowrap; cursor: pointer; }
-  .deck-peek img { width: 5px; height: 5px; }
-  html[data-stack-above="true"] .deck-peek { top: 0; bottom: auto; }
-  #recording-peek-time { font-variant-numeric: tabular-nums; }
   #handoff-notice { position: absolute; left: -1px; top: -1px; width: 188px; height: 64px; border-radius: 36px; display: flex; align-items: flex-start; gap: 8px; padding: 10px 12px; pointer-events: none; }
   #handoff-notice > img { flex: 0 0 auto; width: 18px; height: 18px; margin-top: 3px; }
   #handoff-title { font-size: 14px; font-weight: 500; line-height: 20px; white-space: nowrap; }
@@ -71,13 +66,11 @@
 </head>
 <body>
   <div id="deck" data-deck-view="recording">
-  <div class="previous-card" id="previous-card" data-mode="back" hidden>
+  <div class="previous-card" id="previous-card" data-mode="full" hidden>
     <div class="previous-surface">
       <div id="previous-full" hidden>
-        <div class="previous-identity"><div class="logo"><img src="/note-assets/logo.png" alt="Snack" /></div><div class="previous-status"><img id="previous-status-icon" src="/note-assets/transcribing.svg" width="16" height="16" alt="" /><span id="previous-label"></span></div></div>
-        <button class="open-action" id="previous-open" type="button" data-i18n-label="viewPreviousTranscription"><img src="/note-assets/open-note.svg" alt="" /></button>
+        <div class="previous-identity"><div class="logo"><img src="/note-assets/logo.png" alt="Snack" /></div><div class="previous-status"><img id="previous-status-icon" src="/note-assets/success.svg" width="16" height="16" alt="" /><span id="previous-label"></span></div></div>
       </div>
-      <button class="deck-peek" id="previous-peek" type="button" data-i18n-label="viewPreviousTranscription"><span id="previous-peek-label"></span></button>
       <div id="handoff-notice" role="status" aria-live="polite" aria-atomic="true" hidden><img src="/note-assets/success.svg" alt="" /><div><div id="handoff-title"></div><div id="handoff-description"></div></div></div>
     </div>
   </div>
@@ -99,7 +92,6 @@
     <button class="open-action result-open" id="result-open" type="button" data-i18n-label="openNote" hidden><img src="/note-assets/open-note-processing.svg" alt="" /></button>
     <button class="result-action" id="result-action" type="button" hidden></button>
     </div>
-    <button class="deck-peek" id="recording-peek" type="button" data-i18n-label="backToCurrentRecording" hidden><img src="/note-assets/recording-dot.svg" alt="" /><span id="recording-peek-label"></span><span id="recording-peek-time"></span></button>
     <div class="sr-only" id="live-status" role="status" aria-live="polite"></div>
   </div>
   </div>
@@ -218,9 +210,7 @@
           perform(withTimeout(invoke('meeting_note_overlay_action', { expectedRecordingId: current.recordingId, expectedResultAttempt: current.resultAttempt, expectedPhase: current.phase, action: 'dismiss' })), 'dismissFailed');
         }
       });
-      deck = window.createSnackRecordingDeck({ capsule: capsule, openPrevious: function (previous) {
-        if (!pending) perform(withTimeout(invoke('meeting_note_overlay_action', { expectedRecordingId: previous.recordingId, expectedResultAttempt: previous.resultAttempt, action: 'open' })), 'openNoteFailed');
-      } });
+      deck = window.createSnackRecordingDeck({ capsule: capsule });
       window.renderSnackLocale = render;
       render();
       try {

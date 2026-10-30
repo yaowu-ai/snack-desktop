@@ -113,8 +113,8 @@ pub(crate) enum ActionKind {
 #[derive(Debug, Default)]
 struct RuntimeData {
     binding: Option<Binding>,
-    // A displaced transcription is retained only for explicit read-only navigation while the
-    // current capture is running. It never becomes the active binding or a result reminder.
+    // A displaced transcription exists only during the handoff intro. Its background task
+    // and retired lifecycle outlive this temporary presentation binding.
     previous_binding: Option<Binding>,
     handoff_candidate: Option<LifecycleKey>,
     pending_action: Option<Action>,
@@ -135,6 +135,29 @@ impl HandoffNotice {
         self.key == binding.lifecycle_key()
             && now_ms.saturating_sub(self.presented_at_ms.unwrap_or(self.created_at_ms))
                 < HANDOFF_NOTICE_MS
+    }
+}
+
+struct HandoffLifetime<'a> {
+    binding: &'a Binding,
+    phase: Phase,
+    now_ms: u64,
+}
+
+impl RuntimeData {
+    fn has_current_handoff(&self, context: &HandoffLifetime<'_>) -> bool {
+        context.phase == Phase::Recording
+            && self
+                .handoff_notice
+                .as_ref()
+                .is_some_and(|notice| notice.is_current(context.binding, context.now_ms))
+    }
+
+    fn expire_handoff(&mut self, context: HandoffLifetime<'_>) {
+        if !self.has_current_handoff(&context) {
+            self.handoff_notice = None;
+            self.previous_binding = None;
+        }
     }
 }
 
@@ -675,10 +698,11 @@ fn should_present_overlay(context: OverlayPresentation<'_>) -> bool {
         || (context.state.phase == Phase::Recording
             && context.state.recording_id == context.binding.recording_id
             && context.state.result_attempt == context.binding.result_attempt
-            && context.state.previous.as_ref().is_some_and(|previous| {
-                previous.phase == Phase::Transcribing
-                    && previous.recording_id != context.binding.recording_id
-            })
+            && context
+                .state
+                .previous
+                .as_ref()
+                .is_some_and(|previous| previous.recording_id != context.binding.recording_id)
             && context
                 .notice
                 .is_some_and(|notice| notice.is_current(context.binding, context.now_ms)))
@@ -733,7 +757,11 @@ fn attach_deck_state(
     binding: &Binding,
     state: &mut DisplayState,
 ) {
-    if state.phase == Phase::Recording {
+    if data.has_current_handoff(&HandoffLifetime {
+        binding,
+        phase: state.phase,
+        now_ms: super::state::unix_millis(),
+    }) {
         state.previous = data
             .previous_binding
             .as_ref()
@@ -748,9 +776,6 @@ fn attach_deck_state(
             })
             .and_then(|previous| {
                 let previous_state = display_state(app, previous);
-                if is_summary_phase(previous_state.phase) {
-                    return None;
-                }
                 Some(PreviousDisplayState {
                     recording_id: previous.recording_id.clone(),
                     result_attempt: previous.result_attempt.clone(),
@@ -987,16 +1012,11 @@ fn refresh_on_main_thread(app: &AppHandle, reset_position: bool) -> Result<(), S
     let result_viewed =
         note_visible && main.is_focused().unwrap_or(false) && binding.phase == state.phase;
     let now = super::state::unix_millis();
-    if data
-        .handoff_notice
-        .as_ref()
-        .is_some_and(|notice| state.phase != Phase::Recording || !notice.is_current(&binding, now))
-    {
-        data.handoff_notice = None;
-    }
-    if state.phase != Phase::Recording {
-        data.previous_binding = None;
-    }
+    data.expire_handoff(HandoffLifetime {
+        binding: &binding,
+        phase: state.phase,
+        now_ms: now,
+    });
     attach_deck_state(app, &data, &binding, &mut state);
     let lifecycle_visible = update_lifecycle(app, &binding, |lifecycle| {
         lifecycle.should_show(activity, note_visible, result_viewed, now)
@@ -1044,7 +1064,7 @@ fn refresh_on_main_thread(app: &AppHandle, reset_position: bool) -> Result<(), S
                 && state
                     .previous
                     .as_ref()
-                    .is_some_and(|previous| previous.phase == Phase::Transcribing)
+                    .is_some_and(|previous| previous.recording_id != binding.recording_id)
             {
                 crate::logging::write_app_log(
                     app,
@@ -1396,13 +1416,11 @@ pub(crate) fn meeting_get_note_overlay_state(
         .ok_or("note overlay is no longer bound")?;
     let mut state = display_state(&app, &binding);
     let now = super::state::unix_millis();
-    if data
-        .handoff_notice
-        .as_ref()
-        .is_some_and(|notice| state.phase != Phase::Recording || !notice.is_current(&binding, now))
-    {
-        data.handoff_notice = None;
-    }
+    data.expire_handoff(HandoffLifetime {
+        binding: &binding,
+        phase: state.phase,
+        now_ms: now,
+    });
     if visible
         && app
             .get_webview_window("main")
@@ -2193,6 +2211,81 @@ mod tests {
         assert!(!notice.is_current(&other, 80_001));
     }
 
+    fn handoff_runtime(binding: &Binding) -> RuntimeData {
+        RuntimeData {
+            binding: Some(binding.clone()),
+            previous_binding: Some(handoff_binding("rec-a", Phase::Transcribing)),
+            handoff_notice: Some(HandoffNotice {
+                id: "temporary-handoff".into(),
+                key: binding.lifecycle_key(),
+                created_at_ms: 1_000,
+                presented_at_ms: None,
+            }),
+            ..RuntimeData::default()
+        }
+    }
+
+    #[test]
+    fn handoff_expiry_releases_the_previous_card_but_keeps_the_current_binding() {
+        let binding = handoff_binding("rec-b", Phase::Recording);
+        let mut data = handoff_runtime(&binding);
+        let context = |now_ms| HandoffLifetime {
+            binding: &binding,
+            phase: Phase::Recording,
+            now_ms,
+        };
+        // Bootstrap may read the pending card before its first native presentation.
+        assert!(data.has_current_handoff(&context(1_001)));
+        data.handoff_notice.as_mut().unwrap().presented_at_ms = Some(2_000);
+        data.expire_handoff(context(5_559));
+        assert!(data.previous_binding.is_some());
+        data.expire_handoff(context(5_560));
+        assert!(data.handoff_notice.is_none());
+        assert!(data.previous_binding.is_none());
+        assert_eq!(data.binding.unwrap().recording_id, binding.recording_id);
+    }
+
+    #[test]
+    fn a_missing_notice_cannot_keep_an_orphan_previous_card_alive() {
+        let binding = handoff_binding("rec-b", Phase::Recording);
+        let mut data = handoff_runtime(&binding);
+        data.handoff_notice = None;
+        let context = HandoffLifetime {
+            binding: &binding,
+            phase: Phase::Recording,
+            now_ms: 1_001,
+        };
+        assert!(!data.has_current_handoff(&context));
+        data.expire_handoff(context);
+        assert!(data.previous_binding.is_none());
+        assert_eq!(data.binding.unwrap().recording_id, binding.recording_id);
+    }
+
+    #[test]
+    fn handoff_cleanup_keeps_owner_and_attempt_isolation() {
+        let binding = handoff_binding("rec-b", Phase::Recording);
+        for mismatch in ["origin", "scope", "recording", "attempt", "phase"] {
+            let mut data = handoff_runtime(&binding);
+            let mut current = binding.clone();
+            let mut phase = Phase::Recording;
+            match mismatch {
+                "origin" => current.origin = "https://other.test".into(),
+                "scope" => current.scope_key = "another-owner".into(),
+                "recording" => current.recording_id = "rec-c".into(),
+                "attempt" => current.result_attempt = "retry".into(),
+                _ => phase = Phase::Ended,
+            }
+            data.expire_handoff(HandoffLifetime {
+                binding: &current,
+                phase,
+                now_ms: 1_001,
+            });
+            assert!(data.previous_binding.is_none(), "{mismatch}");
+            assert!(data.handoff_notice.is_none(), "{mismatch}");
+            assert_eq!(data.binding.unwrap().recording_id, binding.recording_id);
+        }
+    }
+
     fn handoff_display_state(current: &Binding, previous_phase: Phase) -> DisplayState {
         DisplayState {
             recording_id: current.recording_id.clone(),
@@ -2244,7 +2337,7 @@ mod tests {
     }
 
     #[test]
-    fn foreground_handoff_requires_the_owned_current_capture_and_a_transcribing_previous_card() {
+    fn foreground_handoff_requires_the_owned_current_capture_and_previous_card() {
         let binding = handoff_binding("rec-b", Phase::Recording);
         let mut state = handoff_display_state(&binding, Phase::Transcribing);
         let mut notice = HandoffNotice {
@@ -2263,9 +2356,20 @@ mod tests {
             })
         };
         assert!(!present(&state, None));
-        state.previous.as_mut().unwrap().phase = Phase::Completed;
-        assert!(!present(&state, Some(&notice)));
-        state.previous.as_mut().unwrap().phase = Phase::Transcribing;
+        for phase in [
+            Phase::Completed,
+            Phase::Failed,
+            Phase::RecordingFailed,
+            Phase::SummaryGenerating,
+            Phase::SummaryCompleted,
+            Phase::SummaryFailed,
+        ] {
+            state.previous.as_mut().unwrap().phase = phase;
+            assert!(
+                present(&state, Some(&notice)),
+                "the neutral handoff receipt remains visible for {phase:?}"
+            );
+        }
         state.phase = Phase::Ended;
         assert!(!present(&state, Some(&notice)));
         state.phase = Phase::Recording;

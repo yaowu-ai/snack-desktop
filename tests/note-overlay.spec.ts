@@ -65,6 +65,17 @@ async function emitState(page: Page, state: Record<string, unknown>) {
   await page.evaluate((payload) => (window as any).noteStateHandler({ payload }), state);
 }
 
+async function expectPreviousRetired(page: Page) {
+  for (const selector of ['#previous-card', '#previous-full', '#previous-peek', '#previous-open', '#recording-peek']) {
+    const elements = page.locator(selector);
+    await expect(elements).toBeHidden();
+    expect(await elements.evaluateAll((items) => items.every((item) => Boolean(item.closest('[inert]'))))).toBe(true);
+  }
+  await expect(page.locator('#handoff-notice')).toBeHidden();
+  await expect(page.locator('#current-content')).toHaveJSProperty('inert', false);
+  await expect(page.locator('#deck')).toHaveAttribute('data-deck-view', 'recording');
+}
+
 test('Figma capsule retains its geometry and local asset slots across every state', async ({ page }) => {
   await openSurface(page);
   await expect(page.locator('#duration')).toHaveText('00:12:23');
@@ -142,15 +153,40 @@ test('handoff shows a compact green confirmation for three seconds without repla
   }));
   expect(style).toEqual({ radius: '36px', pointerEvents: 'none' });
   expect(await page.locator('#capsule').boundingBox()).toEqual({ x: 33, y: 13, width: 197, height: 72 });
+  await page.screenshot({ path: 'test-results/recording-handoff-toast-visible.png' });
   await page.clock.runFor(2000);
   await emitState(page, { ...state, elapsedMs: 5000 });
   await page.clock.runFor(1001);
-  await expect(page.locator('#handoff-notice')).toBeHidden();
-  await expect(page.locator('#previous-card')).toHaveAttribute('data-mode', 'back');
-  await expect(page.locator('#previous-peek')).toBeVisible();
+  await expectPreviousRetired(page);
+  await page.screenshot({ path: 'test-results/recording-handoff-toast-expired.png' });
   await emitState(page, state);
-  await expect(page.locator('#handoff-notice')).toBeHidden();
+  await expectPreviousRetired(page);
 });
+
+for (const previousPhase of ['completed', 'failed']) {
+  test(`an old ${previousPhase} update keeps the neutral receipt until its original deadline`, async ({ page }) => {
+    await page.clock.install();
+    await page.clock.pauseAt(new Date(Date.now() + 60_000));
+    await openSurface(page);
+    const state = handoffState();
+    await emitState(page, state);
+    await page.clock.runFor(81);
+    await expect(page.locator('#handoff-title')).toHaveText('上一条录音已保留');
+    await page.clock.runFor(1000);
+    const updated = { ...state, previous: { ...state.previous, phase: previousPhase } };
+    await emitState(page, updated);
+    await expect(page.locator('#handoff-notice')).toBeVisible();
+    await expect(page.locator('#handoff-title')).toHaveText('上一条录音已保留');
+    await expect(page.locator('#handoff-description')).toHaveText('首页「会议录音」可查看');
+    await page.clock.runFor(1998);
+    await expect(page.locator('#handoff-notice')).toBeVisible();
+    await page.clock.runFor(2);
+    await expectPreviousRetired(page);
+    await emitState(page, updated);
+    await page.clock.runFor(1000);
+    await expectPreviousRetired(page);
+  });
+}
 
 test('a new recording clears the previous animation and cannot show its stale confirmation', async ({ page }) => {
   await page.clock.install();
@@ -166,33 +202,23 @@ test('a new recording clears the previous animation and cannot show its stale co
   await expect(page.locator('#duration')).toHaveText('00:00:07');
 });
 
-test('previous transcription is read-only while pause and stop remain bound to the current recording', async ({ page }) => {
+test('expired handoff leaves only the current recording controls and never sends actions to the old recording', async ({ page }) => {
   await page.clock.install();
   await page.clock.pauseAt(new Date(Date.now() + 60_000));
   await openSurface(page);
   await emitState(page, handoffState());
   await page.clock.runFor(3300);
-  await page.locator('#previous-peek').click();
-  await page.clock.runFor(150);
-  await expect(page.locator('#deck')).toHaveAttribute('data-deck-view', 'previous');
-  await expect(page.locator('#current-content')).toBeHidden();
-  await expect(page.locator('#recording-peek')).toBeVisible();
-  await expect(page.locator('#recording-peek')).toContainText('00:00:03');
-  await page.locator('#previous-open').click();
+  await expectPreviousRetired(page);
   await emitState(page, handoffState({ elapsedMs: 9000, handoffNoticeId: undefined }));
-  await expect(page.locator('#deck')).toHaveAttribute('data-deck-view', 'previous');
-  await expect(page.locator('#recording-peek')).toContainText('00:00:09');
-  await page.locator('#recording-peek').click();
-  await page.clock.runFor(150);
-  await expect(page.locator('#deck')).toHaveAttribute('data-deck-view', 'recording');
+  await expectPreviousRetired(page);
+  await expect(page.locator('#duration')).toHaveText('00:00:09');
   await page.locator('#pause').click();
   await page.locator('#stop').click();
   const calls = await page.evaluate(() => (window as any).noteCalls);
-  expect(calls).toContainEqual({ command: 'meeting_note_overlay_action', args: { expectedRecordingId: 'rec-a', expectedResultAttempt: 'capture', action: 'open' } });
   expect(calls).toContainEqual({ command: 'meeting_note_overlay_control', args: { expectedRecordingId: 'rec-b', paused: true } });
   expect(calls).toContainEqual({ command: 'meeting_note_overlay_control', args: { expectedRecordingId: 'rec-b' } });
   expect(calls.filter((call: { command: string; args?: { expectedRecordingId?: string } }) =>
-    call.command === 'meeting_note_overlay_control' && call.args?.expectedRecordingId === 'rec-a')).toEqual([]);
+    ['meeting_note_overlay_control', 'meeting_note_overlay_action'].includes(call.command) && call.args?.expectedRecordingId === 'rec-a')).toEqual([]);
 });
 
 test('leaving recording hides both deck cards and does not replay the consumed handoff', async ({ page }) => {
@@ -224,16 +250,8 @@ for (const stackAbove of [false, true]) {
     expect(notice).toEqual({ x: 37.5, y: stackAbove ? 13 : 97, width: 188, height: 64 });
     expect(notice!.y + notice!.height).toBeLessThanOrEqual(192);
     await page.clock.runFor(3300);
-    await page.locator('#previous-peek').click();
-    await page.clock.runFor(150);
-    for (const selector of ['#capsule', '#previous-card', '#recording-peek']) {
-      const bounds = await page.locator(selector).boundingBox();
-      expect(bounds).not.toBeNull();
-      expect(bounds!.x).toBeGreaterThanOrEqual(0);
-      expect(bounds!.y).toBeGreaterThanOrEqual(0);
-      expect(bounds!.x + bounds!.width).toBeLessThanOrEqual(263);
-      expect(bounds!.y + bounds!.height).toBeLessThanOrEqual(192);
-    }
+    await expectPreviousRetired(page);
+    expect(await page.locator('#capsule').boundingBox()).toEqual({ x: 33, y: capsuleTop, width: 197, height: 72 });
   });
 }
 
@@ -267,26 +285,22 @@ test('handoff makes moving controls inert and restores only the foreground card 
   await expect(page.locator('#previous-full')).toHaveJSProperty('inert', true);
   await expect(page.locator('#pause')).toBeEnabled();
   await page.clock.runFor(3300);
-  await page.locator('#previous-peek').click();
-  await expect(page.locator('#previous-full')).toHaveJSProperty('inert', false);
+  await expectPreviousRetired(page);
+  await expect(page.locator('#pause')).toBeEnabled();
+  await expect(page.locator('#stop')).toBeEnabled();
 });
 
-test('native ticks cannot change the receipt geometry before its closing animation finishes', async ({ page }) => {
+test('native ticks near expiry cannot keep the previous receipt or controls alive', async ({ page }) => {
   await page.clock.install();
   await page.clock.pauseAt(new Date(Date.now() + 60_000));
   await openSurface(page, 'recording', false, false, false, { motion: 'no-preference' });
   const state = handoffState();
   await emitState(page, state);
-  await page.clock.runFor(3561);
-  await expect(page.locator('#previous-card')).toHaveAttribute('data-mode', 'receipt');
-  await page.clock.runFor(100);
+  await page.clock.runFor(3500);
+  await expect(page.locator('#handoff-notice')).toBeVisible();
   await emitState(page, { ...state, elapsedMs: 6500 });
-  await expect(page.locator('#previous-card')).toHaveAttribute('data-mode', 'receipt');
-  await page.clock.runFor(118);
-  await expect(page.locator('#previous-card')).toHaveAttribute('data-mode', 'receipt');
-  await page.clock.runFor(2);
-  await expect(page.locator('#previous-card')).toHaveAttribute('data-mode', 'back');
-  await expect(page.locator('#previous-peek')).toBeVisible();
+  await page.clock.runFor(281);
+  await expectPreviousRetired(page);
 });
 
 test('a late bootstrap response cannot replace a newer recording event or reset its notice', async ({ page }) => {
@@ -300,7 +314,99 @@ test('a late bootstrap response cannot replace a newer recording event or reset 
   await expect(page.locator('#duration')).toHaveText('00:00:03');
   await expect(page.locator('#handoff-notice')).toBeVisible();
   await page.clock.runFor(3001);
-  await expect(page.locator('#handoff-notice')).toBeHidden();
+  await expectPreviousRetired(page);
+});
+
+test('a previous card without a fresh handoff notice is never shown', async ({ page }) => {
+  await page.clock.install();
+  await page.clock.pauseAt(new Date(Date.now() + 60_000));
+  await openSurface(page);
+  await emitState(page, handoffState({ handoffNoticeId: undefined }));
+  await expectPreviousRetired(page);
+  await page.clock.runFor(5000);
+  await expectPreviousRetired(page);
+  await expect(page.locator('#pause')).toBeEnabled();
+});
+
+test('local expiry keeps the current capsule opaque until native restores its backdrop', async ({ page }) => {
+  await page.clock.install();
+  await page.clock.pauseAt(new Date(Date.now() + 60_000));
+  await openSurface(page);
+  await page.evaluate(() => { document.documentElement.dataset.backdrop = 'native'; });
+  const state = handoffState();
+  await emitState(page, state);
+  await page.clock.runFor(3300);
+  await expectPreviousRetired(page);
+  await expect(page.locator('#capsule')).toHaveCSS('background-color', 'rgb(255, 255, 255)');
+  await emitState(page, { ...state, previous: null, handoffNoticeId: undefined });
+  await expectPreviousRetired(page);
+  await expect(page.locator('#capsule')).toHaveCSS('background-color', 'rgba(0, 0, 0, 0)');
+});
+
+test('failed or completed old-state updates never resurrect an expired handoff', async ({ page }) => {
+  await page.clock.install();
+  await page.clock.pauseAt(new Date(Date.now() + 60_000));
+  await openSurface(page);
+  const state = handoffState();
+  await emitState(page, state);
+  await page.clock.runFor(3300);
+  await expectPreviousRetired(page);
+  for (const phase of ['failed', 'recording_failed', 'completed', 'transcribing']) {
+    await emitState(page, { ...state, elapsedMs: 41000, previous: { ...state.previous, phase } });
+    await expectPreviousRetired(page);
+  }
+  await page.clock.runFor(41000);
+  await expectPreviousRetired(page);
+  await expect(page.locator('#duration')).toHaveText('00:00:41');
+});
+
+test('changing stack direction cannot replay or extend the current confirmation', async ({ page }) => {
+  await page.clock.install();
+  await page.clock.pauseAt(new Date(Date.now() + 60_000));
+  await openSurface(page, 'recording', false, false, false, { motion: 'no-preference' });
+  const state = handoffState();
+  await emitState(page, state);
+  await page.clock.runFor(561);
+  await expect(page.locator('#handoff-notice')).toBeVisible();
+  await page.clock.runFor(2000);
+  await emitState(page, { ...state, capsuleTop: 97, stackAbove: true });
+  await page.clock.runFor(1220);
+  await expectPreviousRetired(page);
+  await emitState(page, state);
+  await page.clock.runFor(1000);
+  await expectPreviousRetired(page);
+});
+
+test('a late initial state cannot revive a confirmation after its deadline', async ({ page }) => {
+  await page.clock.install();
+  await page.clock.pauseAt(new Date(Date.now() + 60_000));
+  await openSurface(page, 'recording', false, false, false, { deferBootstrap: true });
+  const state = handoffState();
+  await emitState(page, state);
+  await page.clock.runFor(3300);
+  await expectPreviousRetired(page);
+  await page.evaluate((payload) => (window as any).resolveNoteBootstrap(payload), state);
+  await page.clock.runFor(1000);
+  await expectPreviousRetired(page);
+});
+
+test('a new handoff identity can show one new confirmation after an earlier one expires', async ({ page }) => {
+  await page.clock.install();
+  await page.clock.pauseAt(new Date(Date.now() + 60_000));
+  await openSurface(page);
+  await emitState(page, handoffState());
+  await page.clock.runFor(3300);
+  await expectPreviousRetired(page);
+  const next = handoffState({ recordingId: 'rec-c', handoffNoticeId: 'b-to-c',
+    previous: { recordingId: 'rec-b', resultAttempt: 'capture', phase: 'transcribing' } });
+  await emitState(page, next);
+  await page.clock.runFor(81);
+  await expect(page.locator('#handoff-notice')).toBeVisible();
+  await page.clock.runFor(3220);
+  await expectPreviousRetired(page);
+  await emitState(page, next);
+  await page.clock.runFor(1000);
+  await expectPreviousRetired(page);
 });
 
 test('controls carry the rendered recording identity and retry delegates to Web', async ({ page }) => {

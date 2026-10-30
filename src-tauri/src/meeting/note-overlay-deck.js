@@ -6,11 +6,8 @@
     var root = document.getElementById('deck');
     var previousCard = document.getElementById('previous-card');
     var previousFull = document.getElementById('previous-full');
-    var previousPeek = document.getElementById('previous-peek');
     var currentContent = document.getElementById('current-content');
-    var recordingPeek = document.getElementById('recording-peek');
     var notice = document.getElementById('handoff-notice');
-    var previousOpen = document.getElementById('previous-open');
     var media = window.matchMedia('(prefers-reduced-motion: reduce)');
     var current = {};
     var identity = '';
@@ -22,13 +19,7 @@
     var animations = [];
     var consumed = new Set();
     var receiptVisible = false;
-    var closingReceipt = false;
-    var pending = false;
-    var phaseKeys = {
-      transcribing: 'transcribing', completed: 'transcriptionCompleted',
-      failed: 'transcriptionFailed', recording_failed: 'recordingFailed',
-      transcription_paused: 'transcriptionPaused', ended: 'recordingEnded'
-    };
+
 
     function key(value) {
       return value ? value.recordingId + ':' + (value.resultAttempt || 'capture') : '';
@@ -45,7 +36,6 @@
       timers = [];
       animations.forEach(function (animation) { animation.cancel(); });
       animations = [];
-      closingReceipt = false;
       options.capsule.style.willChange = previousCard.style.willChange = '';
     }
 
@@ -54,7 +44,6 @@
     }
 
     function front() { return pose(0, 0, 0, 1); }
-    function back() { return pose(24, media.matches ? 0 : -4, media.matches ? 0 : -32, .95); }
     function receipt() { return pose(84, 0, 0, 1); }
     function duration(value) { return media.matches ? 80 : value; }
 
@@ -71,58 +60,46 @@
     function mode(next) {
       previousCard.dataset.mode = next;
       previousFull.hidden = next !== 'full';
-      previousPeek.hidden = next !== 'back';
       notice.hidden = next !== 'receipt';
     }
 
     function labels() {
-      var previous = current.previous || {};
-      var phaseKey = phaseKeys[previous.phase] || 'recordingEnded';
-      document.getElementById('previous-label').textContent = window.snackText(phaseKey);
-      document.getElementById('previous-peek-label').textContent = window.snackText('previousTranscription') + ' · ' + window.snackText(phaseKey);
-      document.getElementById('recording-peek-label').textContent = window.snackText(current.paused ? 'paused' : 'recording');
-      document.getElementById('recording-peek-time').textContent = document.getElementById('duration').textContent;
-      document.getElementById('handoff-title').textContent = window.snackText('backgroundTranscriptionTitle');
+      var title = window.snackText('backgroundTranscriptionTitle');
+      document.getElementById('previous-label').textContent = title;
+      document.getElementById('handoff-title').textContent = title;
       document.getElementById('handoff-description').textContent = window.snackText('backgroundTranscriptionDescription');
-      previousOpen.disabled = pending;
-      updateStatusIcon(previous.phase);
-    }
-
-    function updateStatusIcon(phase) {
-      var icon = document.getElementById('previous-status-icon');
-      var name = phase === 'transcribing' ? 'transcribing' : phase === 'completed' ? 'success' : 'failure';
-      icon.hidden = phase === 'ended' || phase === 'transcription_paused';
-      icon.src = '/note-assets/' + name + '.svg';
-      icon.classList.toggle('loading', phase === 'transcribing');
     }
 
     function layout() {
-      var hasPrevious = current.phase === 'recording' && Boolean(current.previous);
-      document.documentElement.dataset.deckActive = String(hasPrevious);
+      var nativeStack = current.phase === 'recording' && Boolean(current.previous);
+      var presenting = nativeStack && (view === 'handoff' || receiptVisible);
+      // Keep the opaque fallback until native restores the single-card backdrop.
+      document.documentElement.dataset.deckActive = String(nativeStack);
       root.dataset.deckView = view;
-      previousCard.hidden = !hasPrevious;
-      currentContent.hidden = hasPrevious && view === 'previous';
-      recordingPeek.hidden = !hasPrevious || view !== 'previous';
-      currentContent.inert = view === 'handoff' || (hasPrevious && view === 'previous');
-      previousFull.inert = view !== 'previous';
-      options.capsule.style.pointerEvents = view === 'handoff' ? 'none' : '';
-      previousCard.style.pointerEvents = view === 'handoff' ? 'none' : '';
-      if (!hasPrevious) return singleCard();
-      if (view === 'handoff' || closingReceipt) return;
+      previousCard.hidden = !presenting;
+      previousCard.inert = !presenting;
+      currentContent.hidden = false;
+      currentContent.inert = presenting && view === 'handoff';
+      previousFull.inert = true;
+      options.capsule.style.pointerEvents = presenting && view === 'handoff' ? 'none' : '';
+      previousCard.style.pointerEvents = 'none';
+      if (!presenting) return singleCard();
+      if (view === 'handoff') return;
       options.capsule.style.opacity = previousCard.style.opacity = '1';
-      options.capsule.style.transform = view === 'previous' ? back() : front();
-      previousCard.style.transform = view === 'previous' ? front() : receiptVisible ? receipt() : back();
-      options.capsule.style.zIndex = view === 'previous' ? '1' : '3';
-      previousCard.style.zIndex = view === 'previous' ? '3' : '1';
-      mode(view === 'previous' ? 'full' : receiptVisible ? 'receipt' : 'back');
+      options.capsule.style.transform = front();
+      previousCard.style.transform = receipt();
+      options.capsule.style.zIndex = '3';
+      previousCard.style.zIndex = '1';
+      mode('receipt');
     }
 
     function singleCard() {
       view = 'recording';
       root.dataset.deckView = view;
+      previousCard.hidden = true;
+      mode('hidden');
       currentContent.hidden = false;
       currentContent.inert = false;
-      recordingPeek.hidden = true;
       options.capsule.style.transform = '';
       options.capsule.style.opacity = '';
       options.capsule.style.zIndex = '';
@@ -130,19 +107,16 @@
     }
 
     function finishReceipt() {
-      if (!receiptVisible || view !== 'recording') return;
+      if (!receiptVisible) return;
       cancelMotion();
       receiptVisible = false;
-      if (media.matches) { layout(); return; }
-      closingReceipt = true;
-      animate(previousCard, [{ transform: receipt() }, { transform: back() }], 220);
-      later(function () { cancelMotion(); layout(); }, 220);
+      layout();
     }
 
     function finishHandoff() {
       cancelMotion();
       view = 'recording';
-      receiptVisible = current.previous && current.previous.phase === 'transcribing';
+      receiptVisible = Boolean(current.previous);
       layout();
       if (receiptVisible) later(finishReceipt, 3000);
     }
@@ -165,19 +139,7 @@
       later(finishHandoff, duration(560));
     }
 
-    function changeFocus(next) {
-      if (!current.previous || view === 'handoff' || next === view) return;
-      cancelMotion();
-      receiptVisible = false;
-      var showingPrevious = next === 'previous';
-      view = next;
-      layout();
-      animate(options.capsule, [{ transform: showingPrevious ? front() : back() }, { transform: showingPrevious ? back() : front() }], 360);
-      animate(previousCard, [{ transform: showingPrevious ? back() : front() }, { transform: showingPrevious ? front() : back() }], 360);
-      later(function () { cancelMotion(); layout(); }, duration(360));
-    }
-
-    function update(next, isPending) {
+    function update(next) {
       var nextIdentity = key(next);
       var nextPrevious = next.phase === 'recording' ? key(next.previous) : '';
       var nextDirection = next.stackAbove ? -1 : 1;
@@ -185,28 +147,23 @@
         cancelMotion(); view = 'recording'; receiptVisible = false;
       }
       identity = nextIdentity; previousIdentity = nextPrevious; direction = nextDirection;
-      current = next; pending = Boolean(isPending);
+      current = next;
       document.documentElement.dataset.stackAbove = String(direction === -1);
       document.documentElement.style.setProperty('--capsule-top', (next.capsuleTop === 97 ? 97 : 13) + 'px');
       labels();
-      if (!nextPrevious || (receiptVisible && next.previous.phase !== 'transcribing')) { cancelMotion(); receiptVisible = false; }
+      if (!nextPrevious) { cancelMotion(); receiptVisible = false; }
       layout();
       consumeHandoff(next);
     }
 
     function consumeHandoff(next) {
       var id = next.handoffNoticeId;
-      if (!id || !previousIdentity || next.previous.phase !== 'transcribing' || consumed.has(id)) return;
+      if (!id || !previousIdentity || consumed.has(id)) return;
       consumed.add(id);
       if (consumed.size > 64) consumed.delete(consumed.values().next().value);
       handoff();
     }
 
-    previousPeek.addEventListener('click', function () { changeFocus('previous'); });
-    recordingPeek.addEventListener('click', function () { changeFocus('recording'); });
-    previousOpen.addEventListener('click', function () {
-      if (!pending && current.previous) options.openPrevious(Object.assign({}, current.previous));
-    });
     document.addEventListener('visibilitychange', function () {
       if (document.hidden) { cancelMotion(); receiptVisible = false; view = 'recording'; layout(); }
     });

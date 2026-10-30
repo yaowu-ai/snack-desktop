@@ -70,6 +70,16 @@ async function openNoteDeck(page: Page, locale: 'en' | 'zh') {
   await page.evaluate(() => document.fonts.ready);
 }
 
+async function expectPreviousRetired(page: Page) {
+  for (const selector of ['#previous-card', '#previous-full', '#previous-peek', '#previous-open', '#recording-peek']) {
+    const elements = page.locator(selector);
+    await expect(elements).toBeHidden();
+    expect(await elements.evaluateAll((items) => items.every((item) => Boolean(item.closest('[inert]'))))).toBe(true);
+  }
+  await expect(page.locator('#handoff-notice')).toBeHidden();
+  await expect(page.locator('#current-content')).toHaveJSProperty('inert', false);
+}
+
 for (const locale of ['en', 'zh'] as const) {
   test(`recording card renders ${locale} offline and retains drafts on switch`, async ({ page }) => {
     const errors: string[] = [];
@@ -134,11 +144,18 @@ for (const locale of ['en', 'zh'] as const) {
     await page.evaluate((next) => (window as any).setSnackLocale(next), payload(other));
     await expect(page.locator('#handoff-title')).toHaveText(payload(other).messages.backgroundTranscriptionTitle);
     await expect(page.locator('#duration')).toHaveText('00:00:08');
-    await page.clock.runFor(2001);
-    await expect(page.locator('#handoff-notice')).toBeHidden();
-    await expect(page.locator('#previous-peek')).toHaveAccessibleName(payload(other).messages.viewPreviousTranscription);
-    await page.locator('#previous-peek').click();
-    await page.clock.runFor(150);
-    await expect(page.locator('#recording-peek')).toHaveAccessibleName(new RegExp(payload(other).messages.backToCurrentRecording));
+    await page.clock.runFor(2201);
+    await expectPreviousRetired(page);
+    await expect(page.locator('#pause')).toHaveAccessibleName(payload(other).messages.pause);
+    await page.evaluate((next) => (window as any).setSnackLocale(next), payload(locale));
+    await expectPreviousRetired(page);
+    await page.evaluate(() => (window as any).noteStateHandler({ payload: {
+      recordingId: 'rec-b', resultAttempt: 'capture', phase: 'recording', elapsedMs: 41000,
+      capsuleTop: 13, stackAbove: false,
+      previous: { recordingId: 'rec-a', resultAttempt: 'capture', phase: 'failed' },
+    } }));
+    await page.clock.runFor(1000);
+    await expectPreviousRetired(page);
+    await expect(page.locator('#duration')).toHaveText('00:00:41');
   });
 }
