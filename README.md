@@ -1,8 +1,26 @@
 # Snack Desktop
 
-Snack Desktop 是 [Snack](https://snack.mechlabs.cn/) 的桌面客户端。Snack 是面向企业增长团队的 AI 工作台，连接业务数据、团队协作和待办任务，让信息整理、分析、执行与复盘形成持续运转的闭环。
+**Snack Desktop 是企业增长团队 AI 工作台 [Snack](https://snack.mechlabs.cn/) 的桌面客户端，支持 macOS（Apple 芯片和 Intel）和 Windows x64。**
 
-**[访问 Snack 官网并开始使用](https://snack.mechlabs.cn/)**
+适合已经在用 Snack 的增长、运营和经营团队。Snack Desktop 在本地窗口里打开 Snack 工作台，并在本机多做几件事：
+
+- **录会议**：同时录麦克风和电脑播放的会议声音。macOS 用 ScreenCaptureKit，Windows 用 WASAPI loopback。
+- **本地转写**：用内置的 Python 运行时跑 FunASR 中文语音模型（识别、断句、标点、区分说话人），转写在本机生成。模型有几 GB，只在你点了安装后才下载。
+- **桌面集成**：系统通知、全局快捷键、`snack://` 深链接、自动更新。
+
+<!-- TODO: demo GIF（开始录会议 → 录音卡片 → 本地转写结果） -->
+
+### 现在就能试
+
+1. 到 [Releases](https://github.com/yaowu-ai/snack-desktop/releases/latest) 下载安装包：macOS Apple 芯片选 `Snack_<版本>_macos_arm64.dmg`，Intel 选 `Snack_<版本>_macos_x64.dmg`，Windows 选 `Snack_<版本>_windows_x64.exe`。
+2. 安装后打开。第一次录会议时，macOS 会请求麦克风、系统录音和录屏权限，按提示允许。
+3. 想从源码跑：装好 Node.js 22 和 Rust（Snack Desktop 基于 Tauri 2），`npm install`，在 `.env` 里填 `SNACK_HOST`，再 `npm run dev`。细节见下方「本地开发及打包」。
+
+工作台本身的功能和账号，见 [Snack 官网](https://snack.mechlabs.cn/)。想收到新版本，可以点右上角的 Star。
+
+## Snack 是什么
+
+Snack Desktop 是 [Snack](https://snack.mechlabs.cn/) 的桌面客户端。Snack 是面向企业增长团队的 AI 工作台，连接业务数据、团队协作和待办任务，让信息整理、分析、执行与复盘形成持续运转的闭环。
 
 ## Snack 能做什么
 
