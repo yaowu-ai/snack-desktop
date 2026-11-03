@@ -31,6 +31,7 @@ pub(crate) const MAX_MEETING_NOTES_PROMPT_CHARS: usize = 600;
 const RESOURCE_FILE: &str = "resource.json";
 const TASK_FILE: &str = "task.json";
 const SETTINGS_FILE: &str = "settings.json";
+const CURRENT_TASK_SCHEMA_VERSION: u8 = 2;
 
 // A rename moves the TXT before persisting its new path. History cleanup must
 // not observe that intermediate state as a user-deleted export.
@@ -270,6 +271,25 @@ pub(crate) struct ServerSubmission {
     pub(crate) last_error: Option<String>,
 }
 
+/// Metadata for the standard Note binding. It is deliberately separate from
+/// the native meeting state and is never sent as Note document fields.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct NoteSyncMetadata {
+    #[serde(default)]
+    pub(crate) key: Option<String>,
+    #[serde(default)]
+    pub(crate) owner: Option<String>,
+    #[serde(default)]
+    pub(crate) origin: Option<String>,
+    #[serde(default)]
+    pub(crate) status: Option<String>,
+    #[serde(default)]
+    pub(crate) base_version: Option<u64>,
+    #[serde(default)]
+    pub(crate) last_error: Option<String>,
+}
+
 fn deserialize_optional_record_id<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -296,7 +316,11 @@ impl Default for ServerSubmission {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct MeetingTask {
+    #[serde(default)]
+    pub(crate) schema_version: u8,
     pub(crate) recording_id: String,
+    #[serde(default)]
+    pub(crate) note_sync: Option<NoteSyncMetadata>,
     /// Native identity captured only after recording starts; legacy tasks remain unattributed.
     #[serde(default)]
     pub(crate) recording_account_key: Option<String>,
@@ -353,7 +377,9 @@ impl MeetingTask {
     pub(crate) fn new(recording_id: String, language: String) -> Self {
         let now = now_rfc3339();
         Self {
+            schema_version: CURRENT_TASK_SCHEMA_VERSION,
             recording_id,
+            note_sync: None,
             recording_account_key: None,
             display_name: None,
             auto_generate_notes_enabled: None,
@@ -391,6 +417,20 @@ impl MeetingTask {
         self.state = state;
         self.updated_at = now_rfc3339();
         self
+    }
+
+    /// Drop transient transcription implementation details once the formatted
+    /// transcript has been persisted. The transcript text/segments remain the
+    /// local content source for export and recovery.
+    pub(crate) fn compact_completed_transcript(&mut self) {
+        if matches!(self.state, TaskState::TranscriptReady | TaskState::Ready | TaskState::NotesFailed)
+            && self.transcript.is_some()
+        {
+            if let Some(transcript) = self.transcript.as_mut() {
+                transcript.model_key.clear();
+                transcript.engine.clear();
+            }
+        }
     }
 }
 
@@ -861,12 +901,34 @@ impl MeetingStore {
 
 fn read_task_file(path: &PathBuf) -> std::io::Result<Option<MeetingTask>> {
     match fs::read(path) {
-        Ok(bytes) => serde_json::from_slice(&bytes)
-            .map(Some)
-            .map_err(std::io::Error::other),
+        Ok(bytes) => {
+            let mut task: MeetingTask = serde_json::from_slice(&bytes).map_err(std::io::Error::other)?;
+            let changed = normalize_legacy_task(&mut task);
+            if changed {
+                persist_json_atomic(path, &task).map_err(std::io::Error::other)?;
+            }
+            Ok(Some(task))
+        }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error),
     }
+}
+
+/// Upgrade old task.json/task records in place. No cloud Note identity is
+/// guessed from a legacy recording: only native facts are normalized.
+fn normalize_legacy_task(task: &mut MeetingTask) -> bool {
+    let mut changed = false;
+    if task.schema_version < CURRENT_TASK_SCHEMA_VERSION {
+        task.schema_version = CURRENT_TASK_SCHEMA_VERSION;
+        changed = true;
+    }
+    if matches!(task.state, TaskState::TranscriptReady | TaskState::Ready | TaskState::NotesFailed) {
+        let before = task.transcript.as_ref().map(|value| (value.model_key.clone(), value.engine.clone()));
+        task.compact_completed_transcript();
+        let after = task.transcript.as_ref().map(|value| (value.model_key.clone(), value.engine.clone()));
+        if before != after { changed = true; }
+    }
+    changed
 }
 
 fn has_deleted_transcript_export(task: &MeetingTask) -> bool {
@@ -1117,8 +1179,9 @@ mod tests {
     use super::{
         now_rfc3339, parse_rfc3339_millis, validate_meeting_settings, DownloadProgress,
         MeetingSettings, MeetingStore, MeetingTask, ResourceState, ResourceStatus,
-        ServerSubmission, TaskState, TranscriptAssetState, DEFAULT_MEETING_NOTES_PROMPT,
+        ServerSubmission, TaskState, Transcript, TranscriptAssetState, DEFAULT_MEETING_NOTES_PROMPT,
     };
+    use super::CURRENT_TASK_SCHEMA_VERSION;
     use std::fs;
     use std::path::PathBuf;
 
@@ -1218,6 +1281,31 @@ mod tests {
                 assert_eq!(restored.microphone_permission_at_end, Some(permission));
             }
         }
+    }
+
+    #[test]
+    fn legacy_task_records_are_upgraded_without_guessing_note_identity() {
+        let root = std::env::temp_dir().join(format!("snack-note-task-migration-{}", super::unix_millis()));
+        let store = MeetingStore::for_test(root.clone(), root.join("recordings"));
+        fs::create_dir_all(root.join(super::TASKS_DIR_NAME)).unwrap();
+        let mut task = MeetingTask::new("legacy-note".into(), "zh".into());
+        task.state = TaskState::TranscriptReady;
+        task.transcript = Some(Transcript {
+            text: "正文".into(), language: "zh".into(), segments: vec![],
+            model_key: "model".into(), engine: "engine".into(), generated_at: "now".into(),
+        });
+        let mut value = serde_json::to_value(task).unwrap();
+        value.as_object_mut().unwrap().remove("schemaVersion");
+        fs::write(store.task_record_path("legacy-note"), serde_json::to_vec(&value).unwrap()).unwrap();
+        let restored = store.load_task_record("legacy-note").unwrap();
+        assert_eq!(restored.schema_version, CURRENT_TASK_SCHEMA_VERSION);
+        assert_eq!(restored.note_sync, None);
+        assert_eq!(restored.transcript.as_ref().unwrap().model_key, "");
+        let persisted: serde_json::Value = serde_json::from_slice(
+            &fs::read(store.task_record_path("legacy-note")).unwrap(),
+        ).unwrap();
+        assert_eq!(persisted["schemaVersion"], CURRENT_TASK_SCHEMA_VERSION);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

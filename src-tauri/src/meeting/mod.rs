@@ -2272,6 +2272,7 @@ fn spawn_transcription(app: AppHandle, store: MeetingStore, recording_id: String
                 return;
             }
             task.state = TaskState::TranscriptReady;
+            task.compact_completed_transcript();
             if task.duration_ms.is_none() {
                 task.duration_ms = task
                     .transcript
