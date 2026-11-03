@@ -36,6 +36,7 @@ const CURRENT_TASK_SCHEMA_VERSION: u8 = 2;
 // A rename moves the TXT before persisting its new path. History cleanup must
 // not observe that intermediate state as a user-deleted export.
 static TRANSCRIPT_FILE_CHANGES: Mutex<()> = Mutex::new(());
+static AUDIO_RETENTION: Mutex<()> = Mutex::new(());
 
 pub(super) fn lock_transcript_file_changes() -> MutexGuard<'static, ()> {
     TRANSCRIPT_FILE_CHANGES
@@ -318,6 +319,9 @@ impl Default for ServerSubmission {
 pub(crate) struct MeetingTask {
     #[serde(default)]
     pub(crate) schema_version: u8,
+    /// Snapshot-only presentation metadata; stale worker writes cannot undo list clearing.
+    #[serde(skip_deserializing, skip_serializing_if = "Option::is_none")]
+    pub(crate) history: Option<super::record_history::RecordHistoryStatus>,
     pub(crate) recording_id: String,
     #[serde(default)]
     pub(crate) note_sync: Option<NoteSyncMetadata>,
@@ -381,6 +385,7 @@ impl MeetingTask {
             recording_id,
             note_sync: None,
             recording_account_key: None,
+            history: None,
             display_name: None,
             auto_generate_notes_enabled: None,
             defer_transcription: false,
@@ -743,11 +748,22 @@ impl MeetingStore {
     /// record metadata. Cleared task lists are covered by scanning the current
     /// audio directory directly.
     pub(crate) fn prune_recording_audio(&self, keep: usize) -> Result<usize, String> {
+        let _retention = AUDIO_RETENTION.lock().unwrap_or_else(|error| error.into_inner());
         let tasks = self.load_task_records();
         let candidates = self.recording_audio_candidates(&tasks);
+        let _files = lock_transcript_file_changes();
+        let mut tasks = tasks.iter().filter_map(|task| self.load_task_record(&task.recording_id)).collect::<Vec<_>>();
+        if let Some(current) = self.load_task() {
+            if !tasks.iter().any(|task| task.recording_id == current.recording_id) { tasks.push(current); }
+        }
         let protected = protected_audio_paths(&tasks);
-        let removed = remove_old_recording_audio(candidates, &protected, keep)?;
-        self.clear_removed_audio_references(&tasks, &removed)?;
+        let (removed, error) = remove_old_recording_audio(candidates, &protected, keep);
+        let mut unavailable = removed.clone();
+        for path in tasks.iter().filter_map(|task| task.audio_path.as_deref().map(PathBuf::from)) {
+            if !protected.contains(&path) && path.try_exists().is_ok_and(|exists| !exists) { unavailable.insert(path); }
+        }
+        self.clear_removed_audio_references(&tasks, &unavailable)?;
+        if let Some(error) = error { return Err(error); }
         Ok(removed.len())
     }
 
@@ -761,7 +777,9 @@ impl MeetingStore {
             if let Some(parent) = path.parent() {
                 directories.insert(parent.to_path_buf());
             }
-            insert_newest_timestamp(&mut candidates, path, &task.created_at);
+            if fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.file_type().is_file()) {
+                insert_newest_timestamp(&mut candidates, path, &task.created_at);
+            }
         }
         scan_audio_directories(&mut candidates, directories);
         candidates
@@ -874,6 +892,18 @@ impl MeetingStore {
         let _ = fs::remove_file(self.root.join(TASK_FILE));
     }
 
+    /// Explicit cleanup must not clear another recording's current pointer or swallow I/O errors.
+    pub(crate) fn delete_current_task_if(&self, recording_id: &str) -> Result<(), String> {
+        if !self.load_task().is_some_and(|task| task.recording_id == recording_id) {
+            return Ok(());
+        }
+        match fs::remove_file(self.root.join(TASK_FILE)) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
     pub(crate) fn delete_task_record(&self, recording_id: &str) -> Result<(), String> {
         if self.load_task_record(recording_id).is_some_and(|task| task.defer_transcription) {
             return Err("笔记录音只保存在本机，请暂停转写，不能移除录音记录".to_string());
@@ -982,24 +1012,29 @@ fn insert_scanned_audio(candidates: &mut HashMap<PathBuf, u64>, entry: fs::DirEn
     {
         return;
     }
-    candidates.entry(path).or_insert_with(|| {
-        entry
-            .metadata()
-            .and_then(|value| value.modified())
-            .ok()
-            .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
-            .map(|value| value.as_millis() as u64)
-            .unwrap_or(0)
-    });
+    if candidates.contains_key(&path) { return; }
+    // Only identifiable Snack-generated orphan recordings may be silently reclaimed.
+    let Some(stem) = path.file_stem().and_then(|value| value.to_str()) else { return; };
+    let parts = stem.split('-').collect::<Vec<_>>();
+    if parts.len() != 4 || parts[0] != "rec" || parts[1].len() != 13 || parts[1..].iter().any(|value| value.parse::<u64>().is_err()) {
+        return;
+    }
+    if entry.file_type().is_ok_and(|kind| kind.is_file()) {
+        let timestamp = parts[1].parse().unwrap_or_default();
+        candidates.insert(path, timestamp);
+    }
 }
 
 fn protected_audio_paths(tasks: &[MeetingTask]) -> HashSet<PathBuf> {
+    let readers = super::audio_usage::active_recordings();
     tasks
         .iter()
         .filter(|task| {
             task.state.is_active()
-                || task.defer_transcription
                 || task.state == TaskState::AwaitingTranscription
+                || task.state == TaskState::WaitingForNetwork
+                || matches!(task.transcript_asset_state, TranscriptAssetState::Pending | TranscriptAssetState::Uploading)
+                || readers.contains(&task.recording_id)
                 || !task.audio_file_owned
         })
         .filter_map(|task| task.audio_path.as_deref().map(PathBuf::from))
@@ -1010,17 +1045,18 @@ fn remove_old_recording_audio(
     candidates: HashMap<PathBuf, u64>,
     protected: &HashSet<PathBuf>,
     keep: usize,
-) -> Result<HashSet<PathBuf>, String> {
+) -> (HashSet<PathBuf>, Option<String>) {
     let mut ordered = candidates
         .into_iter()
         .filter(|(path, _)| !protected.contains(path))
         .collect::<Vec<_>>();
-    ordered.sort_by(|left, right| right.1.cmp(&left.1));
+    ordered.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
     let mut removed = HashSet::new();
+    let mut error = None;
     for (path, _) in ordered.into_iter().skip(keep) {
-        remove_recording_audio(path, &mut removed)?;
+        if let Err(message) = remove_recording_audio(path, &mut removed) { error = Some(message); }
     }
-    Ok(removed)
+    (removed, error)
 }
 
 fn remove_recording_audio(path: PathBuf, removed: &mut HashSet<PathBuf>) -> Result<(), String> {
@@ -1969,7 +2005,7 @@ mod tests {
     }
 
     #[test]
-    fn note_recordings_survive_retention_and_task_cleanup() {
+    fn note_recordings_retain_ten_audio_files_without_losing_note_metadata() {
         let root = std::env::temp_dir().join(format!("snack-note-retention-{}", super::unix_millis()));
         let store = MeetingStore::for_test(root.join("state"), root.join("recordings"));
         let audio_root = root.join("recordings").join(super::AUDIO_DIR_NAME);
@@ -1980,15 +2016,16 @@ mod tests {
             let mut task = MeetingTask::new(format!("note-{index}"), "zh".to_string());
             task.state = TaskState::TranscriptReady;
             task.defer_transcription = true;
+            task.created_at = format!("2026-10-28T01:00:{index:02}Z");
             task.audio_path = Some(audio_path.to_string_lossy().into_owned());
             store.save_task_record(&task).unwrap();
         }
-        assert_eq!(store.prune_recording_audio(10).unwrap(), 0);
+        assert_eq!(store.prune_recording_audio(10).unwrap(), 5);
         assert_eq!(store.clear_task_records().unwrap(), 0);
         assert!(store.delete_task_record("note-0").is_err());
         assert_eq!(store.prune_recording_audio(10).unwrap(), 0);
         for index in 0..15 {
-            assert!(audio_root.join(format!("note-{index}.wav")).exists());
+            assert_eq!(audio_root.join(format!("note-{index}.wav")).exists(), index >= 5);
             assert!(store.load_task_record(&format!("note-{index}")).is_some());
         }
         fs::remove_dir_all(root).unwrap();
@@ -2064,7 +2101,7 @@ mod tests {
     }
 
     #[test]
-    fn audio_retention_protects_deferred_silence_and_keeps_legacy_policy() {
+    fn audio_retention_treats_finished_note_and_legacy_silence_equally() {
         let root = std::env::temp_dir().join(format!(
             "snack-meeting-silent-audio-{}",
             super::unix_millis()
@@ -2087,13 +2124,13 @@ mod tests {
             store.save_task_record(&task).unwrap();
         }
 
-        assert_eq!(store.prune_recording_audio(0).unwrap(), 1);
-        assert!(audio_root.join("deferred.wav").exists());
+        assert_eq!(store.prune_recording_audio(0).unwrap(), 2);
+        assert!(!audio_root.join("deferred.wav").exists());
         assert!(store
             .load_task_record("deferred")
             .unwrap()
             .audio_path
-            .is_some());
+            .is_none());
         assert!(!audio_root.join("legacy.wav").exists());
         assert!(store
             .load_task_record("legacy")
