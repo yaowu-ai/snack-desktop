@@ -6,6 +6,7 @@
 //! the native recording overlay.
 
 mod audio;
+mod audio_usage;
 pub(crate) mod audio_read;
 mod capture;
 #[cfg(target_os = "macos")]
@@ -22,6 +23,7 @@ pub(crate) mod overlay;
 pub(crate) mod overlay_locale;
 mod permissions;
 mod python_runtime;
+mod record_history;
 pub(crate) mod quick_access;
 mod reminder;
 #[cfg(target_os = "macos")]
@@ -123,6 +125,7 @@ fn permission_status(
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct MeetingSnapshot {
+    history_revision: u64,
     available: bool,
     supported_platform: bool,
     recording_reminder_supported: bool,
@@ -141,6 +144,9 @@ pub(crate) struct MeetingSnapshot {
 #[derive(Debug, Clone, Copy, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct MeetingCapabilities {
+    audio_retention: bool,
+    persistent_record_history: bool,
+    record_note_binding: bool,
     transcript_project_assets: bool,
     transcription_task_controls: bool,
     inline_recording: bool,
@@ -152,6 +158,9 @@ struct MeetingCapabilities {
 impl MeetingCapabilities {
     fn current() -> Self {
         Self {
+            audio_retention: true,
+            persistent_record_history: true,
+            record_note_binding: true,
             transcript_project_assets: true,
             transcription_task_controls: true,
             inline_recording: true,
@@ -164,12 +173,14 @@ impl MeetingCapabilities {
 
 pub(crate) fn build_snapshot(store: &MeetingStore) -> MeetingSnapshot {
     let resource = store.load_resource();
-    let tasks = store.load_task_records();
+    let mut tasks = store.load_task_records();
+    let history_revision = store.decorate_record_history(&mut tasks, shortcut_policy::account_key().as_deref());
     // Permissions are NOT probed here: the ScreenCaptureKit probe can trigger
     // the system permission prompt, and snapshots are emitted frequently
     // (and polled). Explicit checks only (meeting_check_permissions /
     // start_recording).
     MeetingSnapshot {
+        history_revision,
         available: true,
         supported_platform: cfg!(any(target_os = "macos", target_os = "windows")),
         recording_reminder_supported: reminder::supported(),
@@ -494,27 +505,82 @@ pub(crate) fn meeting_get_snapshot(
 pub(crate) fn meeting_clear_task_records(
     app: AppHandle,
     window: WebviewWindow,
-) -> Result<(), String> {
+    recording_ids: Option<Vec<String>>,
+) -> Result<serde_json::Value, String> {
     require_allowed_window(&window)?;
     let state = app.state::<MeetingManagerState>();
-    let current_task_active = state
-        .store
-        .load_task()
-        .is_some_and(|task| task.state.is_active());
-    let cleared = state.store.clear_task_records()?;
-    if !current_task_active {
+    let ids = recording_ids.ok_or("请更新页面后清空已结束记录")?;
+    if ids.len() > 10_000 { return Err("本次清理记录过多，请分批重试".into()); }
+    for id in &ids { validate_record_key(id)?; }
+    let _guard = state.recording_task_update.lock().expect("recording task update poisoned");
+    let current = state.store.load_task().map(|task| task.recording_id);
+    let result = state.store.clear_record_history(&ids, shortcut_policy::account_key().as_deref(), &state.recorder)?;
+    if current.is_some_and(|id| result.cleared_ids.contains(&id)) && state.store.load_task().is_none() {
+        state.reminder.set_recording_active(false);
         overlay::hide_overlay(&app);
     }
     emit_state(&app, &state.store);
-    crate::logging::write_app_log(
-        &app,
-        "info",
-        "meeting-records",
-        "completed meeting task records cleared without deleting local files",
-        Some(
-            &serde_json::json!({ "cleared": cleared, "activeTaskPreserved": current_task_active }),
-        ),
-    );
+    Ok(serde_json::json!({ "result": result, "snapshot": build_snapshot(&state.store) }))
+}
+
+#[tauri::command]
+pub(crate) fn meeting_bind_record_note(app: AppHandle, window: WebviewWindow, recording_id: String, binding: record_history::NoteBinding) -> Result<(), String> {
+    require_allowed_window(&window)?;
+    require_record_account(&binding.account_key)?;
+    validate_record_key(&recording_id)?;
+    validate_record_key(&binding.note_key)?;
+    validate_record_site(&binding.site_origin)?;
+    app.state::<MeetingManagerState>().store.bind_record_note(&recording_id, binding)
+}
+
+#[tauri::command]
+pub(crate) fn meeting_read_record_note(app: AppHandle, window: WebviewWindow, recording_id: String, account_key: String, site_origin: String) -> Result<Option<String>, String> {
+    require_allowed_window(&window)?;
+    validate_record_key(&recording_id)?;
+    require_record_account(&account_key)?;
+    validate_record_site(&site_origin)?;
+    app.state::<MeetingManagerState>().store.read_record_note(&recording_id, &account_key, &site_origin)
+}
+
+fn require_record_account(account: &str) -> Result<(), String> {
+    if shortcut_policy::account_key().as_deref() != Some(account) { return Err("账号信息未就绪或已切换，请重新打开页面".into()); }
+    Ok(())
+}
+
+fn validate_record_key(value: &str) -> Result<(), String> {
+    if value.is_empty() || value.len() > 120 || !value.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
+        return Err("无效的录音或笔记标识".into());
+    }
+    Ok(())
+}
+
+fn validate_record_site(site: &str) -> Result<(), String> {
+    let url = tauri::Url::parse(site).map_err(|_| "无效的站点标识")?;
+    if !matches!(url.scheme(), "http" | "https") || url.origin().ascii_serialization() != site { return Err("无效的站点标识".into()); }
+    Ok(())
+}
+
+#[tauri::command]
+pub(crate) fn meeting_prune_recording_audio(app: AppHandle, window: WebviewWindow) -> Result<usize, String> {
+    require_allowed_window(&window)?;
+    let store = &app.state::<MeetingManagerState>().store;
+    let removed = store.prune_recording_audio(10)?;
+    if removed > 0 { emit_state(&app, store); }
+    Ok(removed)
+}
+
+#[tauri::command]
+pub(crate) fn meeting_set_record_audio_in_use(app: AppHandle, window: WebviewWindow, recording_id: String, lease_id: String, in_use: bool) -> Result<(), String> {
+    require_allowed_window(&window)?;
+    validate_record_key(&recording_id)?;
+    if lease_id.is_empty() || lease_id.len() > 128 { return Err("无效的音频读取标识".into()); }
+    let store = &app.state::<MeetingManagerState>().store;
+    let task = store.load_task_record(&recording_id).ok_or("没有找到本地录音")?;
+    if let Some(owner) = task.recording_account_key {
+        if !shortcut_policy::account_key().is_some_and(|current| record_history::same_account(&owner, &current)) { return Err("这条录音属于其他账号".into()); }
+    }
+    audio_usage::update(recording_id, lease_id, in_use);
+    if !in_use { let _ = store.prune_recording_audio(10); }
     Ok(())
 }
 
@@ -842,6 +908,7 @@ fn start_recording(
         return Err("请先确认已获得参会者同意".to_string());
     }
     let state = app.state::<MeetingManagerState>();
+    let _guard = state.recording_task_update.lock().expect("recording task update poisoned");
     let store = &state.store;
 
     // 1. Manual-transcription recordings need only capture permissions and disk space.
@@ -1473,6 +1540,7 @@ pub(crate) fn stop_recording_from_overlay(app: AppHandle) -> Result<(), String> 
 
 fn stop_recording(app: AppHandle, source: &str) -> Result<(), String> {
     let state = app.state::<MeetingManagerState>();
+    let _guard = state.recording_task_update.lock().expect("recording task update poisoned");
     let store = state.store.clone_for_task();
     let recorder = state.recorder.lock().expect("recorder poisoned").take();
     let Some(recorder) = recorder else {
@@ -1508,6 +1576,7 @@ fn stop_recording(app: AppHandle, source: &str) -> Result<(), String> {
         Some(&serde_json::json!({ "recordingId": task.recording_id })),
     );
 
+    drop(_guard);
     tauri::async_runtime::spawn_blocking(move || finalize_recording(app, store, recorder));
     Ok(())
 }
@@ -2107,6 +2176,7 @@ pub(crate) fn meeting_retranscribe(
     task.duration_ms = duration_ms;
     task.error = None;
     task.updated_at = now_rfc3339();
+    store.show_record_history(&recording_id)?;
     store.save_task_progress(&task)?;
     drop(transcript_guard);
     emit_state(&app, &store);
@@ -2281,6 +2351,7 @@ fn spawn_transcription(app: AppHandle, store: MeetingStore, recording_id: String
             task.error = None;
             task.updated_at = now_rfc3339();
             let _ = store.save_task_progress(&task);
+            prune_finished_audio(&app, &store);
             emit_state(&app, &store);
             handoff_completed_transcript(&app, &recording_id);
         })
@@ -2335,6 +2406,7 @@ fn fail_transcription_task(
     task.state = TaskState::TranscriptionFailed;
     task.error = Some(message.clone());
     let _ = store.save_task_progress(&task);
+    prune_finished_audio(app, store);
     emit_state(app, store);
     notifications::notify_transcript_failed(app, recording_id);
     crate::logging::write_app_log(
@@ -2469,6 +2541,13 @@ fn available_recovered_wav_path(source: &std::path::Path, recording_id: &str) ->
     source.with_file_name(format!("{recording_id}-recovered-{}.wav", unix_millis()))
 }
 
+/// Retention runs after work ends; failures remain retryable on foreground/startup.
+fn prune_finished_audio(app: &AppHandle, store: &MeetingStore) {
+    if let Err(error) = store.prune_recording_audio(10) {
+        crate::logging::write_app_log(app, "warn", "meeting", "audio retention deferred", Some(&serde_json::json!({ "error": error })));
+    }
+}
+
 fn finish_without_audio(app: &AppHandle, store: &MeetingStore, recording_id: &str) {
     let Some(mut task) = store.load_task_record(recording_id) else {
         return;
@@ -2490,6 +2569,7 @@ fn finish_without_audio(app: &AppHandle, store: &MeetingStore, recording_id: &st
         );
         return;
     }
+    prune_finished_audio(app, store);
     emit_state(app, store);
     crate::logging::write_app_log(
         app,
