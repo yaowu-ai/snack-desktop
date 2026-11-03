@@ -1845,14 +1845,14 @@ fn open_notes_in_chat(
     auto_submit: bool,
 ) -> Result<(), String> {
     let state = app.state::<MeetingManagerState>();
-    let task = state
-        .store
-        .load_task_record(recording_id)
-        .ok_or_else(|| "没有找到本地转写记录".to_string())?;
-    let transcript = task
-        .transcript
-        .as_ref()
-        .ok_or_else(|| "本地转写尚未完成".to_string())?;
+    let task = state.store.load_task_record(recording_id).ok_or_else(|| {
+        if auto_submit {
+            "没有找到本地转写记录"
+        } else {
+            "未检测到本地文件"
+        }
+        .to_string()
+    })?;
     let settings = state.store.load_settings();
     let transcript_name = task
         .transcript_path
@@ -1863,7 +1863,15 @@ fn open_notes_in_chat(
                 .map(|name| name.to_string_lossy().into_owned())
         })
         .unwrap_or_else(|| format!("Snack会议-{}.txt", task.recording_id));
-    let transcript_text = state::transcript_text(transcript);
+    let transcript_text = if auto_submit {
+        let transcript = task
+            .transcript
+            .as_ref()
+            .ok_or_else(|| "本地转写尚未完成".to_string())?;
+        state::transcript_text(transcript)
+    } else {
+        read_manual_notes_transcript(task.transcript_path.as_deref())?
+    };
     if auto_submit {
         crate::record_import::queue_background_with_attachment(
             app,
@@ -1886,6 +1894,48 @@ fn open_notes_in_chat(
     }
     overlay::hide_overlay(app);
     Ok(())
+}
+
+/// A manual chat import must use the current TXT, never a stale in-memory transcript.
+fn read_manual_notes_transcript(path: Option<&str>) -> Result<String, String> {
+    path.and_then(|value| {
+        let path = std::path::Path::new(value);
+        if !path.is_absolute() || !path.is_file() {
+            return None;
+        }
+        std::fs::read_to_string(path).ok()
+    })
+    .filter(|text| !text.trim().is_empty())
+    .ok_or_else(|| "未检测到本地文件".to_string())
+}
+
+#[cfg(test)]
+mod manual_notes_file_tests {
+    #[test]
+    fn reads_the_actual_text_file_and_rejects_missing_or_invalid_files() {
+        let directory =
+            std::env::temp_dir().join(format!("snack-manual-notes-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("transcript.txt");
+        std::fs::write(&path, "最新的本地转写文本").unwrap();
+        assert_eq!(
+            super::read_manual_notes_transcript(path.to_str()).unwrap(),
+            "最新的本地转写文本"
+        );
+        std::fs::write(&path, "  \n").unwrap();
+        assert!(super::read_manual_notes_transcript(path.to_str()).is_err());
+        std::fs::write(&path, [0xff, 0xfe]).unwrap();
+        assert_eq!(
+            super::read_manual_notes_transcript(path.to_str()).unwrap_err(),
+            "未检测到本地文件"
+        );
+        std::fs::remove_file(&path).unwrap();
+        assert!(super::read_manual_notes_transcript(path.to_str()).is_err());
+        assert!(super::read_manual_notes_transcript(directory.to_str()).is_err());
+        assert!(super::read_manual_notes_transcript(Some("relative.txt")).is_err());
+        assert!(super::read_manual_notes_transcript(None).is_err());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 }
 
 #[tauri::command]
