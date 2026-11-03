@@ -96,7 +96,7 @@ pub(crate) fn transcribe_file(
     if !on_progress(completion_update(&decoded)) {
         return Err("本地转写已停止".to_string());
     }
-    Ok(transcription_outcome(decoded, request.language))
+    transcription_outcome(decoded, request.language)
 }
 
 fn run_modelscope_with_format_fallback(
@@ -473,7 +473,10 @@ fn validate_normalized_audio(path: &Path) -> Result<(), String> {
         .map_err(|message| format!("标准 WAV 校验失败: {message}"))
 }
 
-fn transcription_outcome(decoded: ModelScopeTranscript, language: &str) -> TranscriptionOutcome {
+fn transcription_outcome(
+    decoded: ModelScopeTranscript,
+    language: &str,
+) -> Result<TranscriptionOutcome, String> {
     let segments = decoded
         .segments
         .into_iter()
@@ -489,13 +492,13 @@ fn transcription_outcome(decoded: ModelScopeTranscript, language: &str) -> Trans
             .iter()
             .all(|segment| segment.text.trim().is_empty())
     {
-        return TranscriptionOutcome::NoAudioDetected;
+        return Err("本地转写未识别到文字，请重试转写".to_string());
     }
-    TranscriptionOutcome::Detected {
+    Ok(TranscriptionOutcome::Detected {
         segments,
         text: decoded.text,
         language: language.to_string(),
-    }
+    })
 }
 
 /// Validate the complete local runtime and cache without loading the model.
@@ -616,7 +619,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_model_output_is_a_no_audio_result() {
+    fn empty_model_output_is_a_transcription_failure_not_capture_evidence() {
         let outcome = transcription_outcome(
             ModelScopeTranscript {
                 text: String::new(),
@@ -625,6 +628,23 @@ mod tests {
             "zh",
         );
 
-        assert!(matches!(outcome, TranscriptionOutcome::NoAudioDetected));
+        assert_eq!(outcome.unwrap_err(), "本地转写未识别到文字，请重试转写");
+    }
+
+    #[test]
+    fn segment_text_survives_an_empty_combined_model_result() {
+        let outcome = transcription_outcome(
+            ModelScopeTranscript {
+                text: String::new(),
+                segments: vec![ModelScopeSegment {
+                    start_ms: 0,
+                    end_ms: 1000,
+                    text: "会议内容".into(),
+                    speaker: "说话人 1".into(),
+                }],
+            },
+            "zh",
+        );
+        assert!(matches!(outcome, Ok(TranscriptionOutcome::Detected { .. })));
     }
 }

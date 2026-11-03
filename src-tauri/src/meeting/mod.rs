@@ -425,12 +425,15 @@ fn reconcile_current_task(app: &AppHandle, store: &MeetingStore) {
                     // The app crashed mid-recording: recover the on-disk WAV
                     // (header repair) without bypassing the user's transcription policy.
                     match recover_recording_state(&path, task.defer_transcription) {
-                        Ok((recovered_state, duration_ms)) => {
+                        Ok((recovered_state, duration_ms, audio_capture_issue)) => {
                             let now = now_rfc3339();
                             task.duration_ms = Some(duration_ms);
                             task.ended_at.get_or_insert_with(|| now.clone());
                             task.audio_bytes = fs::metadata(&path).ok().map(|meta| meta.len());
                             task.state = recovered_state;
+                            task.audio_capture_issue = audio_capture_issue;
+                            // Recovery cannot reconstruct authorization at the interrupted capture's end.
+                            task.microphone_permission_at_end.get_or_insert(PermissionAccess::Unknown);
                             task.error =
                                 Some("应用在上次录音中退出，已自动恢复录音文件".to_string());
                             task.updated_at = now;
@@ -1540,7 +1543,10 @@ fn finalize_recording(app: AppHandle, store: MeetingStore, recorder: Recorder) {
         }
     };
 
-    task.state = finalized_recording_state(task.defer_transcription, &samples);
+    let has_audio = audio::has_audio_signal_i16(&samples);
+    task.state = finalized_recording_state(task.defer_transcription, has_audio);
+    task.audio_capture_issue = (!has_audio).then_some(state::AudioCaptureIssue::NoAudio);
+    task.microphone_permission_at_end = Some(permissions::microphone_permission_at_recording_end());
     drop(samples);
     task.duration_ms = Some(duration_ms);
     task.ended_at = Some(now_rfc3339());
@@ -1580,21 +1586,28 @@ fn validate_recording_resource(resource: ResourceState, deferred: bool) -> Resul
     Ok(())
 }
 
-fn finalized_recording_state(deferred: bool, samples: &[i16]) -> TaskState {
+fn finalized_recording_state(deferred: bool, has_audio: bool) -> TaskState {
     if !deferred {
         TaskState::TranscribingLocal
-    } else if audio::has_audio_signal_i16(samples) {
+    } else if has_audio {
         TaskState::AwaitingTranscription
     } else {
         TaskState::NoAudioDetected
     }
 }
 
-fn recover_recording_state(path: &std::path::Path, deferred: bool) -> Result<(TaskState, u64), String> {
-    let sample_count = audio::repair_wav_header(path)?;
-    if !deferred { return Ok((TaskState::TranscribingLocal, sample_count * 1000 / 16_000)); }
+fn recover_recording_state(
+    path: &std::path::Path,
+    deferred: bool,
+) -> Result<(TaskState, u64, Option<state::AudioCaptureIssue>), String> {
+    audio::repair_wav_header(path)?;
     let (samples, duration_ms) = audio::read_wav_i16(path)?;
-    Ok((finalized_recording_state(true, &samples), duration_ms))
+    let has_audio = audio::has_audio_signal_i16(&samples);
+    Ok((
+        finalized_recording_state(deferred, has_audio),
+        duration_ms,
+        (!has_audio).then_some(state::AudioCaptureIssue::NoAudio),
+    ))
 }
 
 fn fail_finalize(app: &AppHandle, store: &MeetingStore, message: String) {
@@ -2411,6 +2424,8 @@ fn finish_without_audio(app: &AppHandle, store: &MeetingStore, recording_id: &st
         return;
     };
     task.state = TaskState::NoAudioDetected;
+    // This outcome is produced only by inspecting PCM, never by empty ASR output.
+    task.audio_capture_issue = Some(state::AudioCaptureIssue::NoAudio);
     task.transcript = None;
     task.transcript_path = None;
     task.error = None;
@@ -2577,16 +2592,16 @@ mod tests {
         let root = std::env::temp_dir().join(format!("snack-recovery-{}-{}", std::process::id(), super::unix_millis()));
         fs::create_dir_all(&root).unwrap();
         let path = root.join("recovered.wav");
-        for (deferred, samples, expected) in [
-            (true, vec![100; 160], TaskState::AwaitingTranscription),
-            (true, vec![0; 160], TaskState::NoAudioDetected),
-            (false, vec![100; 160], TaskState::TranscribingLocal),
-            (false, vec![0; 160], TaskState::TranscribingLocal),
+        for (deferred, samples, expected, capture_issue) in [
+            (true, vec![100; 160], TaskState::AwaitingTranscription, None),
+            (true, vec![0; 160], TaskState::NoAudioDetected, Some(super::state::AudioCaptureIssue::NoAudio)),
+            (false, vec![100; 160], TaskState::TranscribingLocal, None),
+            (false, vec![0; 160], TaskState::TranscribingLocal, Some(super::state::AudioCaptureIssue::NoAudio)),
         ] {
             let mut writer = WavWriter::create(&path).unwrap();
             writer.write_samples(&samples).unwrap();
             drop(writer);
-            assert_eq!(super::recover_recording_state(&path, deferred).unwrap(), (expected, 10));
+            assert_eq!(super::recover_recording_state(&path, deferred).unwrap(), (expected, 10, capture_issue));
         }
         fs::remove_dir_all(root).unwrap();
     }
@@ -2598,11 +2613,11 @@ mod tests {
         assert!(validate_recording_resource(ResourceState::NotInstalled, false).is_err());
         assert!(validate_recording_resource(ResourceState::Ready, false).is_ok());
         assert_eq!(
-            finalized_recording_state(true, &[100; 160]),
+            finalized_recording_state(true, true),
             TaskState::AwaitingTranscription
         );
         assert_eq!(
-            finalized_recording_state(false, &[100; 160]),
+            finalized_recording_state(false, true),
             TaskState::TranscribingLocal
         );
         assert!(!TaskState::AwaitingTranscription.blocks_recording());
@@ -2612,12 +2627,14 @@ mod tests {
     fn deferred_silence_is_detected_at_finalize_regardless_of_duration() {
         for seconds in [0, 1, 10, 11, 30] {
             let silence = vec![0; super::audio::TARGET_SAMPLE_RATE as usize * seconds];
+            let has_audio = super::audio::has_audio_signal_i16(&silence);
+            assert!(!has_audio);
             assert_eq!(
-                finalized_recording_state(true, &silence),
+                finalized_recording_state(true, has_audio),
                 TaskState::NoAudioDetected
             );
             assert_eq!(
-                finalized_recording_state(false, &silence),
+                finalized_recording_state(false, has_audio),
                 TaskState::TranscribingLocal
             );
         }

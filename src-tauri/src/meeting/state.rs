@@ -330,6 +330,12 @@ pub(crate) struct MeetingTask {
     pub(crate) language: String,
     pub(crate) audio_path: Option<String>,
     pub(crate) audio_bytes: Option<u64>,
+    /// Capture evidence is independent of ASR results and survives later transcription attempts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) audio_capture_issue: Option<AudioCaptureIssue>,
+    /// Snapshot taken when capture ends; absent in legacy recordings, never inferred from ASR.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) microphone_permission_at_end: Option<super::permissions::PermissionAccess>,
     #[serde(default = "default_audio_file_owned")]
     pub(crate) audio_file_owned: bool,
     pub(crate) transcript: Option<Transcript>,
@@ -367,6 +373,8 @@ impl MeetingTask {
             language,
             audio_path: None,
             audio_bytes: None,
+            audio_capture_issue: None,
+            microphone_permission_at_end: None,
             audio_file_owned: true,
             transcript: None,
             transcript_path: None,
@@ -384,6 +392,12 @@ impl MeetingTask {
         self.updated_at = now_rfc3339();
         self
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum AudioCaptureIssue {
+    NoAudio,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1174,6 +1188,36 @@ mod tests {
         let decoded: MeetingTask = serde_json::from_value(serialized).unwrap();
 
         assert!(decoded.audio_file_owned);
+    }
+
+    #[test]
+    fn recording_capture_evidence_round_trips_without_inventing_legacy_permissions() {
+        use super::super::permissions::PermissionAccess;
+
+        let mut task = MeetingTask::new("capture-evidence".into(), "zh".into());
+        task.state = TaskState::NoAudioDetected;
+        let legacy = serde_json::to_value(&task).unwrap();
+        assert!(legacy.get("audioCaptureIssue").is_none());
+        assert!(legacy.get("microphonePermissionAtEnd").is_none());
+        let restored: MeetingTask = serde_json::from_value(legacy).unwrap();
+        assert_eq!(restored.audio_capture_issue, None);
+        assert_eq!(restored.microphone_permission_at_end, None);
+
+        for permission in [PermissionAccess::Granted, PermissionAccess::Denied, PermissionAccess::Unknown] {
+            for deferred in [false, true] {
+                task.defer_transcription = deferred;
+                task.audio_capture_issue = Some(super::AudioCaptureIssue::NoAudio);
+                task.microphone_permission_at_end = Some(permission);
+                // A later failed transcription must preserve the original capture facts.
+                task.state = TaskState::TranscriptionFailed;
+                let value = serde_json::to_value(&task).unwrap();
+                assert_eq!(value["audioCaptureIssue"], "no_audio");
+                assert_eq!(value["microphonePermissionAtEnd"], permission.as_str());
+                let restored: MeetingTask = serde_json::from_value(value).unwrap();
+                assert_eq!(restored.audio_capture_issue, Some(super::AudioCaptureIssue::NoAudio));
+                assert_eq!(restored.microphone_permission_at_end, Some(permission));
+            }
+        }
     }
 
     #[test]
