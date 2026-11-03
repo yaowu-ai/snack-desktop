@@ -30,6 +30,14 @@ struct BridgeMethodRegistration {
 const METHODS: &[BridgeMethodRegistration] = &[
     BridgeMethodRegistration {
         descriptor: BridgeMethodDescriptor {
+            method: "browser.open",
+            introduced_contract_revision: 7,
+            api_versions: &[1],
+        },
+        handler: browser_open_handler,
+    },
+    BridgeMethodRegistration {
+        descriptor: BridgeMethodDescriptor {
             method: "files.preview",
             introduced_contract_revision: 5,
             api_versions: &[1],
@@ -125,6 +133,26 @@ const METHODS: &[BridgeMethodRegistration] = &[
         handler: recording_overlay_sync_handler,
     },
 ];
+
+fn browser_open_handler(
+    _context: BridgeContext,
+    payload: serde_json::Value,
+) -> BridgeHandlerFuture {
+    Box::pin(async move {
+        let request: super::browser::BrowserOpenRequest = parse_payload(payload)?;
+        let url = super::browser::validate_browser_url(&request.url).map_err(|message| {
+            BridgeHandlerError {
+                code: "INVALID_BROWSER_URL",
+                message,
+            }
+        })?;
+        crate::platform::open_external_url(&url).map_err(|_| BridgeHandlerError {
+            code: "BROWSER_OPEN_FAILED",
+            message: "failed to open system browser".into(),
+        })?;
+        Ok(serde_json::json!({ "opened": true }))
+    })
+}
 
 fn recording_overlay_sync_handler(
     context: BridgeContext,
@@ -465,7 +493,8 @@ mod tests {
 
     #[test]
     fn registry_exposes_only_explicit_methods() {
-        assert_eq!(descriptors().len(), 12);
+        assert_eq!(descriptors().len(), 13);
+        assert!(find("browser.open").is_some());
         assert!(find("files.preview").is_some());
         assert!(find("bridge.info").is_some());
         assert!(find("locale.get").is_some());
