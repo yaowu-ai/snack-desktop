@@ -2,7 +2,7 @@
 
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStderr, Command, Stdio};
+use std::process::{Child, ChildStderr, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -11,6 +11,7 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 use crate::meeting::catalog::ModelKey;
+use crate::meeting::python_process::python_command;
 use crate::meeting::state::TranscriptSegment;
 
 const FUNASR_TRANSCRIBER: &str = include_str!("funasr_transcribe.py");
@@ -168,7 +169,7 @@ fn run_modelscope(
     let stderr = stderr_thread.join().unwrap_or_default();
     let transcript = protocol_result?;
     if !status.success() {
-        return Err(transcriber_failure_message(&stderr));
+        return Err(transcriber_failure_message(&stderr, status));
     }
     transcript.ok_or_else(|| "本地转写结果无效：模型未返回结果".to_string())
 }
@@ -183,7 +184,7 @@ fn spawn_transcriber(
         return Err("本地会议模型运行环境不完整，请重新下载".to_string());
     }
     let script = ensure_transcriber_script(&runtime_dir)?;
-    let mut child = Command::new(python)
+    let mut child = python_command(&python)
         .args(["-I", "-X", "utf8"])
         .arg(script)
         .arg(request.wav_path)
@@ -303,16 +304,19 @@ fn decode_message_bytes(line: &[u8]) -> Option<ModelScopeMessage> {
 
 fn diagnostic(stderr: &str) -> String {
     let trimmed = stderr.trim();
-    let start = trimmed.len().saturating_sub(4_000);
-    trimmed.get(start..).unwrap_or(trimmed).to_string()
+    let mut start = trimmed.len().saturating_sub(4_000);
+    while !trimmed.is_char_boundary(start) {
+        start += 1;
+    }
+    trimmed[start..].to_string()
 }
 
-fn transcriber_failure_message(stderr: &str) -> String {
+fn transcriber_failure_message(stderr: &str, status: ExitStatus) -> String {
     let details = diagnostic(stderr);
     if details.is_empty() {
-        return "本地 FunASR 转写进程异常退出，未返回诊断信息".to_string();
+        return format!("本地 FunASR 转写进程异常退出（{status}），未返回诊断信息");
     }
-    format!("本地 FunASR 转写失败: {details}")
+    format!("本地 FunASR 转写失败（{status}）: {details}")
 }
 
 fn progress_update(percent: u8, remaining_seconds: Option<u64>) -> TranscriptionProgress {
@@ -405,7 +409,7 @@ fn normalize_audio_with_python(
     let runtime_dir = request.model_dir.join("runtime");
     let python = crate::meeting::python_runtime::venv_python(&runtime_dir);
     let script = ensure_transcriber_script(&runtime_dir)?;
-    let mut child = Command::new(python)
+    let mut child = python_command(&python)
         .args(["-I", "-X", "utf8"])
         .arg(script)
         .arg("--normalize")
@@ -445,7 +449,10 @@ fn wait_for_normalizer(
             return if status.success() {
                 Ok(())
             } else {
-                Err(format!("音频格式转换失败: {}", diagnostic(&stderr_output)))
+                Err(format!(
+                    "音频格式转换失败（{status}）: {}",
+                    diagnostic(&stderr_output)
+                ))
             };
         }
         if started_at.elapsed() >= AUDIO_NORMALIZATION_TIMEOUT {
@@ -584,10 +591,49 @@ mod tests {
 
     #[test]
     fn empty_stderr_returns_an_actionable_transcriber_failure() {
+        let status = failed_exit_status(23);
         assert_eq!(
-            transcriber_failure_message(""),
-            "本地 FunASR 转写进程异常退出，未返回诊断信息"
+            transcriber_failure_message("", status),
+            format!("本地 FunASR 转写进程异常退出（{status}），未返回诊断信息")
         );
+    }
+
+    #[test]
+    fn transcriber_failure_retains_exit_status_and_stderr() {
+        let status = failed_exit_status(23);
+        let message = transcriber_failure_message("ImportError: missing dependency", status);
+        assert!(message.contains(&status.to_string()));
+        assert!(message.ends_with("ImportError: missing dependency"));
+    }
+
+    #[test]
+    fn diagnostic_keeps_a_bounded_utf8_tail() {
+        let stderr = format!("{}结束", "错".repeat(1_400));
+        let message = diagnostic(&stderr);
+        assert!(message.len() <= 4_000);
+        assert!(message.ends_with("结束"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn console_termination_code_is_retained_without_stderr() {
+        let status = failed_exit_status(0xC000_013A);
+        let message = transcriber_failure_message("", status);
+        assert!(message.contains(&status.to_string()));
+        assert!(message.contains("未返回诊断信息"));
+    }
+
+    fn failed_exit_status(code: u32) -> ExitStatus {
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::ExitStatusExt;
+            ExitStatus::from_raw(code)
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            ExitStatus::from_raw((code as i32) << 8)
+        }
     }
 
     #[test]

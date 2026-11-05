@@ -22,6 +22,7 @@ mod note_overlay_lifecycle;
 pub(crate) mod overlay;
 pub(crate) mod overlay_locale;
 mod permissions;
+mod python_process;
 mod python_runtime;
 mod record_history;
 pub(crate) mod quick_access;

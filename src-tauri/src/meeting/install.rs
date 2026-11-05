@@ -13,7 +13,7 @@ use std::collections::VecDeque;
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -27,6 +27,7 @@ use crate::meeting::audio::{available_bytes, disk_has_room, sha256_file};
 use crate::meeting::catalog::{
     find_model, platform_label, CatalogModel, ModelArtifact, ModelKey, CATALOG_VERSION,
 };
+use crate::meeting::python_process::python_command;
 use crate::meeting::state::{
     now_rfc3339, persist_json_atomic, DownloadProgress, MeetingStore, ResourceState, ResourceStatus,
 };
@@ -483,7 +484,7 @@ fn spawn_modelscope_downloader(
 ) -> Result<std::process::Child, String> {
     let stderr =
         fs::File::create(log_path).map_err(|error| format!("无法创建模型下载日志: {error}"))?;
-    Command::new(python)
+    python_command(python)
         .arg(context.runtime_dir.join("modelscope_download.py"))
         .env("MODELSCOPE_CACHE", &context.cache_dir)
         .stdout(Stdio::piped())
