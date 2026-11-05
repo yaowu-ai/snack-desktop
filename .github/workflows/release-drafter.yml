@@ -1,0 +1,23 @@
+name: Release Drafter
+
+on:
+  push:
+    branches: [prod]
+  pull_request_target:
+    types: [opened, reopened, synchronize]
+
+permissions:
+  contents: write
+  pull-requests: read
+
+jobs:
+  update_release_draft:
+    runs-on: ubuntu-latest
+    steps:
+      # Draft release notes only. Does not publish, does not create tags.
+      # Tag-triggered builds stay in release.yml.
+      - uses: release-drafter/release-drafter@v6
+        with:
+          publish: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

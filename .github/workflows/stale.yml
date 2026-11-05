@@ -1,0 +1,35 @@
+name: Stale
+
+on:
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  issues: write
+  pull-requests: write
+
+jobs:
+  stale:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/stale@v9
+        with:
+          days-before-issue-stale: 60
+          days-before-issue-close: 14
+          days-before-pr-stale: 45
+          days-before-pr-close: 14
+          stale-issue-label: stale
+          stale-pr-label: stale
+          exempt-issue-labels: pinned,security,good first issue
+          exempt-pr-labels: pinned,security,good first issue
+          stale-issue-message: |
+            这个 issue 已 60 天无活动，标记为 stale。
+            留言可保持打开，否则 14 天后关闭。
+          close-issue-message: |
+            因长期无活动关闭。仍相关请重新打开。
+          stale-pr-message: |
+            这个 PR 已 45 天无活动，标记为 stale。
+            留言可保持打开，否则 14 天后关闭。
+          close-pr-message: |
+            因长期无活动关闭。仍相关请重新打开。

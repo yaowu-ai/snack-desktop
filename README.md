@@ -114,3 +114,7 @@ Bridge Kernel 之前的客户端由 Web 的通用 command-not-found updater 兜�
 ## 许可证
 
 本项目采用 [MIT License](LICENSE)。
+
+## Star History
+
+[![Star History Chart](https://api.star-history.com/svg?repos=yaowu-ai/snack-desktop&type=Date)](https://star-history.com/#yaowu-ai/snack-desktop&Date)

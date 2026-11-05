@@ -1,0 +1,27 @@
+name: Welcome
+
+on:
+  pull_request_target:
+    types: [opened]
+  issues:
+    types: [opened]
+
+permissions:
+  issues: write
+  pull-requests: write
+
+jobs:
+  welcome:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/first-interaction@v1
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+          issue-message: |
+            感谢提第一个 issue。
+
+            动手前先看一眼 README，确认复现步骤和版本信息写清楚。
+          pr-message: |
+            感谢提第一个 PR。
+
+            请先对照 README 的本地开发与打包说明，再继续改动。
