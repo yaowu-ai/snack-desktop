@@ -4,6 +4,7 @@ use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStderr, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -17,6 +18,10 @@ use crate::meeting::state::TranscriptSegment;
 const FUNASR_TRANSCRIBER: &str = include_str!("funasr_transcribe.py");
 const TRANSCRIPTION_STALLED: &str = "本地转写长时间停留在 95%";
 const TRANSCRIPTION_STALL_GRACE: Duration = Duration::from_secs(120);
+// A healthy worker emits a progress heartbeat every second.  Keep a bounded
+// wait around the pipe so a Python startup/model deadlock cannot leave the task
+// in `transcribing_local` forever.
+const TRANSCRIPTION_OUTPUT_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const AUDIO_NORMALIZATION_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 static SCRIPT_UPDATE_COUNTER: AtomicU64 = AtomicU64::new(0);
 static NORMALIZED_AUDIO_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -234,12 +239,47 @@ fn ensure_transcriber_script(runtime_dir: &Path) -> Result<std::path::PathBuf, S
 
 fn consume_protocol(
     child: &mut Child,
-    mut reader: impl BufRead,
+    reader: impl BufRead + Send + 'static,
     on_progress: &mut impl FnMut(TranscriptionProgress) -> bool,
 ) -> Result<Option<ModelScopeTranscript>, String> {
+    let (sender, receiver) = mpsc::channel();
+    let reader_thread = std::thread::spawn(move || {
+        let mut reader = reader;
+        loop {
+            match read_protocol_line(&mut reader) {
+                Ok(Some(line)) => {
+                    if sender.send(Ok(Some(line))).is_err() {
+                        break;
+                    }
+                }
+                Ok(None) => {
+                    let _ = sender.send(Ok(None));
+                    break;
+                }
+                Err(error) => {
+                    let _ = sender.send(Err(error));
+                    break;
+                }
+            }
+        }
+    });
     let mut transcript = None;
     let mut stall = TranscriptionStall::default();
-    while let Some(line) = read_protocol_line(&mut reader)? {
+    let result = loop {
+        let message = match receiver.recv_timeout(TRANSCRIPTION_OUTPUT_TIMEOUT) {
+            Ok(message) => message?,
+            Err(RecvTimeoutError::Timeout) => {
+                child.kill().ok();
+                break Err(format!(
+                    "本地转写进程超过 {} 分钟没有输出",
+                    TRANSCRIPTION_OUTPUT_TIMEOUT.as_secs() / 60
+                ));
+            }
+            Err(RecvTimeoutError::Disconnected) => break Ok(transcript),
+        };
+        let Some(line) = message else {
+            break Ok(transcript);
+        };
         match decode_message_bytes(&line) {
             Some(ModelScopeMessage::Progress {
                 percent,
@@ -247,11 +287,11 @@ fn consume_protocol(
             }) => {
                 if stall.observe(percent, remaining_seconds, Instant::now()) {
                     child.kill().ok();
-                    return Err(TRANSCRIPTION_STALLED.to_string());
+                    break Err(TRANSCRIPTION_STALLED.to_string());
                 }
                 if !on_progress(progress_update(percent.min(99), Some(remaining_seconds))) {
                     child.kill().ok();
-                    return Err("本地转写已停止".to_string());
+                    break Err("本地转写已停止".to_string());
                 }
             }
             Some(ModelScopeMessage::Result { text, segments }) => {
@@ -259,8 +299,15 @@ fn consume_protocol(
             }
             _ => {}
         }
+    };
+    // On the normal EOF path the reader has already finished, so join it to
+    // avoid leaving a pipe reader behind.  After cancellation/timeout, do not
+    // wait for a possibly inherited pipe handle; dropping the handle lets the
+    // transcription worker return and mark the task failed.
+    if result.is_ok() {
+        let _ = reader_thread.join();
     }
-    Ok(transcript)
+    result
 }
 
 #[derive(Default)]

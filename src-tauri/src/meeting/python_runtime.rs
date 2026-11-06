@@ -24,6 +24,8 @@ const DEPENDENCY_CHECK_LOG_FILE: &str = "dependency-check.log";
 const PYTORCH_CPU_INDEX: &str = "https://download.pytorch.org/whl/cpu";
 const PIP_ATTEMPTS: u8 = 2;
 const COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const STALE_VENV_CLEANUP_ATTEMPTS: u8 = 12;
+const STALE_VENV_CLEANUP_INTERVAL: Duration = Duration::from_millis(500);
 const VENV_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const PIP_TIMEOUT: Duration = Duration::from_secs(45 * 60);
 const DEPENDENCY_CHECK_TIMEOUT: Duration = Duration::from_secs(5 * 60);
@@ -322,8 +324,27 @@ fn rebuild_environment(runtime_dir: &Path, managed: &ManagedPython) -> Result<()
     let venv = runtime_dir.join("venv");
     fs::remove_file(runtime_dir.join(STATE_FILE)).ok();
     if venv.exists() {
-        fs::remove_dir_all(&venv)
-            .map_err(|error| failure_from_io("remove stale virtual environment", error))?;
+        let mut last_error = None;
+        for attempt in 0..STALE_VENV_CLEANUP_ATTEMPTS {
+            match fs::remove_dir_all(&venv) {
+                Ok(()) => {
+                    last_error = None;
+                    break;
+                }
+                Err(error) => {
+                    last_error = Some(error);
+                    if attempt + 1 < STALE_VENV_CLEANUP_ATTEMPTS {
+                        thread::sleep(STALE_VENV_CLEANUP_INTERVAL);
+                    }
+                }
+            }
+        }
+        if let Some(error) = last_error {
+            return Err(failure_from_io(
+                "remove stale virtual environment after retries",
+                error,
+            ));
+        }
     }
     let mut command = python_command(&managed.executable);
     command.args(["-I", "-m", "venv", "--copies"]).arg(&venv);

@@ -94,8 +94,11 @@ fn build_open_url_command(url: &str) -> Command {
 
 #[cfg(windows)]
 fn build_open_url_command(url: &str) -> Command {
-    let mut command = Command::new("explorer.exe");
-    command.arg(url);
+    // `explorer.exe` may treat URLs containing a query as file-system paths and
+    // open File Explorer. Delegate the URL to Windows' default protocol handler
+    // instead, matching the browser behavior used on the other platforms.
+    let mut command = Command::new("cmd");
+    command.args(["/C", "start", "", url]);
     command
 }
 

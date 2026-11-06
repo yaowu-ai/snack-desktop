@@ -2191,8 +2191,22 @@ pub(crate) fn meeting_retranscribe(
 
 fn spawn_transcription(app: AppHandle, store: MeetingStore, recording_id: String) {
     if !register_transcription(&recording_id) {
+        crate::logging::write_app_log(
+            &app,
+            "info",
+            "meeting-transcribe",
+            "transcription already active; restart queued",
+            Some(&serde_json::json!({ "recordingId": recording_id.as_str() })),
+        );
         return;
     }
+    crate::logging::write_app_log(
+        &app,
+        "info",
+        "meeting-transcribe",
+        "transcription worker queued",
+        Some(&serde_json::json!({ "recordingId": recording_id.as_str() })),
+    );
     let failure_app = app.clone();
     let failure_store = store.clone_for_task();
     let failure_recording_id = recording_id.clone();
@@ -2207,6 +2221,13 @@ fn spawn_transcription(app: AppHandle, store: MeetingStore, recording_id: String
             let _gate = TRANSCRIPTION_GATE
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
+            crate::logging::write_app_log(
+                &app,
+                "info",
+                "meeting-transcribe",
+                "transcription worker started",
+                Some(&serde_json::json!({ "recordingId": recording_id.as_str() })),
+            );
             if !store
                 .load_task_record(&recording_id)
                 .is_some_and(|task| task.state == TaskState::TranscribingLocal)
@@ -2270,7 +2291,18 @@ fn spawn_transcription(app: AppHandle, store: MeetingStore, recording_id: String
             let recording_id_for_progress = recording_id.clone();
             let runtime_dir = model_dir.join("runtime");
             let ensure_runtime = || {
-                let on_stage = |_| {};
+                let on_stage = |stage| {
+                    crate::logging::write_app_log(
+                        &app,
+                        "info",
+                        "meeting-transcribe",
+                        "local Python runtime stage",
+                        Some(&serde_json::json!({
+                            "recordingId": recording_id.as_str(),
+                            "stage": format!("{stage:?}"),
+                        })),
+                    );
+                };
                 python_runtime::ensure_ready(python_runtime::RuntimeSetup {
                     app: &app,
                     runtime_dir: &runtime_dir,
@@ -2278,6 +2310,20 @@ fn spawn_transcription(app: AppHandle, store: MeetingStore, recording_id: String
                 })
                 .map(drop)
             };
+            crate::logging::write_app_log(
+                &app,
+                "info",
+                "meeting-transcribe",
+                "starting FunASR worker",
+                Some(&serde_json::json!({
+                    "recordingId": recording_id.as_str(),
+                    "model": model_key.as_str(),
+                    "language": language.as_str(),
+                })),
+            );
+            let mut last_progress_log_at = std::time::Instant::now()
+                .checked_sub(std::time::Duration::from_secs(15))
+                .unwrap_or_else(std::time::Instant::now);
             let outcome = transcribe::transcribe_file(
                 transcribe::TranscriptionRequest {
                     model_key,
@@ -2287,6 +2333,23 @@ fn spawn_transcription(app: AppHandle, store: MeetingStore, recording_id: String
                 },
                 ensure_runtime,
                 move |progress| {
+                    if last_progress_log_at.elapsed() >= std::time::Duration::from_secs(15)
+                        || progress.percent >= 100
+                    {
+                        crate::logging::write_app_log(
+                            &app_for_progress,
+                            "info",
+                            "meeting-transcribe",
+                            "transcription progress",
+                            Some(&serde_json::json!({
+                                "recordingId": recording_id_for_progress,
+                                "percent": progress.percent,
+                                "remainingSeconds": progress.remaining_seconds,
+                                "segmentCount": progress.segment_count,
+                            })),
+                        );
+                        last_progress_log_at = std::time::Instant::now();
+                    }
                     let _ = app_for_progress.emit(
                         TRANSCRIPTION_PROGRESS_EVENT,
                         serde_json::json!({
@@ -2307,6 +2370,13 @@ fn spawn_transcription(app: AppHandle, store: MeetingStore, recording_id: String
 
             let transcript = match outcome {
                 Ok(transcribe::TranscriptionOutcome::NoAudioDetected) => {
+                    crate::logging::write_app_log(
+                        &app,
+                        "info",
+                        "meeting-transcribe",
+                        "transcription finished without audio",
+                        Some(&serde_json::json!({ "recordingId": recording_id.as_str() })),
+                    );
                     finish_without_audio(&app, &store, &recording_id);
                     return;
                 }
@@ -2323,10 +2393,28 @@ fn spawn_transcription(app: AppHandle, store: MeetingStore, recording_id: String
                     generated_at: now_rfc3339(),
                 },
                 Err(message) => {
+                    crate::logging::write_app_log(
+                        &app,
+                        "error",
+                        "meeting-transcribe",
+                        "transcription worker returned an error",
+                        Some(&serde_json::json!({
+                            "recordingId": recording_id.as_str(),
+                            "reason": message,
+                        })),
+                    );
                     fail_transcription_task(&app, &store, &recording_id, message);
                     return;
                 }
             };
+
+            crate::logging::write_app_log(
+                &app,
+                "info",
+                "meeting-transcribe",
+                "transcription worker produced a result",
+                Some(&serde_json::json!({ "recordingId": recording_id.as_str() })),
+            );
 
             // Atomically persist the transcript and retain the user-owned audio.
             let mut task = match store.load_task_record(&recording_id) {

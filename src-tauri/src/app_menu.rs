@@ -8,6 +8,9 @@ use std::time::Duration;
 use crate::i18n::{self, t, Locale};
 use tauri::{AppHandle, Manager, WebviewWindow};
 
+#[cfg(any(target_os = "macos", windows))]
+struct LocalizedMenuState(std::sync::Mutex<Option<Locale>>);
+
 #[cfg(windows)]
 use crate::attention::DesktopAttentionState;
 #[cfg(windows)]
@@ -31,12 +34,23 @@ fn navigation_back_accelerator() -> &'static str {
 
 #[cfg(any(target_os = "macos", windows))]
 pub(crate) fn setup_navigation_menu(app: &mut tauri::App) -> tauri::Result<()> {
-    install_application_menu(app.handle())
+    app.manage(LocalizedMenuState(std::sync::Mutex::new(None)));
+    install_application_menu(app.handle()).map(|_| ())
 }
 
 #[cfg(any(target_os = "macos", windows))]
-fn install_application_menu(app: &AppHandle) -> tauri::Result<()> {
+fn install_application_menu(app: &AppHandle) -> tauri::Result<bool> {
     use tauri::menu::{MenuItem, Submenu};
+
+    // Web locale synchronization can repeat on focus or navigation. Tauri's
+    // set_menu removes the old menu first, temporarily changing the Windows
+    // client height. Only replace native menus when their language changes.
+    let locale = i18n::snapshot(app).locale;
+    let state = app.state::<LocalizedMenuState>();
+    let mut installed_locale = state.0.lock().unwrap_or_else(|error| error.into_inner());
+    if *installed_locale == Some(locale) {
+        return Ok(false);
+    }
 
     let back = MenuItem::with_id(
         app,
@@ -63,9 +77,17 @@ fn install_application_menu(app: &AppHandle) -> tauri::Result<()> {
     let site_menu = build_site_menu(app, Some(selected_site))?;
     menu.insert(&site_menu, site_menu_position())?;
     menu.append(&navigation)?;
+    crate::logging::write_app_log(
+        app,
+        "info",
+        "app-menu",
+        "Installing localized application menu",
+        Some(&serde_json::json!({ "previousLocale": *installed_locale, "locale": locale })),
+    );
     app.set_menu(menu)?;
+    *installed_locale = Some(locale);
 
-    Ok(())
+    Ok(true)
 }
 
 #[cfg(any(target_os = "macos", windows))]
@@ -305,21 +327,62 @@ pub(crate) fn show_main_window(app: &AppHandle) {
 
 #[cfg(any(target_os = "macos", windows))]
 fn register_status_menu_events(app: &mut tauri::App) {
-    app.on_menu_event(|app, event| match event.id().as_ref() {
-        NAVIGATION_MENU_BACK_ID => {
-            if let Some(window) = app.get_webview_window("main") {
-                navigate_back(&window);
+    app.on_menu_event(|app, event| {
+        log_menu_event(app, event.id().as_ref());
+        match event.id().as_ref() {
+            NAVIGATION_MENU_BACK_ID => {
+                if let Some(window) = app.get_webview_window("main") {
+                    navigate_back(&window);
+                }
             }
-        }
-        TRAY_MENU_SHOW_ID => show_main_window(app),
-        TRAY_MENU_MEETING_ID => crate::meeting::quick_access::request_quick_recording(app),
-        TRAY_MENU_QUIT_ID => app.exit(0),
-        id => {
-            if let Some(site) = crate::site::SiteKey::from_menu_id(id) {
-                handle_site_selection(app, site);
+            TRAY_MENU_SHOW_ID => show_main_window(app),
+            TRAY_MENU_MEETING_ID => crate::meeting::quick_access::request_quick_recording(app),
+            TRAY_MENU_QUIT_ID => app.exit(0),
+            id => {
+                if let Some(site) = crate::site::SiteKey::from_menu_id(id) {
+                    handle_site_selection(app, site);
+                }
             }
         }
     });
+}
+
+#[cfg(any(target_os = "macos", windows))]
+fn log_menu_event(app: &AppHandle, id: &str) {
+    let Some(window) = app.get_webview_window("main") else {
+        crate::logging::write_app_log(
+            app,
+            "info",
+            "app-menu",
+            "Native menu event without main window",
+            Some(&serde_json::json!({ "id": id })),
+        );
+        return;
+    };
+
+    crate::logging::write_app_log(
+        app,
+        "info",
+        "app-menu",
+        "Native menu event",
+        Some(&window_geometry(&window, id)),
+    );
+}
+
+#[cfg(any(target_os = "macos", windows))]
+fn window_geometry(window: &WebviewWindow, source: &str) -> serde_json::Value {
+    serde_json::json!({
+        "source": source,
+        "label": window.label(),
+        "focused": window.is_focused().ok(),
+        "minimized": window.is_minimized().ok(),
+        "maximized": window.is_maximized().ok(),
+        "fullscreen": window.is_fullscreen().ok(),
+        "outerPosition": window.outer_position().ok().map(|position| serde_json::json!({ "x": position.x, "y": position.y })),
+        "outerSize": window.outer_size().ok().map(|size| serde_json::json!({ "width": size.width, "height": size.height })),
+        "innerSize": window.inner_size().ok().map(|size| serde_json::json!({ "width": size.width, "height": size.height })),
+        "scaleFactor": window.scale_factor().ok(),
+    })
 }
 
 #[cfg(any(target_os = "macos", windows))]
@@ -478,6 +541,31 @@ fn log_site_switch_failure(app: &AppHandle, site: crate::site::SiteKey, error: &
 pub(crate) fn install_close_to_status_menu(window: &WebviewWindow) {
     let close_window = window.clone();
     window.on_window_event(move |event| {
+        #[cfg(windows)]
+        if matches!(
+            event,
+            tauri::WindowEvent::Focused(_)
+                | tauri::WindowEvent::Moved(_)
+                | tauri::WindowEvent::Resized(_)
+                | tauri::WindowEvent::ScaleFactorChanged { .. }
+                | tauri::WindowEvent::CloseRequested { .. }
+        ) {
+            let event_name = match event {
+                tauri::WindowEvent::Focused(_) => "focused",
+                tauri::WindowEvent::Moved(_) => "moved",
+                tauri::WindowEvent::Resized(_) => "resized",
+                tauri::WindowEvent::ScaleFactorChanged { .. } => "scale-factor-changed",
+                tauri::WindowEvent::CloseRequested { .. } => "close-requested",
+                _ => unreachable!(),
+            };
+            crate::logging::write_app_log(
+                &close_window.app_handle(),
+                "info",
+                "window-diagnostics",
+                "Main window event",
+                Some(&window_geometry(&close_window, event_name)),
+            );
+        }
         if let tauri::WindowEvent::CloseRequested { api, .. } = event {
             api.prevent_close();
             let _ = close_window.hide();
@@ -576,7 +664,9 @@ fn build_status_menu(app: &AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::
 
 #[cfg(any(target_os = "macos", windows))]
 pub(crate) fn refresh_localized_menus(app: &AppHandle) -> tauri::Result<()> {
-    install_application_menu(app)?;
+    if !install_application_menu(app)? {
+        return Ok(());
+    }
     if let Some(tray) = app.tray_by_id(TRAY_ID) {
         tray.set_menu(Some(build_status_menu(app)?))?;
     }
