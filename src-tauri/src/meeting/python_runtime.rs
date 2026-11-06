@@ -12,6 +12,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tauri::{AppHandle, Manager};
 
+use super::python_process::python_command;
+
 const RUNTIME_ID: &str = "cpython-3.12.13+20260718";
 const PYTHON_VERSION: (u8, u8, u8) = (3, 12, 13);
 const REQUIREMENTS: &str = include_str!("requirements.lock.txt");
@@ -22,6 +24,8 @@ const DEPENDENCY_CHECK_LOG_FILE: &str = "dependency-check.log";
 const PYTORCH_CPU_INDEX: &str = "https://download.pytorch.org/whl/cpu";
 const PIP_ATTEMPTS: u8 = 2;
 const COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const STALE_VENV_CLEANUP_ATTEMPTS: u8 = 12;
+const STALE_VENV_CLEANUP_INTERVAL: Duration = Duration::from_millis(500);
 const VENV_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const PIP_TIMEOUT: Duration = Duration::from_secs(45 * 60);
 const DEPENDENCY_CHECK_TIMEOUT: Duration = Duration::from_secs(5 * 60);
@@ -250,7 +254,7 @@ fn inspect_python(executable: &Path) -> Result<PythonInfo, RuntimeFailure> {
             executable.display()
         )));
     }
-    let output = Command::new(executable)
+    let output = python_command(executable)
         .args(["-I", "-c", PYTHON_INFO_SCRIPT])
         .output()
         .map_err(|error| RuntimeFailure::package(format!("start managed interpreter: {error}")))?;
@@ -308,7 +312,7 @@ fn environment_is_current(runtime_dir: &Path, expected: &RuntimeState) -> bool {
 }
 
 fn dependencies_import(runtime_dir: &Path) -> bool {
-    Command::new(venv_python(runtime_dir))
+    python_command(&venv_python(runtime_dir))
         .args(["-I", "-c", DEPENDENCY_CHECK_SCRIPT])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -320,10 +324,29 @@ fn rebuild_environment(runtime_dir: &Path, managed: &ManagedPython) -> Result<()
     let venv = runtime_dir.join("venv");
     fs::remove_file(runtime_dir.join(STATE_FILE)).ok();
     if venv.exists() {
-        fs::remove_dir_all(&venv)
-            .map_err(|error| failure_from_io("remove stale virtual environment", error))?;
+        let mut last_error = None;
+        for attempt in 0..STALE_VENV_CLEANUP_ATTEMPTS {
+            match fs::remove_dir_all(&venv) {
+                Ok(()) => {
+                    last_error = None;
+                    break;
+                }
+                Err(error) => {
+                    last_error = Some(error);
+                    if attempt + 1 < STALE_VENV_CLEANUP_ATTEMPTS {
+                        thread::sleep(STALE_VENV_CLEANUP_INTERVAL);
+                    }
+                }
+            }
+        }
+        if let Some(error) = last_error {
+            return Err(failure_from_io(
+                "remove stale virtual environment after retries",
+                error,
+            ));
+        }
     }
-    let mut command = Command::new(&managed.executable);
+    let mut command = python_command(&managed.executable);
     command.args(["-I", "-m", "venv", "--copies"]).arg(&venv);
     let outcome = run_logged_command(
         &mut command,
@@ -357,7 +380,7 @@ fn run_pip(runtime_dir: &Path) -> Result<CommandOutcome, RuntimeFailure> {
 }
 
 fn pip_install_command(runtime_dir: &Path) -> Command {
-    let mut command = Command::new(venv_python(runtime_dir));
+    let mut command = python_command(&venv_python(runtime_dir));
     command.args([
         "-I",
         "-m",
@@ -385,7 +408,7 @@ fn pytorch_index_for(target_os: &str) -> Option<&'static str> {
 }
 
 fn verify_dependencies(runtime_dir: &Path) -> Result<(), RuntimeFailure> {
-    let mut command = Command::new(venv_python(runtime_dir));
+    let mut command = python_command(&venv_python(runtime_dir));
     command.args(["-I", "-c", DEPENDENCY_CHECK_SCRIPT]);
     let outcome = run_logged_command(
         &mut command,

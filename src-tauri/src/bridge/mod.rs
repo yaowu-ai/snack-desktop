@@ -1,3 +1,4 @@
+mod browser;
 mod protocol;
 mod registry;
 mod updater;
@@ -184,6 +185,20 @@ mod tests {
         let response = resolve_probe(&probe("future.method", BRIDGE_CONTRACT_REVISION + 1, 1));
         assert_eq!(response.status, BridgeProbeStatus::UpdateRequired);
         assert_eq!(response.code, Some("CONTRACT_TOO_OLD"));
+    }
+
+    #[test]
+    fn browser_open_requires_contract_seven_before_opening_urls() {
+        let request = probe("browser.open", 7, 1);
+        assert_eq!(
+            resolve_probe_for_revision(&request, 6).status,
+            BridgeProbeStatus::UpdateRequired
+        );
+        assert_eq!(resolve_probe(&request).status, BridgeProbeStatus::Supported);
+        assert_eq!(
+            resolve_probe(&probe("browser.open", 7, 2)).status,
+            BridgeProbeStatus::Unsupported
+        );
     }
 
     #[test]

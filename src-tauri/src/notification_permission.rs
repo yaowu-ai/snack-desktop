@@ -4,7 +4,7 @@
 #[link(name = "UserNotifications", kind = "framework")]
 extern "C" {}
 
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", not(debug_assertions)))]
 pub(crate) async fn current(app: &tauri::AppHandle) -> Result<&'static str, String> {
     let (sender, receiver) = tokio::sync::oneshot::channel();
     app.run_on_main_thread(move || read_macos_settings(sender))
@@ -15,7 +15,12 @@ pub(crate) async fn current(app: &tauri::AppHandle) -> Result<&'static str, Stri
         .map_err(|_| crate::i18n::t(app, "desktop.permissionCancelled"))
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", debug_assertions))]
+pub(crate) async fn current(_app: &tauri::AppHandle) -> Result<&'static str, String> {
+    Ok("unsupported")
+}
+
+#[cfg(all(target_os = "macos", not(debug_assertions)))]
 fn read_macos_settings(sender: tokio::sync::oneshot::Sender<&'static str>) {
     use block2::RcBlock;
     use objc2::{class, msg_send, runtime::AnyObject};

@@ -8,7 +8,8 @@
 #[cfg(target_os = "macos")]
 use tauri::AppHandle;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum PermissionAccess {
     Granted,
     Denied,
@@ -39,9 +40,20 @@ impl PermissionAccess {
 
 #[cfg(target_os = "macos")]
 pub(crate) fn check_mac_permission_statuses() -> (PermissionAccess, PermissionAccess) {
+    let microphone = microphone_permission_at_recording_end();
+    let system_audio = system_audio_access_from_preflight(unsafe {
+        snack_audio_capture_permission_status()
+    });
+
+    (microphone, system_audio)
+}
+
+/// Read only microphone authorization, without opening either capture device or a prompt.
+#[cfg(target_os = "macos")]
+pub(crate) fn microphone_permission_at_recording_end() -> PermissionAccess {
     use objc2_av_foundation::{AVAuthorizationStatus, AVCaptureDevice, AVMediaTypeAudio};
 
-    let microphone = match unsafe { AVMediaTypeAudio } {
+    match unsafe { AVMediaTypeAudio } {
         Some(media_type) => {
             let status = unsafe { AVCaptureDevice::authorizationStatusForMediaType(media_type) };
             if status == AVAuthorizationStatus::Authorized {
@@ -52,14 +64,15 @@ pub(crate) fn check_mac_permission_statuses() -> (PermissionAccess, PermissionAc
                 PermissionAccess::Denied
             }
         }
-        None => PermissionAccess::Denied,
-    };
+        None => PermissionAccess::Unknown,
+    }
+}
 
-    let system_audio = system_audio_access_from_preflight(unsafe {
-        snack_audio_capture_permission_status()
-    });
-
-    (microphone, system_audio)
+/// The Windows device probe does not distinguish privacy denial from absent/busy devices.
+/// Preserve that uncertainty instead of showing a misleading permission-repair suggestion.
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn microphone_permission_at_recording_end() -> PermissionAccess {
+    PermissionAccess::Unknown
 }
 
 fn system_audio_access_from_preflight(status: i32) -> PermissionAccess {
