@@ -9,10 +9,11 @@ use super::super::{
 /// Unknown/unreadable paths and a not-yet-created recording never count as deletion.
 pub(super) fn missing_recording_audio(task: &MeetingTask) -> bool {
     task.state == TaskState::Recording
-        && task
-            .audio_path
-            .as_deref()
-            .is_some_and(|path| matches!(Path::new(path).try_exists(), Ok(false)))
+        && task.audio_path.as_deref().is_some_and(|path| {
+            let path = Path::new(path);
+            matches!(path.try_exists(), Ok(false))
+                && path.parent().is_some_and(Path::is_dir)
+        })
 }
 
 /// The caller serializes recording start/stop/metadata updates and validates account ownership.
