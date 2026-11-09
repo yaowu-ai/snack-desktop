@@ -14,6 +14,25 @@ pub(super) fn capsule_top(stack_above: bool) -> f64 {
     CAPSULE_TOP + if stack_above { STACK_OFFSET } else { 0.0 }
 }
 
+/// Native hit testing uses logical content coordinates, just like the embedded HTML.
+/// Shadows, the passive receipt and the unused animation canvas must pass clicks through.
+#[cfg(any(target_os = "macos", test))]
+pub(super) fn contains_control(x: f64, y: f64, stack_above: bool, can_dismiss: bool) -> bool {
+    let top = capsule_top(stack_above);
+    let radius = CAPSULE_HEIGHT / 2.0;
+    let local_x = x - CAPSULE_LEFT;
+    let local_y = y - top;
+    let nearest_x = local_x.clamp(radius, CAPSULE_WIDTH - radius);
+    let capsule = local_x >= 0.0
+        && local_x <= CAPSULE_WIDTH
+        && local_y >= 0.0
+        && local_y <= CAPSULE_HEIGHT
+        && (local_x - nearest_x).powi(2) + (local_y - radius).powi(2) <= radius.powi(2);
+    // .dismiss-action: left: 226px; top: capsule-top - 9px; size: 24px.
+    let dismiss = can_dismiss && (x - 238.0).powi(2) + (y - top - 3.0).powi(2) <= 144.0;
+    capsule || dismiss
+}
+
 #[derive(Clone, Copy)]
 pub(super) struct WorkArea {
     pub x: i32,
@@ -67,6 +86,41 @@ fn scaled(value: f64, scale: f64) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transparent_canvas_and_rounded_corners_do_not_capture_clicks() {
+        for (x, y) in [
+            (0.0, 0.0),
+            (32.0, 49.0),
+            (231.0, 49.0),
+            (130.0, 100.0),
+            (130.0, 180.0),
+            (34.0, 14.0),
+            (229.0, 84.0),
+        ] {
+            assert!(!contains_control(x, y, false, false), "{x}, {y}");
+        }
+        for (x, y) in [(34.0, 49.0), (69.0, 14.0), (130.0, 49.0), (229.0, 49.0)] {
+            assert!(contains_control(x, y, false, false), "{x}, {y}");
+        }
+    }
+
+    #[test]
+    fn dismiss_hotspot_only_exists_when_the_button_is_visible() {
+        assert!(!contains_control(238.0, 16.0, false, false));
+        assert!(contains_control(238.0, 16.0, false, true));
+        assert!(!contains_control(227.0, 5.0, false, true));
+        assert!(!contains_control(251.0, 16.0, false, true));
+    }
+
+    #[test]
+    fn stacking_moves_only_the_current_capsule_hotspot() {
+        assert!(!contains_control(130.0, 49.0, true, false));
+        assert!(contains_control(130.0, 133.0, true, false));
+        assert!(!contains_control(130.0, 91.0, true, false));
+        assert!(!contains_control(238.0, 16.0, true, true));
+        assert!(contains_control(238.0, 100.0, true, true));
+    }
 
     fn area() -> WorkArea {
         WorkArea {

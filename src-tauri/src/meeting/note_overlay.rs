@@ -9,6 +9,9 @@ use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WebviewWindow, WebviewWindo
 #[path = "note_overlay_geometry.rs"]
 mod geometry;
 #[cfg(target_os = "macos")]
+#[path = "note_overlay_mouse.rs"]
+mod mouse;
+#[cfg(target_os = "macos")]
 use geometry::{CAPSULE_LEFT, CAPSULE_TOP};
 use geometry::{WINDOW_HEIGHT, WINDOW_WIDTH};
 
@@ -1050,6 +1053,8 @@ fn refresh_on_main_thread(app: &AppHandle, reset_position: bool) -> Result<(), S
     )?;
     attach_deck_state(app, &data, &binding, &mut state);
     state.handoff_notice_id = data.handoff_notice.as_ref().map(|notice| notice.id.clone());
+    #[cfg(target_os = "macos")]
+    mouse::update(state.stack_above, state.can_dismiss);
     hide_notice(app);
     let emitted = window.emit(STATE_EVENT, &state).is_ok();
     if !window.is_visible().unwrap_or(false) {
@@ -1166,6 +1171,8 @@ fn create_capsule_window(app: &AppHandle) -> Result<(), String> {
         .map_err(|error| error.to_string())?;
     #[cfg(target_os = "macos")]
     install_native_backdrop(&window)?;
+    #[cfg(target_os = "macos")]
+    mouse::install(&window)?;
     #[cfg(not(target_os = "macos"))]
     let _ = &window;
     follow_capsule_events(app, &window);
@@ -1185,6 +1192,10 @@ fn follow_capsule_events(app: &AppHandle, window: &WebviewWindow) {
         }
         tauri::WindowEvent::Destroyed | tauri::WindowEvent::CloseRequested { .. } => {
             hide_notice(&handle);
+            #[cfg(target_os = "macos")]
+            if matches!(event, tauri::WindowEvent::Destroyed) {
+                let _ = handle.run_on_main_thread(mouse::uninstall);
+            }
         }
         _ => {}
     });
