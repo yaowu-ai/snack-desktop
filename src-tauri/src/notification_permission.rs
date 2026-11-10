@@ -1,5 +1,9 @@
 //! Read current OS authorization, not the notification plugin's persisted WebView choice.
 
+#[cfg(any(target_os = "windows", test))]
+#[path = "notification_permission_windows.rs"]
+mod windows_permission;
+
 #[cfg(target_os = "macos")]
 #[link(name = "UserNotifications", kind = "framework")]
 extern "C" {}
@@ -57,7 +61,15 @@ fn permission_from_status(status: isize) -> &'static str {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "windows")]
+pub(crate) async fn current(app: &tauri::AppHandle) -> Result<&'static str, String> {
+    let identifier = app.config().identifier.clone();
+    tauri::async_runtime::spawn_blocking(move || windows_permission::current(&identifier))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 pub(crate) async fn current(_app: &tauri::AppHandle) -> Result<&'static str, String> {
     Ok("unsupported")
 }
