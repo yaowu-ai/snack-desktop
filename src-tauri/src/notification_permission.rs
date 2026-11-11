@@ -8,7 +8,7 @@ mod windows_permission;
 #[link(name = "UserNotifications", kind = "framework")]
 extern "C" {}
 
-#[cfg(all(target_os = "macos", not(debug_assertions)))]
+#[cfg(target_os = "macos")]
 pub(crate) async fn current(app: &tauri::AppHandle) -> Result<&'static str, String> {
     let (sender, receiver) = tokio::sync::oneshot::channel();
     app.run_on_main_thread(move || read_macos_settings(sender))
@@ -19,12 +19,7 @@ pub(crate) async fn current(app: &tauri::AppHandle) -> Result<&'static str, Stri
         .map_err(|_| crate::i18n::t(app, "desktop.permissionCancelled"))
 }
 
-#[cfg(all(target_os = "macos", debug_assertions))]
-pub(crate) async fn current(_app: &tauri::AppHandle) -> Result<&'static str, String> {
-    Ok("unsupported")
-}
-
-#[cfg(all(target_os = "macos", not(debug_assertions)))]
+#[cfg(target_os = "macos")]
 fn read_macos_settings(sender: tokio::sync::oneshot::Sender<&'static str>) {
     use block2::RcBlock;
     use objc2::{class, msg_send, runtime::AnyObject};
@@ -86,5 +81,16 @@ mod tests {
             assert_eq!(permission_from_status(status), "granted");
         }
         assert_eq!(permission_from_status(99), "unsupported");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn unbundled_process_does_not_access_the_notification_center() {
+        use objc2_foundation::NSBundle;
+
+        assert!(NSBundle::mainBundle().bundleIdentifier().is_none());
+        let (sender, mut receiver) = tokio::sync::oneshot::channel();
+        super::read_macos_settings(sender);
+        assert_eq!(receiver.try_recv().unwrap(), "unsupported");
     }
 }
