@@ -171,6 +171,20 @@ def transcript_payload(item: dict) -> dict:
     return {"type": "result", "text": text, "segments": segments}
 
 
+def configure_speaker_clustering(model) -> None:
+    """Keep tensor dtypes out of UMAP's NumPy dtype checks on long recordings."""
+    import torch
+
+    cluster = model.cb_model.umap_hdbscan_cluster
+
+    def cluster_numpy(embeddings):
+        if torch.is_tensor(embeddings):
+            embeddings = embeddings.detach().cpu().numpy()
+        return cluster(embeddings)
+
+    model.cb_model.umap_hdbscan_cluster = cluster_numpy
+
+
 def run_model(audio_path: Path) -> list[dict]:
     cache = Path(os.environ["MODELSCOPE_CACHE"])
     asr, vad, punc, speaker = (model_dir(cache, name) for name in MODEL_NAMES)
@@ -181,6 +195,7 @@ def run_model(audio_path: Path) -> list[dict]:
             model=str(asr), vad_model=str(vad), punc_model=str(punc), spk_model=str(speaker),
             disable_update=True, disable_pbar=True,
         )
+        configure_speaker_clustering(model)
         return model.generate(
             input=str(audio_path), batch_size_s=300, sentence_timestamp=True
         )
