@@ -68,7 +68,7 @@ pub(crate) fn notify_recording_save_failed(app: &AppHandle, recording_id: &str) 
 
 fn show_model_ready_notification(app: AppHandle) {
     configure_notification_identity(&app);
-    let result = Notification::new()
+    let result = notification_for_app(&app)
         .summary(&crate::i18n::t(&app, "desktop.notifications.modelReady"))
         .body(&crate::i18n::t(&app, "desktop.notifications.modelReadyBody"))
         .action("open-meeting-settings", &crate::i18n::t(&app, "desktop.notifications.finishSetup"))
@@ -86,7 +86,7 @@ fn show_model_ready_notification(app: AppHandle) {
 
 fn show_transcript_ready_notification(app: AppHandle) {
     configure_notification_identity(&app);
-    let result = Notification::new()
+    let result = notification_for_app(&app)
         .summary(&crate::i18n::t(&app, "desktop.notifications.transcriptReady"))
         .body(&crate::i18n::t(&app, "desktop.notifications.transcriptReadyBody"))
         .action("open-meeting-records", &crate::i18n::t(&app, "desktop.notifications.viewTask"))
@@ -110,7 +110,7 @@ fn show_transcript_ready_notification(app: AppHandle) {
 
 fn show_notes_ready_notification(app: AppHandle, target_path: String) {
     configure_notification_identity(&app);
-    let result = Notification::new()
+    let result = notification_for_app(&app)
         .summary(&crate::i18n::t(&app, "desktop.notifications.notesReady"))
         .body(&crate::i18n::t(&app, "desktop.notifications.notesReadyBody"))
         .action("open-meeting-records", &crate::i18n::t(&app, "desktop.notifications.viewNotes"))
@@ -134,7 +134,7 @@ fn show_notes_ready_notification(app: AppHandle, target_path: String) {
 
 fn show_transcript_failed_notification(app: AppHandle, recording_id: String, save_failed: bool) {
     configure_notification_identity(&app);
-    let result = Notification::new()
+    let result = notification_for_app(&app)
         .summary(&crate::i18n::t(&app, if save_failed { "desktop.notifications.saveFailed" } else { "desktop.notifications.transcriptFailed" }))
         .body(&crate::i18n::t(&app, if save_failed { "desktop.notifications.saveFailedBody" } else { "desktop.notifications.transcriptFailedBody" }))
         .action("open-meeting-records", &crate::i18n::t(&app, "desktop.notifications.viewTask"))
@@ -155,6 +155,20 @@ fn show_transcript_failed_notification(app: AppHandle, recording_id: String, sav
         }
         let _ = recording_id;
     });
+}
+
+pub(super) fn notification_for_app(app: &AppHandle) -> Notification {
+    #[cfg(target_os = "windows")]
+    {
+        let mut notification = Notification::new();
+        notification.app_id(&app.config().identifier);
+        notification
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = app;
+        Notification::new()
+    }
 }
 
 pub(super) fn configure_notification_identity(app: &AppHandle) {

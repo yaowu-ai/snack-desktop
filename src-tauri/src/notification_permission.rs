@@ -1,10 +1,14 @@
 //! Read current OS authorization, not the notification plugin's persisted WebView choice.
 
+#[cfg(any(target_os = "windows", test))]
+#[path = "notification_permission_windows.rs"]
+mod windows_permission;
+
 #[cfg(target_os = "macos")]
 #[link(name = "UserNotifications", kind = "framework")]
 extern "C" {}
 
-#[cfg(all(target_os = "macos", not(debug_assertions)))]
+#[cfg(target_os = "macos")]
 pub(crate) async fn current(app: &tauri::AppHandle) -> Result<&'static str, String> {
     let (sender, receiver) = tokio::sync::oneshot::channel();
     app.run_on_main_thread(move || read_macos_settings(sender))
@@ -15,12 +19,7 @@ pub(crate) async fn current(app: &tauri::AppHandle) -> Result<&'static str, Stri
         .map_err(|_| crate::i18n::t(app, "desktop.permissionCancelled"))
 }
 
-#[cfg(all(target_os = "macos", debug_assertions))]
-pub(crate) async fn current(_app: &tauri::AppHandle) -> Result<&'static str, String> {
-    Ok("unsupported")
-}
-
-#[cfg(all(target_os = "macos", not(debug_assertions)))]
+#[cfg(target_os = "macos")]
 fn read_macos_settings(sender: tokio::sync::oneshot::Sender<&'static str>) {
     use block2::RcBlock;
     use objc2::{class, msg_send, runtime::AnyObject};
@@ -57,7 +56,15 @@ fn permission_from_status(status: isize) -> &'static str {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "windows")]
+pub(crate) async fn current(app: &tauri::AppHandle) -> Result<&'static str, String> {
+    let identifier = app.config().identifier.clone();
+    tauri::async_runtime::spawn_blocking(move || windows_permission::current(&identifier))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 pub(crate) async fn current(_app: &tauri::AppHandle) -> Result<&'static str, String> {
     Ok("unsupported")
 }
@@ -74,5 +81,16 @@ mod tests {
             assert_eq!(permission_from_status(status), "granted");
         }
         assert_eq!(permission_from_status(99), "unsupported");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn unbundled_process_does_not_access_the_notification_center() {
+        use objc2_foundation::NSBundle;
+
+        assert!(NSBundle::mainBundle().bundleIdentifier().is_none());
+        let (sender, mut receiver) = tokio::sync::oneshot::channel();
+        super::read_macos_settings(sender);
+        assert_eq!(receiver.try_recv().unwrap(), "unsupported");
     }
 }

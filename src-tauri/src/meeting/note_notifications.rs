@@ -2,7 +2,6 @@
 use std::collections::HashSet;
 use std::sync::{LazyLock, Mutex};
 
-use notify_rust::Notification;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager};
 
@@ -88,7 +87,7 @@ pub(crate) fn show(app: AppHandle, target: NoteNotificationTarget) -> Result<(),
     tauri::async_runtime::spawn_blocking(move || {
         super::notifications::configure_notification_identity(&app);
         let (title, body) = notification_text(&target);
-        let result = Notification::new()
+        let result = super::notifications::notification_for_app(&app)
             .summary(title)
             .body(body)
             .action("open-note", "查看笔记")
