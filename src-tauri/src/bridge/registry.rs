@@ -30,6 +30,14 @@ struct BridgeMethodRegistration {
 const METHODS: &[BridgeMethodRegistration] = &[
     BridgeMethodRegistration {
         descriptor: BridgeMethodDescriptor {
+            method: "video.prepare",
+            introduced_contract_revision: 8,
+            api_versions: &[1],
+        },
+        handler: video_handler,
+    },
+    BridgeMethodRegistration {
+        descriptor: BridgeMethodDescriptor {
             method: "browser.open",
             introduced_contract_revision: 7,
             api_versions: &[1],
@@ -133,6 +141,17 @@ const METHODS: &[BridgeMethodRegistration] = &[
         handler: recording_overlay_sync_handler,
     },
 ];
+
+fn video_handler(context: BridgeContext, payload: serde_json::Value) -> BridgeHandlerFuture {
+    Box::pin(async move {
+        crate::chat_video::handle(context.app, context.window, parse_payload(payload)?)
+            .await
+            .map_err(|message| BridgeHandlerError {
+                code: "VIDEO_PREPARE_FAILED",
+                message,
+            })
+    })
+}
 
 fn browser_open_handler(
     _context: BridgeContext,

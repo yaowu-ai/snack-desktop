@@ -126,6 +126,9 @@ fn preview_extension(request: &PreviewRequest) -> Result<&'static str, String> {
         .unwrap_or("")
         .trim()
         .to_ascii_lowercase();
+    if extension == "mp4" && mime == "video/mp4" {
+        return Ok("mp4");
+    }
     if extension == "heif" || mime == "image/heif" {
         return Ok("heif");
     }
@@ -270,6 +273,7 @@ mod tests {
     fn accepts_mime_aliases_and_case_insensitive_extensions_only_for_heic_heif() {
         for (filename, mime, expected) in [
             ("PHOTO.HEIC", None, "heic"),
+            ("video.MP4", Some("video/mp4"), "mp4"),
             ("photo", Some("image/heif; codecs=hevc"), "heif"),
         ] {
             let request = PreviewRequest {
