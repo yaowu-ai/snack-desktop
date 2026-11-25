@@ -145,8 +145,8 @@ pub fn run() {
             #[cfg(windows)]
             setup_windows_tray(app)?;
 
-            #[cfg(any(target_os = "macos", windows))]
-            setup_navigation_menu(app)?;
+            #[cfg(target_os = "macos")]
+            setup_navigation_menu(app.handle())?;
 
             let window_config = app
                 .config()
@@ -188,6 +188,8 @@ pub fn run() {
                     }
                 })
                 .build()?;
+            #[cfg(windows)]
+            setup_navigation_menu(app.handle())?;
             window.set_title(window_title)?;
 
             logging::write_app_log(

@@ -30,8 +30,8 @@ fn navigation_back_accelerator() -> &'static str {
 }
 
 #[cfg(any(target_os = "macos", windows))]
-pub(crate) fn setup_navigation_menu(app: &mut tauri::App) -> tauri::Result<()> {
-    install_application_menu(app.handle())
+pub(crate) fn setup_navigation_menu(app: &AppHandle) -> tauri::Result<()> {
+    install_application_menu(app)
 }
 
 #[cfg(any(target_os = "macos", windows))]
@@ -63,6 +63,13 @@ fn install_application_menu(app: &AppHandle) -> tauri::Result<()> {
     let site_menu = build_site_menu(app, Some(selected_site))?;
     menu.insert(&site_menu, site_menu_position())?;
     menu.append(&navigation)?;
+    // On Windows, an app-wide menu is inherited by borderless recording windows
+    // and is also attached to existing windows when the locale changes.
+    #[cfg(windows)]
+    app.get_webview_window("main")
+        .ok_or(tauri::Error::WindowNotFound)?
+        .set_menu(menu)?;
+    #[cfg(target_os = "macos")]
     app.set_menu(menu)?;
 
     Ok(())
@@ -433,7 +440,11 @@ pub(crate) fn sync_site_after_load(
 
 #[cfg(any(target_os = "macos", windows))]
 fn restore_site_menu_selection(app: &AppHandle, selected: Option<crate::site::SiteKey>) {
-    let Some(menu) = app.menu() else {
+    #[cfg(windows)]
+    let menu = app.get_webview_window("main").and_then(|main| main.menu());
+    #[cfg(target_os = "macos")]
+    let menu = app.menu();
+    let Some(menu) = menu else {
         return;
     };
     let Some(site_menu) = menu
