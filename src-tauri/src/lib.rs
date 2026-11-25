@@ -54,6 +54,7 @@ pub fn run() {
             bridge::bridge_probe,
             bridge::bridge_update,
             commands::delete_downloaded_file,
+            navigation::close_image_preview_window,
             commands::download_snack_file,
             commands::exit_after_force_update_cancel,
             commands::open_downloaded_file,
@@ -171,9 +172,16 @@ pub fn run() {
                 .visible(false)
                 .user_agent(&user_agent)
                 .initialization_script(web_runtime_recovery::initialization_script())
-                .on_new_window(move |url, _features| handle_new_window_request(&app_handle, url))
+                .initialization_script(
+                    "Object.defineProperty(window, 'snackImageWindowV1', { value: true });",
+                )
+                .on_new_window(move |url, features| {
+                    handle_new_window_request(&app_handle, url, features)
+                })
                 .on_page_load(move |window, payload| {
                     if payload.event() == PageLoadEvent::Started {
+                        download::clear_inline_downloads(window.label());
+                        navigation::close_image_previews(&page_load_app_handle);
                         meeting::reset_note_notification_handler();
                         meeting::shortcut_policy::clear_account_binding();
                     }
