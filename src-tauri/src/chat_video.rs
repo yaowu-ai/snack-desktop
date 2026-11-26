@@ -53,9 +53,18 @@ pub(crate) async fn handle(
         .map_err(|_| "VIDEO_RUNTIME")?
         .join("chat-video");
     if req.op == "available" {
-        return Ok(json!(
-            binary(&root, "ffmpeg").is_file() && binary(&root, "ffprobe").is_file()
-        ));
+        let ffmpeg = binary(&root, "ffmpeg").is_file();
+        let ffprobe = binary(&root, "ffprobe").is_file();
+        if !ffmpeg || !ffprobe {
+            crate::logging::write_app_log(
+                &app,
+                "warn",
+                "chat-video",
+                "Bundled video tools missing",
+                Some(&json!({ "ffmpegPresent": ffmpeg, "ffprobePresent": ffprobe })),
+            );
+        }
+        return Ok(json!(ffmpeg && ffprobe));
     }
     let url = window.url().map_err(|_| "VIDEO_SESSION")?;
     let owner = (
@@ -163,6 +172,30 @@ const INPUT: [&str; 4] = [
     "-format_whitelist",
     "mov,matroska,webm,avi,flv,mpegts,asf",
 ];
+// Match the H5 chat player's AVC profile allowlist (profile_idc 66, 77, 100).
+// Unknown profiles must be transcoded rather than copied into the output MP4.
+fn can_copy_video(v: &Value, w: u64, h: u64, hdr: bool) -> bool {
+    let fps = v["avg_frame_rate"]
+        .as_str()
+        .and_then(|r| r.split_once('/'))
+        .and_then(|(n, d)| Some(n.parse::<f64>().ok()? / d.parse::<f64>().ok()?))
+        .unwrap_or(0.);
+    v["codec_name"] == "h264"
+        && matches!(
+            v["profile"].as_str(),
+            // The bundled --enable-small ffprobe reports numeric profile strings.
+            Some(
+                "Baseline" | "Constrained Baseline" | "Main" | "High" | "66" | "578" | "77" | "100"
+            )
+        )
+        && v["pix_fmt"] == "yuv420p"
+        && !hdr
+        && w.max(h) <= 1920
+        && w.min(h) <= 1080
+        && fps > 0.
+        && fps <= 30.01
+        && matches!(v["level"].as_i64(), Some(1..=41))
+}
 fn convert(root: &Path, dir: &Path, cancel: &AtomicBool) -> Result<(), String> {
     let mut probe = Command::new(binary(root, "ffprobe"));
     probe.current_dir(dir).args(["-v","error"]).args(INPUT).args(["-show_entries","stream=codec_name,codec_type,profile,level,width,height,pix_fmt,color_transfer,avg_frame_rate,channels","-of","json","in"]).stdout(File::create(dir.join("probe")).map_err(|_|"VIDEO_TEMP")?);
@@ -185,23 +218,11 @@ fn convert(root: &Path, dir: &Path, cancel: &AtomicBool) -> Result<(), String> {
     if w * h == 0 || w.max(h) > 8192 {
         return Err("VIDEO_DIMENSIONS".into());
     }
-    let fps = v["avg_frame_rate"]
-        .as_str()
-        .and_then(|r| r.split_once('/'))
-        .and_then(|(n, d)| Some(n.parse::<f64>().ok()? / d.parse::<f64>().ok()?))
-        .unwrap_or(0.);
     let hdr = matches!(
         v["color_transfer"].as_str(),
         Some("smpte2084" | "arib-std-b67")
     );
-    let copy = v["codec_name"] == "h264"
-        && v["pix_fmt"] == "yuv420p"
-        && !hdr
-        && w.max(h) <= 1920
-        && w.min(h) <= 1080
-        && fps > 0.
-        && fps <= 30.01
-        && matches!(v["level"].as_i64(), Some(1..=41));
+    let copy = can_copy_video(v, w, h, hdr);
     let mut cmd = Command::new(binary(root, "ffmpeg"));
     cmd.current_dir(dir)
         .args(["-nostdin", "-v", "error"])
@@ -251,7 +272,7 @@ fn convert(root: &Path, dir: &Path, cancel: &AtomicBool) -> Result<(), String> {
         .filter(|t| t["codec_type"] == "audio")
         .all(|a| {
             a["codec_name"] == "aac"
-                && a["profile"] == "LC"
+                && matches!(a["profile"].as_str(), Some("LC" | "1"))
                 && a["channels"].as_u64().unwrap_or(9) <= 2
         })
     {
@@ -284,5 +305,40 @@ fn run(mut cmd: Command, cancel: &AtomicBool) -> Result<(), String> {
             };
         }
         std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_chat_compatible_h264_profiles_can_be_copied() {
+        let stream = json!({
+            "codec_name": "h264",
+            "pix_fmt": "yuv420p",
+            "avg_frame_rate": "30/1",
+            "level": 41,
+        });
+        assert!(!can_copy_video(&stream, 1280, 720, false));
+        for profile in [
+            "Baseline",
+            "Constrained Baseline",
+            "Main",
+            "High",
+            "66",
+            "578",
+            "77",
+            "100",
+        ] {
+            let mut stream = stream.clone();
+            stream["profile"] = json!(profile);
+            assert!(can_copy_video(&stream, 1280, 720, false), "{profile}");
+        }
+        for profile in ["Extended", "High 10", "High 4:2:2", "unknown", "88", "110"] {
+            let mut stream = stream.clone();
+            stream["profile"] = json!(profile);
+            assert!(!can_copy_video(&stream, 1280, 720, false), "{profile}");
+        }
     }
 }

@@ -128,6 +128,19 @@ if (!operation) {
   process.exit(1);
 }
 
+// These tools are generated locally (git only tracks the resource directory).
+if (["darwin", "win32"].includes(process.platform)) {
+  const suffix = process.platform === "win32" ? ".exe" : "";
+  const missing = ["ffmpeg", "ffprobe"].filter(name => {
+    const tool = path.join(repoRoot, "src-tauri/resources/chat-video", name + suffix);
+    return spawnSync(tool, ["-version"], { stdio: "ignore", timeout: 10000 }).status !== 0;
+  });
+  if (missing.length) {
+    console.error(`Chat video tools missing or not executable: ${missing.join(", ")}. Run bash scripts/build-chat-video-runtime.sh (see README).`);
+    if (operation.command === "build") process.exit(1);
+  }
+}
+
 const args = process.argv.slice(3);
 let targetEnv = (process.env.SNACK_ENV || inferEnvFromGitRef()).toLowerCase();
 

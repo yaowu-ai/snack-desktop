@@ -51,6 +51,16 @@ Snack 将企业增长工作流呈现在同一界面中：
 
 ## 本地开发及打包
 
+聊天视频转换使用随包的 `ffmpeg` 和 `ffprobe`，不调用用户 PATH 中的版本。首次打包或更新工具版本时，先在目标平台执行：
+
+```bash
+# macOS 先安装编译依赖（Windows 使用 release.yml 中的 MSYS2 MINGW64 环境）
+brew install autoconf automake libtool pkg-config  # 仅 macOS
+bash scripts/build-chat-video-runtime.sh
+```
+
+生成物位于 `src-tauri/resources/chat-video/`，不提交 Git。工具缺失时 `dev` 会提醒，`build` 与 `build:local` 会停止，避免生成无法转换 MOV 的安装包。
+
 ```bash
 npm run dev # 热开发，并关闭桌面自动更新检查
 npm run build:local # macOS：生成使用稳定本地签名的 Debug Snack.app
