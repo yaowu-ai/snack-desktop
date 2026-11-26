@@ -15,13 +15,15 @@ use std::{
 };
 use tauri::{AppHandle, Manager, WebviewWindow};
 use tempfile::TempDir;
-const MAX: u64 = 100 * 1024 * 1024;
+const LEGACY_MAX: u64 = 100 * 1024 * 1024;
+const PROCESSING_CEILING: u64 = 2048 * 1024 * 1024;
 const CHUNK: usize = 384 * 1024;
 struct Job {
     dir: Arc<TempDir>,
     owner: (String, String),
     id: String,
     cancel: Arc<AtomicBool>,
+    max_bytes: u64,
     phase: u8,
     touched: Instant,
 }
@@ -38,6 +40,8 @@ pub(crate) struct Request {
     id: Option<String>,
     offset: Option<u64>,
     data: Option<String>,
+    #[serde(rename = "maxVideoBytes")]
+    max_bytes: Option<u64>,
 }
 fn binary(root: &Path, name: &str) -> PathBuf {
     root.join(format!("{name}{}", std::env::consts::EXE_SUFFIX))
@@ -101,6 +105,10 @@ fn operate(root: PathBuf, owner: (String, String), req: Request) -> Result<Value
             owner,
             id: id.clone(),
             cancel: Arc::new(false.into()),
+            max_bytes: req
+                .max_bytes
+                .unwrap_or(LEGACY_MAX)
+                .clamp(1, PROCESSING_CEILING),
             phase: 0,
             touched: Instant::now(),
         });
@@ -124,7 +132,7 @@ fn operate(root: PathBuf, owner: (String, String), req: Request) -> Result<Value
             let bytes = STANDARD.decode(data).map_err(|_| "VIDEO_CHUNK")?;
             let p = j.dir.path().join("in");
             let size = fs::metadata(&p).map_err(|_| "VIDEO_INPUT")?.len();
-            if req.offset != Some(size) || size + bytes.len() as u64 > MAX {
+            if req.offset != Some(size) || size + bytes.len() as u64 > j.max_bytes {
                 return Err("VIDEO_LIMIT".into());
             }
             OpenOptions::new()
@@ -138,12 +146,13 @@ fn operate(root: PathBuf, owner: (String, String), req: Request) -> Result<Value
             j.phase = 1;
             let dir = j.dir.clone();
             let cancel = j.cancel.clone();
+            let max_bytes = j.max_bytes;
             drop(guard);
-            convert(&root, dir.path(), &cancel)?;
+            convert(&root, dir.path(), &cancel, max_bytes)?;
             let size = fs::metadata(dir.path().join("out.mp4"))
                 .map_err(|_| "VIDEO_OUTPUT")?
                 .len();
-            if size == 0 || size > MAX {
+            if size == 0 || size > max_bytes {
                 return Err("VIDEO_LIMIT".into());
             }
             let mut g = slot.lock().map_err(|_| "VIDEO_JOB")?;
@@ -196,10 +205,10 @@ fn can_copy_video(v: &Value, w: u64, h: u64, hdr: bool) -> bool {
         && fps <= 30.01
         && matches!(v["level"].as_i64(), Some(1..=41))
 }
-fn convert(root: &Path, dir: &Path, cancel: &AtomicBool) -> Result<(), String> {
+fn convert(root: &Path, dir: &Path, cancel: &AtomicBool, max_bytes: u64) -> Result<(), String> {
     let mut probe = Command::new(binary(root, "ffprobe"));
     probe.current_dir(dir).args(["-v","error"]).args(INPUT).args(["-show_entries","stream=codec_name,codec_type,profile,level,width,height,pix_fmt,color_transfer,avg_frame_rate,channels","-of","json","in"]).stdout(File::create(dir.join("probe")).map_err(|_|"VIDEO_TEMP")?);
-    run(probe, cancel)?;
+    run(probe, cancel, max_bytes)?;
     let p = dir.join("probe");
     if fs::metadata(&p).map_err(|_| "VIDEO_PROBE")?.len() > 65536 {
         return Err("VIDEO_PROBE".into());
@@ -281,9 +290,9 @@ fn convert(root: &Path, dir: &Path, cancel: &AtomicBool) -> Result<(), String> {
         cmd.args(["-c:a", "aac", "-ac", "2", "-ar", "48000", "-b:a", "128k"]);
     }
     cmd.args(["-movflags", "+faststart", "out.mp4"]);
-    run(cmd, cancel)
+    run(cmd, cancel, max_bytes)
 }
-fn run(mut cmd: Command, cancel: &AtomicBool) -> Result<(), String> {
+fn run(mut cmd: Command, cancel: &AtomicBool, max_bytes: u64) -> Result<(), String> {
     cmd.stderr(Stdio::null()).stdin(Stdio::null());
     let dir = cmd.get_current_dir().ok_or("VIDEO_TEMP")?.to_path_buf();
     let mut child = cmd.spawn().map_err(|_| "VIDEO_RUNTIME")?;
@@ -291,7 +300,7 @@ fn run(mut cmd: Command, cancel: &AtomicBool) -> Result<(), String> {
     loop {
         if cancel.load(Ordering::Relaxed)
             || start.elapsed() > Duration::from_secs(300)
-            || fs::metadata(dir.join("out.mp4")).is_ok_and(|m| m.len() > MAX)
+            || fs::metadata(dir.join("out.mp4")).is_ok_and(|m| m.len() > max_bytes)
         {
             let _ = child.kill();
             let _ = child.wait();
@@ -311,6 +320,25 @@ fn run(mut cmd: Command, cancel: &AtomicBool) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn each_conversion_takes_the_limit_from_its_begin_request() {
+        let owner = ("origin".to_string(), "session".to_string());
+        for max_bytes in [2, 8] {
+            let call = |payload| {
+                operate(
+                    PathBuf::new(),
+                    owner.clone(),
+                    serde_json::from_value(payload).unwrap(),
+                )
+            };
+            let id = call(json!({"op":"begin", "maxVideoBytes":max_bytes})).unwrap();
+            let slot = JOB.get().unwrap().lock().unwrap();
+            assert_eq!(slot.as_ref().unwrap().max_bytes, max_bytes);
+            drop(slot);
+            call(json!({"op":"release", "id":id})).unwrap();
+        }
+    }
 
     #[test]
     fn only_chat_compatible_h264_profiles_can_be_copied() {

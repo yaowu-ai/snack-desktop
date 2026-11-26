@@ -50,7 +50,13 @@ pub(crate) async fn preview(
         .take(60)
         .collect();
     let file = folder.join(format!("{stem}.{extension}"));
-    let result = download(&file, url, &token).await;
+    let is_video = extension == "mp4";
+    let limit = if is_video {
+        2048 * 1024 * 1024
+    } else {
+        MAX_BYTES
+    };
+    let result = download(&file, url, &token, limit).await;
     if let Err(error) = result {
         let _ = tokio::fs::remove_dir_all(&folder).await;
         return Err(error);
@@ -63,7 +69,13 @@ pub(crate) async fn preview(
         let _ = tokio::fs::remove_dir_all(&folder).await;
         return Err("PREVIEW_SESSION_CHANGED".into());
     }
-    if let Err(error) = open_viewer(app.clone(), file.clone()).await {
+    let opened = if is_video {
+        tauri_plugin_opener::open_path(&file, None::<&str>)
+            .map_err(|_| "PREVIEW_UNAVAILABLE".to_string())
+    } else {
+        open_viewer(app.clone(), file.clone()).await
+    };
+    if let Err(error) = opened {
         let _ = tokio::fs::remove_dir_all(&folder).await;
         return Err(error);
     }
@@ -170,10 +182,11 @@ fn create_preview_folder(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(folder)
 }
 
-async fn download(path: &Path, url: tauri::Url, token: &str) -> Result<(), String> {
+async fn download(path: &Path, url: tauri::Url, token: &str, limit: u64) -> Result<(), String> {
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
-        .timeout(Duration::from_secs(60))
+        .connect_timeout(Duration::from_secs(30))
+        .read_timeout(Duration::from_secs(60))
         .build()
         .map_err(|_| "PREVIEW_DOWNLOAD_FAILED")?;
     let first = client
@@ -207,16 +220,17 @@ async fn download(path: &Path, url: tauri::Url, token: &str) -> Result<(), Strin
     if response.status() != reqwest::StatusCode::OK {
         return Err("PREVIEW_DOWNLOAD_FAILED".into());
     }
-    if response
-        .content_length()
-        .is_some_and(|size| size > MAX_BYTES)
-    {
+    if response.content_length().is_some_and(|size| size > limit) {
         return Err("PREVIEW_TOO_LARGE".into());
     }
-    write_response(path, response).await
+    write_response(path, response, limit).await
 }
 
-async fn write_response(path: &Path, response: reqwest::Response) -> Result<(), String> {
+async fn write_response(
+    path: &Path,
+    response: reqwest::Response,
+    limit: u64,
+) -> Result<(), String> {
     let mut file = tokio::fs::File::create(path)
         .await
         .map_err(|_| "PREVIEW_CACHE_UNAVAILABLE")?;
@@ -225,7 +239,7 @@ async fn write_response(path: &Path, response: reqwest::Response) -> Result<(), 
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|_| "PREVIEW_DOWNLOAD_FAILED")?;
         size += chunk.len() as u64;
-        if size > MAX_BYTES {
+        if size > limit {
             return Err("PREVIEW_TOO_LARGE".into());
         }
         file.write_all(&chunk)
