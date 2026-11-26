@@ -84,6 +84,13 @@ fn install_application_menu(app: &AppHandle) -> tauri::Result<bool> {
         "Installing localized application menu",
         Some(&serde_json::json!({ "previousLocale": *installed_locale, "locale": locale })),
     );
+    // On Windows, an app-wide menu is inherited by borderless recording windows
+    // and is also attached to existing windows when the locale changes.
+    #[cfg(windows)]
+    app.get_webview_window("main")
+        .ok_or(tauri::Error::WindowNotFound)?
+        .set_menu(menu)?;
+    #[cfg(target_os = "macos")]
     app.set_menu(menu)?;
     *installed_locale = Some(locale);
 
@@ -496,7 +503,11 @@ pub(crate) fn sync_site_after_load(
 
 #[cfg(any(target_os = "macos", windows))]
 fn restore_site_menu_selection(app: &AppHandle, selected: Option<crate::site::SiteKey>) {
-    let Some(menu) = app.menu() else {
+    #[cfg(windows)]
+    let menu = app.get_webview_window("main").and_then(|main| main.menu());
+    #[cfg(target_os = "macos")]
+    let menu = app.menu();
+    let Some(menu) = menu else {
         return;
     };
     let Some(site_menu) = menu
