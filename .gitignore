@@ -6,3 +6,5 @@ node_modules/
 /playwright-report/
 /src-tauri/resources/python-runtime/*
 !/src-tauri/resources/python-runtime/.gitkeep
+/src-tauri/resources/chat-video/*
+!/src-tauri/resources/chat-video/.gitkeep

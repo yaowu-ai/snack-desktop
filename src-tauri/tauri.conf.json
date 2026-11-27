@@ -42,6 +42,7 @@
       "icons/icon.ico"
     ],
     "resources": {
+      "resources/chat-video/": "chat-video/",
       "resources/python-runtime/": "python-runtime/"
     },
     "windows": {

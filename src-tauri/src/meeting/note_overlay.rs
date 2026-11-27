@@ -1805,6 +1805,43 @@ pub(crate) fn render_notice_html(locale: &serde_json::Value) -> String {
 mod tests {
     use super::*;
 
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires a Windows desktop session with WebView2"]
+    fn recording_capsule_stays_menu_free_across_locale_refresh() {
+        use crate::{app_menu, i18n};
+
+        let mut context = tauri::generate_context!();
+        context.config_mut().identifier = "cn.yaowutech.snack.test.overlay-menu".into();
+        let mut app = tauri::Builder::default()
+            .any_thread()
+            .manage(Runtime::default())
+            .build(context)
+            .unwrap();
+        i18n::initialize(app.handle()).unwrap();
+        let main = WebviewWindowBuilder::new(
+            &app,
+            "main",
+            WebviewUrl::External("about:blank".parse().unwrap()),
+        )
+        .visible(false)
+        .build()
+        .unwrap();
+        app_menu::setup_navigation_menu(&mut app).unwrap();
+        create_capsule_window(app.handle()).unwrap();
+        let capsule = app.get_webview_window(LABEL).unwrap();
+        assert!(main.is_menu_visible().unwrap());
+        assert!(capsule.menu().is_none());
+
+        let next = match i18n::snapshot(app.handle()).locale {
+            i18n::Locale::Zh => i18n::Locale::En,
+            i18n::Locale::En => i18n::Locale::Zh,
+        };
+        i18n::set_preference(app.handle(), Some(next)).unwrap();
+        assert!(main.is_menu_visible().unwrap());
+        assert!(capsule.menu().is_none());
+    }
+
     #[test]
     fn passive_notice_can_only_read_the_shared_overlay_state() {
         assert!(require_readable_overlay(LABEL).is_ok());
