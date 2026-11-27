@@ -25,6 +25,7 @@ UPDATER_ARCHIVE_PATH="${BUNDLE_ROOT}/macos/${APP_NAME}_${APP_VERSION}_macos_${RE
 UPDATER_SIGNATURE_PATH="${UPDATER_ARCHIVE_PATH}.sig"
 PYTHON_RUNTIME_ROOT="${APP_PATH}/Contents/Resources/python-runtime/python"
 PYTHON_RUNTIME_ENTITLEMENTS="src-tauri/PythonRuntimeEntitlements.plist"
+CHAT_VIDEO_RUNTIME_ROOT="${APP_PATH}/Contents/Resources/chat-video"
 
 codesign_with_retry() {
   local attempt
@@ -63,6 +64,25 @@ sign_python_runtime() {
     esac
     codesign_with_retry "${arguments[@]}" "${candidate}"
   done < <(find "${PYTHON_RUNTIME_ROOT}" -type f -print0)
+}
+
+sign_chat_video_runtime() {
+  if [[ ! -d "${CHAT_VIDEO_RUNTIME_ROOT}" ]]; then
+    echo "Chat video runtime not found: ${CHAT_VIDEO_RUNTIME_ROOT}" >&2
+    return 1
+  fi
+
+  while IFS= read -r -d '' candidate; do
+    if ! file -b "${candidate}" | grep -q '^Mach-O'; then
+      continue
+    fi
+    codesign_with_retry \
+      --force \
+      --timestamp \
+      --options runtime \
+      --sign "${APPLE_SIGNING_IDENTITY}" \
+      "${candidate}"
+  done < <(find "${CHAT_VIDEO_RUNTIME_ROOT}" -type f -print0)
 }
 
 submit_for_notarization() {
@@ -161,6 +181,7 @@ fi
 xattr -crs "${APP_PATH}"
 
 sign_python_runtime
+sign_chat_video_runtime
 
 codesign_with_retry \
   --force \
