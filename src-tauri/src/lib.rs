@@ -1,6 +1,7 @@
 mod app_menu;
 mod attention;
 mod bridge;
+mod chat_video;
 mod commands;
 mod constants;
 mod download;
