@@ -159,9 +159,9 @@ pub fn run() {
             let mut window_config = window_config.clone();
             window_config.url = site::initial_webview_url(app.handle(), &window_config.url);
             let window_title = if site::site_from_webview_url(&window_config.url).is_some() {
-                selected_site.window_title()
+                selected_site.window_title().to_owned()
             } else {
-                app.package_info().name.as_str()
+                app.package_info().name.clone()
             };
 
             let user_agent = desktop_user_agent();
@@ -191,7 +191,7 @@ pub fn run() {
                 .build()?;
             #[cfg(windows)]
             setup_navigation_menu(app)?;
-            window.set_title(window_title)?;
+            window.set_title(&window_title)?;
 
             logging::write_app_log(
                 app.handle(),
