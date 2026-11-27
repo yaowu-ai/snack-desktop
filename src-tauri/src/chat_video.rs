@@ -251,7 +251,8 @@ fn convert(root: &Path, dir: &Path, cancel: &AtomicBool, max_bytes: u64) -> Resu
     if copy {
         cmd.args(["-c:v", "copy"]);
     } else {
-        let scale="scale='min(iw,if(gte(iw,ih),1280,720))':'min(ih,if(gte(iw,ih),720,1280))':force_original_aspect_ratio=decrease:force_divisible_by=2,fps=30,format=yuv420p";
+        // Both native encoders accept NV12. Planar input can corrupt full-range frames.
+        let scale = "scale='min(iw,if(gte(iw,ih),1280,720))':'min(ih,if(gte(iw,ih),720,1280))':force_original_aspect_ratio=decrease:force_divisible_by=2,fps=30,format=nv12";
         let filter = if hdr {
             format!("zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,tonemap=tonemap=hable,zscale=t=bt709:m=bt709:r=tv,{scale}")
         } else {
