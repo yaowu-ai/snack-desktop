@@ -1,5 +1,7 @@
+mod inline;
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use futures_util::StreamExt;
+pub(crate) use inline::clear_window as clear_inline_downloads;
 use reqwest::header::{COOKIE, LOCATION, USER_AGENT};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -21,6 +23,7 @@ const PROGRESS_EMIT_INTERVAL: Duration = Duration::from_millis(150);
 pub(crate) struct DownloadSnackFileRequest {
     pub(crate) download_id: String,
     pub(crate) url: String,
+    chunk: Option<inline::Chunk>,
     pub(crate) filename: String,
 }
 
@@ -67,23 +70,19 @@ pub(crate) async fn download_snack_file_inner(
         return Err("origin is not allowed to start native downloads".to_string());
     }
 
-    let mut file_url = resolve_snack_file_url(&current_url, &request.url)?;
-    ensure_supported_file_endpoint(&file_url)?;
-    ensure_download_query(&mut file_url);
-
-    let auth_token = read_auth_token_cookie(&window, file_url.clone())?;
+    if request.url == "inline:" {
+        return inline::receive(app, window, current_url, request).await;
+    }
+    let mut file_url = download_url(&current_url, &request.url)?;
+    // Only Snack content endpoints require the download flag; preserve arbitrary signed URLs.
+    if file_url.origin() == current_url.origin()
+        && ensure_supported_file_endpoint(&file_url).is_ok()
+        && file_url.query().is_none()
+    {
+        ensure_download_query(&mut file_url);
+    }
     let filename = sanitize_filename(&request.filename)?;
     let destination_dir = resolve_destination_dir(&app)?;
-    let final_path = resolve_available_path(&destination_dir, &filename);
-    let part_path = final_path.with_extension(format!(
-        "{}part",
-        final_path
-            .extension()
-            .and_then(|value| value.to_str())
-            .map(|value| format!("{value}."))
-            .unwrap_or_default()
-    ));
-
     emit_download_progress(
         &window,
         DownloadProgressPayload {
@@ -104,38 +103,37 @@ pub(crate) async fn download_snack_file_inner(
         .build()
         .map_err(|_| "failed to prepare download client".to_string())?;
 
-    let first_response = client
-        .get(file_url.clone())
-        .header(COOKIE, format!("auth_token={auth_token}"))
-        .header(USER_AGENT, desktop_user_agent())
-        .send()
-        .await
-        .map_err(|error| format!("failed to request file access URL: {}", error.without_url()))?;
-
-    let response = if first_response.status().is_redirection() {
-        let location = first_response
-            .headers()
-            .get(LOCATION)
-            .and_then(|value| value.to_str().ok())
-            .ok_or_else(|| "download redirect missing location".to_string())?;
-        let signed_url = file_url
-            .join(location)
-            .map_err(|_| "download redirect URL is invalid".to_string())?;
-        if signed_url.scheme() != "https" {
-            return Err("download redirect URL is not supported".to_string());
+    let mut send_cookie = may_send_auth(true, &current_url, &file_url);
+    let mut redirects = 0;
+    let response = loop {
+        let mut get = client
+            .get(file_url.clone())
+            .header(USER_AGENT, desktop_user_agent());
+        if send_cookie {
+            if let Ok(token) = read_auth_token_cookie(&window, file_url.clone()) {
+                get = get.header(COOKIE, format!("auth_token={token}"));
+            }
         }
-        client
-            .get(signed_url)
-            .header(USER_AGENT, desktop_user_agent())
+        let response = get
             .send()
             .await
-            .map_err(|error| {
-                format!("failed to request signed file URL: {}", error.without_url())
-            })?
-    } else {
-        first_response
+            .map_err(|err| format!("download failed: {}", err.without_url()))?;
+        if !response.status().is_redirection() {
+            break response;
+        }
+        redirects += 1;
+        if redirects > 5 {
+            return Err("too many download redirects".into());
+        }
+        let location = response
+            .headers()
+            .get(LOCATION)
+            .and_then(|h| h.to_str().ok())
+            .ok_or("missing download redirect")?;
+        let next = download_redirect(&file_url, location)?;
+        send_cookie = may_send_auth(send_cookie, &current_url, &next);
+        file_url = next;
     };
-
     if !response.status().is_success() {
         return Err(format!(
             "file download request failed with status {}",
@@ -146,15 +144,7 @@ pub(crate) async fn download_snack_file_inner(
     let total_bytes = response.content_length();
     set_window_progress(&window, total_bytes, 0);
 
-    if let Some(parent) = part_path.parent() {
-        tokio::fs::create_dir_all(parent)
-            .await
-            .map_err(|_| "failed to create download directory".to_string())?;
-    }
-
-    let mut file = tokio::fs::File::create(&part_path)
-        .await
-        .map_err(|_| "failed to create local download file".to_string())?;
+    let (mut file, staging) = stage_download(&destination_dir).await?;
     let mut stream = response.bytes_stream();
     let mut downloaded_bytes = 0_u64;
     let mut last_emit = Instant::now()
@@ -196,10 +186,7 @@ pub(crate) async fn download_snack_file_inner(
         .map_err(|_| "failed to flush local download file".to_string())?;
     drop(file);
 
-    tokio::fs::rename(&part_path, &final_path)
-        .await
-        .map_err(|_| "failed to finish local download file".to_string())?;
-
+    let final_path = finish_download(staging, &destination_dir, &filename)?;
     let path = final_path.to_string_lossy().to_string();
     emit_download_progress(
         &window,
@@ -235,22 +222,58 @@ pub(crate) async fn save_generated_share_image_inner(
     validate_download_origin(&window)?;
     let filename = sanitize_png_filename(&request.filename)?;
     let bytes = decode_generated_png(&request.data_base64)?;
+    save_download_bytes(app, window, request.download_id, filename, bytes).await
+}
+
+fn may_send_auth(previously_trusted: bool, owner: &Url, target: &Url) -> bool {
+    previously_trusted && owner.origin() == target.origin()
+}
+
+fn download_redirect(from: &Url, location: &str) -> Result<Url, String> {
+    let next = download_url(from, location)?;
+    if from.scheme() == "https" && next.scheme() != "https" {
+        return Err("insecure download redirect".into());
+    }
+    Ok(next)
+}
+
+fn download_url(base: &Url, raw: &str) -> Result<Url, String> {
+    if raw.trim().is_empty() {
+        return Err("empty download URL".into());
+    }
+    let target = base.join(raw).map_err(|_| "invalid download URL")?;
+    if !matches!(target.scheme(), "http" | "https")
+        || !target.username().is_empty()
+        || target.password().is_some()
+    {
+        return Err("unsupported download URL".into());
+    }
+    Ok(target)
+}
+
+async fn save_download_bytes(
+    app: AppHandle,
+    window: WebviewWindow,
+    download_id: String,
+    filename: String,
+    bytes: Vec<u8>,
+) -> Result<DownloadSnackFileResult, String> {
     let total_bytes = bytes.len() as u64;
     let destination_dir = resolve_destination_dir(&app)?;
-    let final_path = resolve_available_path(&destination_dir, &filename);
-
-    emit_generated_image_started(&window, &request.download_id, &filename, total_bytes);
-    tokio::fs::create_dir_all(&destination_dir)
+    emit_generated_image_started(&window, &download_id, &filename, total_bytes);
+    let (mut file, staging) = stage_download(&destination_dir).await?;
+    file.write_all(&bytes)
         .await
-        .map_err(|_| "failed to create download directory".to_string())?;
-    tokio::fs::write(&final_path, bytes)
+        .map_err(|_| "failed to write local download")?;
+    file.flush()
         .await
-        .map_err(|_| "failed to save generated image".to_string())?;
-
+        .map_err(|_| "failed to flush local download")?;
+    drop(file);
+    let final_path = finish_download(staging, &destination_dir, &filename)?;
     let path = final_path.to_string_lossy().to_string();
-    emit_generated_image_completed(&window, &request.download_id, &filename, &path, total_bytes);
+    emit_generated_image_completed(&window, &download_id, &filename, &path, total_bytes);
     Ok(DownloadSnackFileResult {
-        download_id: request.download_id,
+        download_id,
         path,
         downloaded_bytes: total_bytes,
     })
@@ -573,9 +596,39 @@ fn validate_downloaded_path(
     Ok(canonical_path)
 }
 
+// Unique staging files clean themselves up on failure. Publish atomically without replacing
+// an existing file, including when two requests with the same filename finish together.
+async fn stage_download(dir: &Path) -> Result<(tokio::fs::File, tempfile::TempPath), String> {
+    tokio::fs::create_dir_all(dir)
+        .await
+        .map_err(|_| "failed to create downloads directory")?;
+    let (file, staging) = tempfile::NamedTempFile::new_in(dir)
+        .map_err(|_| "failed to stage download")?
+        .into_parts();
+    Ok((tokio::fs::File::from_std(file), staging))
+}
+
+fn finish_download(
+    mut staging: tempfile::TempPath,
+    dir: &Path,
+    filename: &str,
+) -> Result<PathBuf, String> {
+    for _ in 0..32 {
+        let target = resolve_available_path(dir, filename);
+        match staging.persist_noclobber(&target) {
+            Ok(()) => return Ok(target),
+            Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
+                staging = error.path
+            }
+            Err(_) => return Err("failed to finish local download".into()),
+        }
+    }
+    Err("unable to allocate a unique download filename".into())
+}
+
 fn resolve_available_path(destination_dir: &Path, filename: &str) -> PathBuf {
     let candidate = destination_dir.join(filename);
-    if !candidate.exists() {
+    if candidate.symlink_metadata().is_err() {
         return candidate;
     }
 
@@ -593,7 +646,7 @@ fn resolve_available_path(destination_dir: &Path, filename: &str) -> PathBuf {
             None => format!("{stem} ({index})"),
         };
         let candidate = destination_dir.join(filename);
-        if !candidate.exists() {
+        if candidate.symlink_metadata().is_err() {
             return candidate;
         }
     }
@@ -630,6 +683,46 @@ mod tests {
     };
     use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
     use tauri::Url;
+
+    #[test]
+    fn download_link_policy_preserves_signatures_and_drops_cross_origin_auth() {
+        let owner = Url::parse("https://snack.mechlabs.cn/sessions/12").unwrap();
+        let local =
+            super::download_url(&owner, "/api/snack/direct-chats/12/attachments/7").unwrap();
+        assert!(super::may_send_auth(true, &owner, &local));
+        let signed = "https://cdn.example/image?sig=a%2Fb";
+        let external = super::download_redirect(&local, signed).unwrap();
+        assert_eq!(external.as_str(), signed);
+        assert!(!super::may_send_auth(true, &owner, &external));
+        assert!(!super::may_send_auth(false, &owner, &local));
+        for bad in [
+            "http://cdn.example/downgrade",
+            "file:///tmp/x",
+            "https://user:secret@cdn.example/x",
+        ] {
+            assert!(super::download_redirect(&owner, bad).is_err());
+        }
+    }
+
+    #[test]
+    fn identically_named_downloads_do_not_overwrite() {
+        let dir = tempfile::tempdir().unwrap();
+        for content in ["one", "two"] {
+            let stage = tempfile::NamedTempFile::new_in(dir.path())
+                .unwrap()
+                .into_temp_path();
+            std::fs::write(&stage, content).unwrap();
+            super::finish_download(stage, dir.path(), "document.pdf").unwrap();
+        }
+        assert_eq!(
+            std::fs::read(dir.path().join("document.pdf")).unwrap(),
+            b"one"
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("document (1).pdf")).unwrap(),
+            b"two"
+        );
+    }
 
     #[test]
     fn accepts_generated_png_data() {
