@@ -512,7 +512,8 @@ mod tests {
 
     #[test]
     fn registry_exposes_only_explicit_methods() {
-        assert_eq!(descriptors().len(), 13);
+        assert_eq!(descriptors().len(), 14);
+        assert!(find("video.prepare").is_some());
         assert!(find("browser.open").is_some());
         assert!(find("files.preview").is_some());
         assert!(find("bridge.info").is_some());
